@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-TidyBot2 with WX250S Arm - MuJoCo Simulation Demo
+TidyBot2 with Bimanual WX250S Arms - MuJoCo Simulation Demo
 
 This script demonstrates how to:
-1. Load the TidyBot2 mobile robot with a WX250S 6-DOF arm in MuJoCo
+1. Load the TidyBot2 mobile robot with dual WX250S 6-DOF arms in MuJoCo
 2. Control the mobile base (x, y, rotation)
-3. Control the arm joints (waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate)
-4. Control the gripper (open/close)
+3. Control both arm joints (left/right: waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate)
+4. Control both grippers (open/close)
 
-The demo drives the robot forward 1 meter while performing a simple arm wave motion.
+The demo drives the robot forward 1 meter while performing a synchronized arm wave motion.
 """
 
 import mujoco
@@ -25,7 +25,7 @@ def main():
     # The scene XML file includes the robot, floor, and lighting
     # Get path relative to this script's location
     script_dir = Path(__file__).parent
-    model_path = script_dir / "../assets/mujoco/scene_wx250s.xml"
+    model_path = script_dir / "../assets/mujoco/scene_wx250s_bimanual.xml"
     model_path = model_path.resolve()  # Convert to absolute path
     model = mujoco.MjModel.from_xml_path(str(model_path))  # Static model definition
     data = mujoco.MjData(model)  # Dynamic simulation state (positions, velocities, etc.)
@@ -54,17 +54,28 @@ def main():
     base_ctrl_y = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "joint_y")      # Target y position (meters)
     base_ctrl_theta = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "joint_th") # Target rotation (radians)
 
-    # --- WX250S Arm Actuators (6 joints) ---
+    # --- Right WX250S Arm Actuators (6 joints) ---
     # The arm has 6 degrees of freedom, from base to end-effector:
-    arm_ctrl_waist = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "waist")            # Rotates entire arm left/right
-    arm_ctrl_shoulder = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "shoulder")      # Raises/lowers upper arm
-    arm_ctrl_elbow = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "elbow")            # Bends the elbow
-    arm_ctrl_forearm_roll = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "forearm_roll")  # Rotates forearm
-    arm_ctrl_wrist_angle = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "wrist_angle")    # Bends wrist up/down
-    arm_ctrl_wrist_rotate = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "wrist_rotate")  # Rotates wrist
+    right_arm_ctrl_waist = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "right_waist")            # Rotates entire arm left/right
+    right_arm_ctrl_shoulder = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "right_shoulder")      # Raises/lowers upper arm
+    right_arm_ctrl_elbow = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "right_elbow")            # Bends the elbow
+    right_arm_ctrl_forearm_roll = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "right_forearm_roll")  # Rotates forearm
+    right_arm_ctrl_wrist_angle = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "right_wrist_angle")    # Bends wrist up/down
+    right_arm_ctrl_wrist_rotate = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "right_wrist_rotate")  # Rotates wrist
 
-    # --- Gripper Actuator ---
-    gripper_ctrl = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "fingers_actuator")  # 0 = open, 255 = closed
+    # --- Right Gripper Actuator ---
+    right_gripper_ctrl = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "right_fingers_actuator")  # 0 = open, 255 = closed
+
+    # --- Left WX250S Arm Actuators (6 joints) ---
+    left_arm_ctrl_waist = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "left_waist")
+    left_arm_ctrl_shoulder = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "left_shoulder")
+    left_arm_ctrl_elbow = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "left_elbow")
+    left_arm_ctrl_forearm_roll = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "left_forearm_roll")
+    left_arm_ctrl_wrist_angle = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "left_wrist_angle")
+    left_arm_ctrl_wrist_rotate = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "left_wrist_rotate")
+
+    # --- Left Gripper Actuator ---
+    left_gripper_ctrl = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "left_fingers_actuator")
 
     # ==========================================================================
     # STEP 4: Initialize robot to home position
@@ -76,9 +87,13 @@ def main():
     home_qpos = [
         # Mobile base (3 DOF)
         0, 0, 0,              # x=0m, y=0m, theta=0rad (at origin, facing forward)
-        # WX250S arm (6 DOF)
+        # Right WX250S arm (6 DOF)
         0, 0, 0, 0, 0, 0,     # All arm joints at zero (straight up position)
-        # Gripper fingers (multiple joints for finger segments)
+        # Right gripper fingers (multiple joints for finger segments)
+        0, 0, 0, 0, 0, 0, 0, 0,
+        # Left WX250S arm (6 DOF)
+        0, 0, 0, 0, 0, 0,
+        # Left gripper fingers
         0, 0, 0, 0, 0, 0, 0, 0
     ]
     data.qpos[:len(home_qpos)] = home_qpos
@@ -89,16 +104,23 @@ def main():
     data.ctrl[base_ctrl_y] = 0.0
     data.ctrl[base_ctrl_theta] = 0.0
 
-    # --- Arm controls (all at zero = home position) ---
-    data.ctrl[arm_ctrl_waist] = 0.0
-    data.ctrl[arm_ctrl_shoulder] = 0.0
-    data.ctrl[arm_ctrl_elbow] = 0.0
-    data.ctrl[arm_ctrl_forearm_roll] = 0.0
-    data.ctrl[arm_ctrl_wrist_angle] = 0.0
-    data.ctrl[arm_ctrl_wrist_rotate] = 0.0
+    # --- Right arm controls (all at zero = home position) ---
+    data.ctrl[right_arm_ctrl_waist] = 0.0
+    data.ctrl[right_arm_ctrl_shoulder] = 0.0
+    data.ctrl[right_arm_ctrl_elbow] = 0.0
+    data.ctrl[right_arm_ctrl_forearm_roll] = 0.0
+    data.ctrl[right_arm_ctrl_wrist_angle] = 0.0
+    data.ctrl[right_arm_ctrl_wrist_rotate] = 0.0
+    data.ctrl[right_gripper_ctrl] = 0.0  # 0 = fully open
 
-    # --- Gripper control ---
-    data.ctrl[gripper_ctrl] = 0.0  # 0 = fully open
+    # --- Left arm controls (all at zero = home position) ---
+    data.ctrl[left_arm_ctrl_waist] = 0.0
+    data.ctrl[left_arm_ctrl_shoulder] = 0.0
+    data.ctrl[left_arm_ctrl_elbow] = 0.0
+    data.ctrl[left_arm_ctrl_forearm_roll] = 0.0
+    data.ctrl[left_arm_ctrl_wrist_angle] = 0.0
+    data.ctrl[left_arm_ctrl_wrist_rotate] = 0.0
+    data.ctrl[left_gripper_ctrl] = 0.0  # 0 = fully open
 
     # Compute forward kinematics to update all derived quantities
     mujoco.mj_forward(model, data)
@@ -106,7 +128,7 @@ def main():
     # ==========================================================================
     # STEP 5: Set up the demo motion
     # ==========================================================================
-    print("Starting TidyBot2 with WX250S arm simulation...")
+    print("Starting TidyBot2 with bimanual WX250S arms simulation...")
     print("Initial position: x={:.3f}m, y={:.3f}m, theta={:.3f}rad".format(
         data.qpos[base_joint_x], data.qpos[base_joint_y], data.qpos[base_joint_theta]))
 
@@ -150,35 +172,51 @@ def main():
             data.ctrl[base_ctrl_theta] = 0.0            # No rotation
 
             # ==================================================================
-            # CONTROL THE ARM - Demo: Raise arm, wave, return home
+            # CONTROL BOTH ARMS - Demo: Raise arms, wave, return home
             # ==================================================================
             # Arm joint values are in radians. Positive/negative depends on
             # the joint's axis definition in the URDF/XML.
-            
+
             if elapsed_time < 5.0:
-                # Phase 1 (0-5 sec): Raise the arm into a bent position
-                data.ctrl[arm_ctrl_shoulder] = -0.5      # Raise shoulder (negative = up)
-                data.ctrl[arm_ctrl_elbow] = 1.0          # Bend elbow
-                data.ctrl[arm_ctrl_wrist_angle] = -0.5   # Angle wrist
-                
+                # Phase 1 (0-5 sec): Raise both arms into a bent position
+                # Right arm
+                data.ctrl[right_arm_ctrl_shoulder] = -0.5      # Raise shoulder (negative = up)
+                data.ctrl[right_arm_ctrl_elbow] = 1.0          # Bend elbow
+                data.ctrl[right_arm_ctrl_wrist_angle] = -0.5   # Angle wrist
+                # Left arm (mirrored)
+                data.ctrl[left_arm_ctrl_shoulder] = -0.5
+                data.ctrl[left_arm_ctrl_elbow] = 1.0
+                data.ctrl[left_arm_ctrl_wrist_angle] = -0.5
+
             elif elapsed_time < 10.0:
-                # Phase 2 (5-10 sec): Wave by oscillating the waist joint
+                # Phase 2 (5-10 sec): Wave by oscillating the waist joints
                 # np.sin creates smooth back-and-forth motion
                 wave_angle = np.sin(elapsed_time * 2) * 0.5  # Oscillate ±0.5 rad
-                data.ctrl[arm_ctrl_waist] = wave_angle
-                # Keep arm in raised position while waving
-                data.ctrl[arm_ctrl_shoulder] = -0.5
-                data.ctrl[arm_ctrl_elbow] = 1.0
-                data.ctrl[arm_ctrl_wrist_angle] = -0.5
-                
+                # Right arm
+                data.ctrl[right_arm_ctrl_waist] = wave_angle
+                data.ctrl[right_arm_ctrl_shoulder] = -0.5
+                data.ctrl[right_arm_ctrl_elbow] = 1.0
+                data.ctrl[right_arm_ctrl_wrist_angle] = -0.5
+                # Left arm (wave in opposite phase for variety)
+                data.ctrl[left_arm_ctrl_waist] = -wave_angle
+                data.ctrl[left_arm_ctrl_shoulder] = -0.5
+                data.ctrl[left_arm_ctrl_elbow] = 1.0
+                data.ctrl[left_arm_ctrl_wrist_angle] = -0.5
+
             elif not arm_demo_complete:
                 # Phase 3 (after 10 sec): Return all arm joints to home position
-                data.ctrl[arm_ctrl_waist] = 0.0
-                data.ctrl[arm_ctrl_shoulder] = 0.0
-                data.ctrl[arm_ctrl_elbow] = 0.0
-                data.ctrl[arm_ctrl_wrist_angle] = 0.0
+                # Right arm
+                data.ctrl[right_arm_ctrl_waist] = 0.0
+                data.ctrl[right_arm_ctrl_shoulder] = 0.0
+                data.ctrl[right_arm_ctrl_elbow] = 0.0
+                data.ctrl[right_arm_ctrl_wrist_angle] = 0.0
+                # Left arm
+                data.ctrl[left_arm_ctrl_waist] = 0.0
+                data.ctrl[left_arm_ctrl_shoulder] = 0.0
+                data.ctrl[left_arm_ctrl_elbow] = 0.0
+                data.ctrl[left_arm_ctrl_wrist_angle] = 0.0
                 arm_demo_complete = True
-                print("Arm demo complete!")
+                print("Bimanual arm demo complete!")
 
             # ==================================================================
             # STEP THE SIMULATION
