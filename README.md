@@ -51,6 +51,8 @@ ros2 run tidybot_bringup test_base.py
 
 This will run the robot in simulation
 
+To view the simulation examples with ROS2 wrapper, see ros2_ws/src/tidybot_bringup/scripts
+
 ### Run on Real Robot
 
 

@@ -26,6 +26,7 @@ from rclpy.node import Node
 import time
 
 from tidybot_msgs.msg import ArmCommand
+from std_msgs.msg import Float64MultiArray
 
 
 # Joint positions: [waist, shoulder, elbow, wrist_angle, wrist_rotate]
@@ -44,20 +45,25 @@ class TestArms(Node):
         # Publishers for arm commands
         self.right_arm_pub = self.create_publisher(ArmCommand, '/right_arm/cmd', 10)
         self.left_arm_pub = self.create_publisher(ArmCommand, '/left_arm/cmd', 10)
+        self.right_gripper_pub = self.create_publisher(Float64MultiArray, '/right_gripper/cmd', 10)
+        self.left_gripper_pub = self.create_publisher(Float64MultiArray, '/left_gripper/cmd', 10)
 
-        # State
-        self.start_time = None
-        self.command_sent = False
-        self.done = False
+        # State machine
+        self.state = 'OPEN_GRIPPERS'
+        self.state_start_time = None
+        self.logged_state = None  # Track which state we've logged
 
-        # Control loop at 50Hz
-        self.timer = self.create_timer(0.02, self.control_loop)
-
+        # Wait for connections to establish
         self.get_logger().info('=' * 50)
         self.get_logger().info('TidyBot2 Arm Control Demo')
         self.get_logger().info('=' * 50)
-        self.get_logger().info('Moving arms from home to forward position')
+        self.get_logger().info('Waiting for connections...')
+        time.sleep(0.5)
+        self.get_logger().info('Sequence: Open grippers -> Move arms -> Close grippers')
         self.get_logger().info('')
+
+        # Control loop at 50Hz
+        self.timer = self.create_timer(0.02, self.control_loop)
 
     def send_arm_command(self, pub, positions, duration=0.0):
         """Send arm command with given joint positions."""
@@ -66,31 +72,66 @@ class TestArms(Node):
         cmd.duration = duration
         pub.publish(cmd)
 
-    def control_loop(self):
-        if self.done:
-            return
+    def send_gripper_command(self, pub, position):
+        """Send gripper command with normalized position (0.0 = closed, 1.0 = open)."""
+        msg = Float64MultiArray()
+        msg.data = [float(position)]
+        pub.publish(msg)
 
+    def control_loop(self):
         now = time.time()
 
-        if self.start_time is None:
-            self.start_time = now
+        # Initialize state timing
+        if self.state_start_time is None:
+            self.state_start_time = now
 
-        elapsed = now - self.start_time
+        elapsed = now - self.state_start_time
 
-        # Send command once
-        if not self.command_sent:
-            self.get_logger().info('Sending arm commands...')
-            self.send_arm_command(self.right_arm_pub, FORWARD_POSITION, duration=MOVE_DURATION)
-            self.send_arm_command(self.left_arm_pub, FORWARD_POSITION, duration=MOVE_DURATION)
-            self.command_sent = True
+        # Log state change once
+        if self.state != self.logged_state:
+            if self.state == 'OPEN_GRIPPERS':
+                self.get_logger().info('Opening grippers...')
+            elif self.state == 'MOVE_ARMS':
+                self.get_logger().info('Moving arms forward...')
+                self.send_arm_command(self.right_arm_pub, FORWARD_POSITION, duration=MOVE_DURATION)
+                self.send_arm_command(self.left_arm_pub, FORWARD_POSITION, duration=MOVE_DURATION)
+            elif self.state == 'CLOSE_GRIPPERS':
+                self.get_logger().info('Closing grippers...')
+            elif self.state == 'DONE':
+                self.get_logger().info('')
+                self.get_logger().info('=' * 50)
+                self.get_logger().info('Done! Arms forward, grippers closed.')
+                self.get_logger().info('=' * 50)
+            self.logged_state = self.state
 
-        # Wait for motion to complete
-        if elapsed > MOVE_DURATION + 0.5:
-            self.get_logger().info('')
-            self.get_logger().info('=' * 50)
-            self.get_logger().info('Done! Arms in forward position.')
-            self.get_logger().info('=' * 50)
-            self.done = True
+        # State: Open grippers
+        if self.state == 'OPEN_GRIPPERS':
+            self.send_gripper_command(self.right_gripper_pub, 1.0)
+            self.send_gripper_command(self.left_gripper_pub, 1.0)
+            if elapsed > 1.0:
+                self.state = 'MOVE_ARMS'
+                self.state_start_time = now
+
+        # State: Move arms forward
+        elif self.state == 'MOVE_ARMS':
+            self.send_gripper_command(self.right_gripper_pub, 1.0)
+            self.send_gripper_command(self.left_gripper_pub, 1.0)
+            if elapsed > MOVE_DURATION + 0.5:
+                self.state = 'CLOSE_GRIPPERS'
+                self.state_start_time = now
+
+        # State: Close grippers
+        elif self.state == 'CLOSE_GRIPPERS':
+            self.send_gripper_command(self.right_gripper_pub, 0.0)
+            self.send_gripper_command(self.left_gripper_pub, 0.0)
+            if elapsed > 1.0:
+                self.state = 'DONE'
+                self.state_start_time = now
+
+        # State: Done
+        elif self.state == 'DONE':
+            self.send_gripper_command(self.right_gripper_pub, 0.0)
+            self.send_gripper_command(self.left_gripper_pub, 0.0)
 
 
 def main(args=None):

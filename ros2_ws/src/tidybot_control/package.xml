@@ -4,7 +4,8 @@
   <name>tidybot_control</name>
   <version>0.1.0</version>
   <description>Control nodes for TidyBot2 - arm, base, gripper, and velocity controllers</description>
-  <maintainer email="aqiu34@stanford.edu, mastro1@stanford.edu">Alex Qiu and Matt Strong</maintainer>
+  <maintainer email="aqiu34@stanford.edu">Alex Qiu</maintainer>
+  <maintainer email="mastro1@stanford.edu">Matt Strong</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_python</buildtool_depend>

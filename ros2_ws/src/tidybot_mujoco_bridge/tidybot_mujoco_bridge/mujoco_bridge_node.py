@@ -21,9 +21,9 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from sensor_msgs.msg import JointState, Image, CameraInfo
-from geometry_msgs.msg import Twist, TransformStamped
+from geometry_msgs.msg import Twist, TransformStamped, Pose2D
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Float64MultiArray, Header
+from std_msgs.msg import Float64MultiArray, Header, Bool
 from tf2_ros import TransformBroadcaster
 
 import mujoco
@@ -159,8 +159,22 @@ class MuJoCoBridgeNode(Node):
         self.lock = threading.Lock()
 
         # Acceleration limits for smooth motion (m/s^2 and rad/s^2)
-        self.max_linear_accel = 1.0   # m/s^2
-        self.max_angular_accel = 2.0  # rad/s^2
+        self.max_linear_accel = 2.0   # m/s^2 (higher = snappier response)
+        self.max_angular_accel = 4.0  # rad/s^2
+
+        # Velocity limits for position control
+        self.max_linear_vel = 0.5     # m/s
+        self.max_angular_vel = 1.5    # rad/s
+
+        # Position control state
+        self.position_control_mode = False
+        self.target_pose = None  # Pose2D (x, y, theta)
+        self.position_tolerance = 0.02      # meters
+        self.orientation_tolerance = 0.05   # radians
+
+        # Position control gains
+        self.kp_linear = 2.0   # Proportional gain for linear motion
+        self.kp_angular = 3.0  # Proportional gain for angular motion
 
         # Target positions for all actuators (initialized to current)
         self.target_ctrl = np.zeros(self.model.nu)
@@ -174,6 +188,7 @@ class MuJoCoBridgeNode(Node):
         self.rgb_pub = self.create_publisher(Image, '/camera/color/image_raw', qos)
         self.depth_pub = self.create_publisher(Image, '/camera/depth/image_raw', qos)
         self.camera_info_pub = self.create_publisher(CameraInfo, '/camera/color/camera_info', qos)
+        self.goal_reached_pub = self.create_publisher(Bool, '/base/goal_reached', 10)
 
         # TF broadcaster
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -196,6 +211,10 @@ class MuJoCoBridgeNode(Node):
         )
         self.pan_tilt_sub = self.create_subscription(
             Float64MultiArray, '/camera/pan_tilt_cmd', self.pan_tilt_callback, 10
+        )
+        # Position control subscriber - send target pose and robot drives there
+        self.target_pose_sub = self.create_subscription(
+            Pose2D, '/base/target_pose', self.target_pose_callback, 10
         )
 
         # Timers
@@ -226,11 +245,25 @@ class MuJoCoBridgeNode(Node):
             while viewer.is_running():
                 with self.lock:
                     viewer.sync()
+                # Rate limit viewer to 60 FPS to avoid starving simulation
+                time.sleep(1.0 / 60.0)
 
     def cmd_vel_callback(self, msg: Twist):
         """Handle velocity commands for the mobile base."""
         with self.lock:
+            # Velocity commands cancel position control mode
+            self.position_control_mode = False
+            self.target_pose = None
             self.cmd_vel = msg
+
+    def target_pose_callback(self, msg: Pose2D):
+        """Handle position target for the mobile base (go-to-goal)."""
+        with self.lock:
+            self.position_control_mode = True
+            self.target_pose = msg
+            self.get_logger().info(
+                f'New target pose: x={msg.x:.2f}, y={msg.y:.2f}, theta={msg.theta:.2f}'
+            )
 
     def right_arm_callback(self, msg: Float64MultiArray):
         """Handle joint commands for right arm (5 joints)."""
@@ -259,10 +292,14 @@ class MuJoCoBridgeNode(Node):
         if len(msg.data) < 1:
             return
         # Convert normalized position to finger position
+        # 0.0 = closed (fingers together), 1.0 = open (fingers apart 22mm)
         pos = msg.data[0] * 0.022  # 0.022m is max finger travel
         with self.lock:
             if 'right_left_finger' in self.actuator_ids:
-                self.target_ctrl[self.actuator_ids['right_left_finger']] = pos
+                idx = self.actuator_ids['right_left_finger']
+                if abs(self.target_ctrl[idx] - pos) > 0.001:
+                    self.get_logger().info(f'Right gripper: {self.target_ctrl[idx]:.4f} -> {pos:.4f}')
+                self.target_ctrl[idx] = pos
             if 'right_right_finger' in self.actuator_ids:
                 self.target_ctrl[self.actuator_ids['right_right_finger']] = pos
 
@@ -287,6 +324,79 @@ class MuJoCoBridgeNode(Node):
             if 'camera_tilt' in self.actuator_ids:
                 self.target_ctrl[self.actuator_ids['camera_tilt']] = msg.data[1]
 
+    def normalize_angle(self, angle):
+        """Normalize angle to [-pi, pi]."""
+        while angle > np.pi:
+            angle -= 2 * np.pi
+        while angle < -np.pi:
+            angle += 2 * np.pi
+        return angle
+
+    def compute_position_control_velocity(self):
+        """Compute velocity commands to reach target pose."""
+        if self.target_pose is None:
+            return 0.0, 0.0, 0.0
+
+        # Current pose
+        x, y, th = self.base_x, self.base_y, self.base_th
+
+        # Target pose
+        tx, ty, tth = self.target_pose.x, self.target_pose.y, self.target_pose.theta
+
+        # Position error in world frame
+        dx = tx - x
+        dy = ty - y
+        distance = np.sqrt(dx * dx + dy * dy)
+
+        # Angle to target (in world frame)
+        angle_to_target = np.arctan2(dy, dx)
+
+        # Heading error (difference between current heading and angle to target)
+        heading_error = self.normalize_angle(angle_to_target - th)
+
+        # Final orientation error
+        orientation_error = self.normalize_angle(tth - th)
+
+        # Check if we've reached the goal
+        at_position = distance < self.position_tolerance
+        at_orientation = abs(orientation_error) < self.orientation_tolerance
+
+        if at_position and at_orientation:
+            # Goal reached - publish and stop
+            goal_msg = Bool()
+            goal_msg.data = True
+            self.goal_reached_pub.publish(goal_msg)
+            self.position_control_mode = False
+            self.target_pose = None
+            self.get_logger().info('Goal reached!')
+            return 0.0, 0.0, 0.0
+
+        # Two-phase control: first rotate to face target, then drive + rotate to final
+        if not at_position:
+            # Phase 1: Drive toward target
+            if abs(heading_error) > 0.3:  # ~17 degrees - need to rotate first
+                # Rotate in place to face target
+                vx = 0.0
+                vy = 0.0
+                vth = self.kp_angular * heading_error
+            else:
+                # Drive toward target while correcting heading
+                vx = self.kp_linear * distance
+                vy = 0.0
+                vth = self.kp_angular * heading_error
+        else:
+            # Phase 2: At position, rotate to final orientation
+            vx = 0.0
+            vy = 0.0
+            vth = self.kp_angular * orientation_error
+
+        # Apply velocity limits
+        vx = np.clip(vx, -self.max_linear_vel, self.max_linear_vel)
+        vy = np.clip(vy, -self.max_linear_vel, self.max_linear_vel)
+        vth = np.clip(vth, -self.max_angular_vel, self.max_angular_vel)
+
+        return vx, vy, vth
+
     def sim_step_callback(self):
         """Step the MuJoCo simulation."""
         now = time.perf_counter()
@@ -301,10 +411,13 @@ class MuJoCoBridgeNode(Node):
         self.last_sim_time = now
 
         with self.lock:
-            # Smooth velocity commands with acceleration limits
-            target_vx = self.cmd_vel.linear.x
-            target_vy = self.cmd_vel.linear.y
-            target_vth = self.cmd_vel.angular.z
+            # Get target velocity from position controller or cmd_vel
+            if self.position_control_mode:
+                target_vx, target_vy, target_vth = self.compute_position_control_velocity()
+            else:
+                target_vx = self.cmd_vel.linear.x
+                target_vy = self.cmd_vel.linear.y
+                target_vth = self.cmd_vel.angular.z
 
             # Apply acceleration limiting for smooth motion
             max_dv_linear = self.max_linear_accel * dt

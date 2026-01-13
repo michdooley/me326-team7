@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-TidyBot2 Base Movement Demo
+TidyBot2 Base Position Control Demo
 
-Demonstrates how to control the mobile base using ROS2 velocity commands.
-The robot will drive forward a specified distance, then stop.
+Sends position targets to the base - the robot drives there automatically.
+Matches the real TidyBot2's set_target_position() interface.
 
 Topics used:
-- /cmd_vel (geometry_msgs/Twist) - velocity commands to the base
+- /base/target_pose (Pose2D) - target position [x, y, theta]
+- /base/goal_reached (Bool) - notification when goal is reached
 
 Usage:
     # Terminal 1: Start simulation
@@ -18,68 +19,86 @@ Usage:
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Pose2D
+from std_msgs.msg import Bool
 import time
 
 
-# Configuration
-LINEAR_SPEED = 0.3       # m/s
-TARGET_DISTANCE = 1.0    # meters
-
-
 class TestBase(Node):
-    """Simple base movement demo - drive forward then stop."""
 
     def __init__(self):
         super().__init__('test_base')
 
-        # Publisher for base velocity commands
-        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        # Publisher for target pose
+        self.target_pub = self.create_publisher(Pose2D, '/base/target_pose', 10)
 
-        # State tracking
-        self.start_time = None
-        self.distance_traveled = 0.0
-        self.done = False
+        # Subscriber for goal reached
+        self.goal_reached = False
+        self.goal_sub = self.create_subscription(
+            Bool, '/base/goal_reached', self.goal_callback, 10
+        )
 
-        # Control loop at 50Hz
-        self.timer = self.create_timer(0.02, self.control_loop)
+        # State machine
+        self.state = 'MOVE_1'
+        self.state_start_time = None
+
+        # Control loop at 10Hz
+        self.timer = self.create_timer(0.1, self.control_loop)
 
         self.get_logger().info('=' * 50)
-        self.get_logger().info('TidyBot2 Base Movement Demo')
+        self.get_logger().info('TidyBot2 Position Control Demo')
         self.get_logger().info('=' * 50)
-        self.get_logger().info(f'Target: {TARGET_DISTANCE}m at {LINEAR_SPEED}m/s')
-        self.get_logger().info('')
+
+    def goal_callback(self, msg: Bool):
+        if msg.data:
+            self.goal_reached = True
+
+    def send_target(self, x, y, theta=0.0):
+        msg = Pose2D()
+        msg.x = x
+        msg.y = y
+        msg.theta = theta
+        self.target_pub.publish(msg)
 
     def control_loop(self):
-        if self.done:
-            return
+        now = time.time()
 
-        # Initialize timing
-        if self.start_time is None:
-            self.start_time = time.time()
-            self.get_logger().info('Starting movement...')
+        if self.state_start_time is None:
+            self.state_start_time = now
 
-        twist = Twist()
+        elapsed = now - self.state_start_time
 
-        if self.distance_traveled < TARGET_DISTANCE:
-            # Drive forward
-            twist.linear.x = LINEAR_SPEED
-            self.distance_traveled += LINEAR_SPEED * 0.02  # dt = 0.02s
+        # State: Move forward 0.5m
+        if self.state == 'MOVE_1':
+            if elapsed < 0.2:
+                self.send_target(0.5, 0.0)
+                self.get_logger().info('Moving to x=0.5m...')
+            elif self.goal_reached:
+                self.get_logger().info('Reached first target. Waiting 5 seconds...')
+                self.state = 'WAIT'
+                self.state_start_time = now
+                self.goal_reached = False
 
-            # Log progress every 0.25m
-            if int(self.distance_traveled * 4) > int((self.distance_traveled - LINEAR_SPEED * 0.02) * 4):
-                self.get_logger().info(f'Distance: {self.distance_traveled:.2f}m / {TARGET_DISTANCE}m')
-        else:
-            # Stop
-            twist.linear.x = 0.0
-            elapsed = time.time() - self.start_time
-            self.get_logger().info('')
-            self.get_logger().info('=' * 50)
-            self.get_logger().info(f'Done! Traveled {self.distance_traveled:.2f}m in {elapsed:.1f}s')
-            self.get_logger().info('=' * 50)
-            self.done = True
+        # State: Wait 5 seconds
+        elif self.state == 'WAIT':
+            if elapsed >= 5.0:
+                self.get_logger().info('Moving to x=1.0m...')
+                self.state = 'MOVE_2'
+                self.state_start_time = now
 
-        self.cmd_vel_pub.publish(twist)
+        # State: Move another 0.5m forward (total 1.0m)
+        elif self.state == 'MOVE_2':
+            if elapsed < 0.2:
+                self.send_target(1.0, 0.0)
+            elif self.goal_reached:
+                self.get_logger().info('')
+                self.get_logger().info('=' * 50)
+                self.get_logger().info('Done!')
+                self.get_logger().info('=' * 50)
+                self.state = 'DONE'
+
+        elif self.state == 'DONE':
+            pass
 
 
 def main(args=None):
@@ -91,9 +110,6 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        # Send stop command before shutting down
-        stop = Twist()
-        node.cmd_vel_pub.publish(stop)
         node.destroy_node()
         rclpy.shutdown()
 

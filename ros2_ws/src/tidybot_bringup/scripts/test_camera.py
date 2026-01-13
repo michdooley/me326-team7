@@ -77,6 +77,7 @@ class TestCamera(Node):
             )
 
         # State
+        self.waiting_for_camera = True
         self.position_index = 0
         self.settled_time = None
         self.done = False
@@ -92,7 +93,7 @@ class TestCamera(Node):
         self.get_logger().info('TidyBot2 Camera Pan-Tilt Demo')
         self.get_logger().info('=' * 50)
         self.get_logger().info(f'Images saved to: {self.output_dir}')
-        self.get_logger().info('')
+        self.get_logger().info('Waiting for camera feed...')
 
     def joint_state_callback(self, msg: JointState):
         for i, name in enumerate(msg.name):
@@ -109,6 +110,14 @@ class TestCamera(Node):
 
     def control_loop(self):
         if self.done:
+            return
+
+        # Wait for camera feed before starting
+        if self.waiting_for_camera:
+            if self.latest_rgb is not None:
+                self.waiting_for_camera = False
+                self.get_logger().info('Camera ready!')
+                self.get_logger().info('')
             return
 
         if self.position_index >= len(POSITIONS):
