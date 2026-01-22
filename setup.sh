@@ -118,6 +118,9 @@ install_ros2() {
     sudo apt update
     sudo apt install -y ros-humble-desktop
 
+    # Update again before installing additional packages
+    sudo apt update
+
     # Install additional ROS2 packages
     sudo apt install -y \
         ros-humble-xacro \
