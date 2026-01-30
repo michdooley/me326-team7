@@ -101,8 +101,9 @@ def capture_rgb_image(renderer, data, camera_name="d435_rgb"):
     # Render the scene - returns RGB image as numpy array (height, width, 3)
     rgb = renderer.render()
 
-    # MuJoCo renders images upside-down, so flip vertically
-    rgb = np.flipud(rgb)
+    # MuJoCo renders images upside-down and left-right mirrored due to camera quaternion,
+    # so flip both vertically and horizontally
+    rgb = np.fliplr(np.flipud(rgb))
 
     return rgb
 
@@ -131,8 +132,8 @@ def capture_depth_image(renderer, data, camera_name="d435_depth"):
     # Disable depth rendering for next RGB capture
     renderer.disable_depth_rendering()
 
-    # Flip vertically to match RGB orientation
-    depth = np.flipud(depth)
+    # Flip vertically and horizontally to match RGB orientation
+    depth = np.fliplr(np.flipud(depth))
 
     return depth
 

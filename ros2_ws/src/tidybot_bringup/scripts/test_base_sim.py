@@ -14,7 +14,7 @@ Usage:
     ros2 launch tidybot_bringup sim.launch.py
 
     # Terminal 2: Run this demo
-    ros2 run tidybot_bringup test_base.py
+    ros2 run tidybot_bringup test_base_sim.py
 """
 
 import rclpy

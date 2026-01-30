@@ -617,16 +617,17 @@ class MuJoCoBridgeNode(Node):
             # Render RGB image
             self.renderer.update_scene(self.data, camera='d435_rgb')
             rgb_image = self.renderer.render()
-            # Flip vertically to match ROS camera convention
-            rgb_image = np.flipud(rgb_image).copy()
+            # Flip vertically and horizontally to match ROS camera convention
+            # (MuJoCo camera quaternion causes both vertical and horizontal flip)
+            rgb_image = np.fliplr(np.flipud(rgb_image)).copy()
 
             # Render depth image
             self.renderer.update_scene(self.data, camera='d435_depth')
             self.renderer.enable_depth_rendering()
             depth_image = self.renderer.render()
             self.renderer.disable_depth_rendering()
-            # Flip vertically to match ROS camera convention
-            depth_image = np.flipud(depth_image).copy()
+            # Flip vertically and horizontally to match ROS camera convention
+            depth_image = np.fliplr(np.flipud(depth_image)).copy()
 
         # Publish RGB image
         try:

@@ -114,14 +114,14 @@ RUN echo '#!/bin/bash' > /usr/local/bin/tidybot-test-base && \
     echo 'source /opt/ros/humble/setup.bash' >> /usr/local/bin/tidybot-test-base && \
     echo 'source /opt/tidybot2/ros2_ws/install/setup.bash' >> /usr/local/bin/tidybot-test-base && \
     echo 'export PYTHONPATH="/opt/tidybot2/.venv/lib/python3.10/site-packages:$PYTHONPATH"' >> /usr/local/bin/tidybot-test-base && \
-    echo 'ros2 run tidybot_bringup test_base.py' >> /usr/local/bin/tidybot-test-base && \
+    echo 'ros2 run tidybot_bringup test_base_sim.py' >> /usr/local/bin/tidybot-test-base && \
     chmod +x /usr/local/bin/tidybot-test-base
 
 RUN echo '#!/bin/bash' > /usr/local/bin/tidybot-test-arms && \
     echo 'source /opt/ros/humble/setup.bash' >> /usr/local/bin/tidybot-test-arms && \
     echo 'source /opt/tidybot2/ros2_ws/install/setup.bash' >> /usr/local/bin/tidybot-test-arms && \
     echo 'export PYTHONPATH="/opt/tidybot2/.venv/lib/python3.10/site-packages:$PYTHONPATH"' >> /usr/local/bin/tidybot-test-arms && \
-    echo 'ros2 run tidybot_bringup test_arms.py' >> /usr/local/bin/tidybot-test-arms && \
+    echo 'ros2 run tidybot_bringup test_arms_sim.py' >> /usr/local/bin/tidybot-test-arms && \
     chmod +x /usr/local/bin/tidybot-test-arms
 
 # =============================================================================

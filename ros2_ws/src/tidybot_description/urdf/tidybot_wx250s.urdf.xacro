@@ -390,7 +390,7 @@
   </xacro:macro>
 
   <!-- Instantiate both arms -->
-  <xacro:wx250s_arm prefix="right" x_offset="0.15" y_offset="-0.1199" yaw="-1.5708"/>
-  <xacro:wx250s_arm prefix="left" x_offset="-0.15" y_offset="-0.1199" yaw="-1.5708"/>
+  <xacro:wx250s_arm prefix="right" x_offset="-0.15" y_offset="-0.1199" yaw="-1.5708"/>
+  <xacro:wx250s_arm prefix="left" x_offset="0.15" y_offset="-0.1199" yaw="-1.5708"/>
 
 </robot>

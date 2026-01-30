@@ -88,13 +88,13 @@ cd ros2_ws
 source setup_env.bash
 
 # Test base movement
-ros2 run tidybot_bringup test_base.py
+ros2 run tidybot_bringup test_base_sim.py
 
 # Test bimanual arms
-ros2 run tidybot_bringup test_arms.py
+ros2 run tidybot_bringup test_arms_sim.py
 
 # Test camera pan-tilt
-ros2 run tidybot_bringup test_camera.py
+ros2 run tidybot_bringup test_camera_sim.py
 
 # Advanced state machine example
 ros2 run tidybot_bringup example_state_machine.py

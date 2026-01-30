@@ -21,10 +21,10 @@ install(DIRECTORY rviz/
 
 # Install Python scripts as executables
 install(PROGRAMS
-  scripts/test_base.py
-  scripts/test_camera.py
-  scripts/test_arms.py
-  scripts/test_planner.py
+  scripts/test_base_sim.py
+  scripts/test_camera_sim.py
+  scripts/test_arms_sim.py
+  scripts/test_planner_sim.py
   scripts/test_real_hardware.py
   scripts/test_base_real.py
   scripts/test_arms_real.py

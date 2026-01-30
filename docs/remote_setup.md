@@ -123,7 +123,7 @@ ros2 topic pub /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.1}}" -r 10
 ros2 topic echo /joint_states
 
 # Send arm command (using test script)
-ros2 run tidybot_bringup test_arms.py
+ros2 run tidybot_bringup test_arms_sim.py
 ```
 
 ## Network Configuration Options

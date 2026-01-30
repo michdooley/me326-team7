@@ -10,7 +10,7 @@ Usage:
     ros2 launch tidybot_bringup sim.launch.py
 
     # Terminal 2: Run this demo
-    ros2 run tidybot_bringup test_planner.py
+    ros2 run tidybot_bringup test_planner_sim.py
 """
 
 import rclpy

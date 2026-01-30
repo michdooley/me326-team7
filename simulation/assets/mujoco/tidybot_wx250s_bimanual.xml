@@ -164,7 +164,7 @@
 
       <!-- ==================== RIGHT WX250s ARM ==================== -->
       <!-- 6-DOF arm: waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate -->
-      <body name="right_arm_base_link" pos="0.15 -0.1199 0.3847" euler="0 0 -1.5708">
+      <body name="right_arm_base_link" pos="-0.15 -0.1199 0.3847" euler="0 0 -1.5708">
         <geom type="mesh" mesh="wx250s_base" pos="-0.095773 0 -0.10565" quat="0.5 0.5 0.5 0.5"
               contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
 
@@ -245,7 +245,7 @@
 
       <!-- ==================== LEFT WX250s ARM ==================== -->
       <!-- 6-DOF arm: waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate -->
-      <body name="left_arm_base_link" pos="-0.15 -0.1199 0.3847" euler="0 0 -1.5708">
+      <body name="left_arm_base_link" pos="0.15 -0.1199 0.3847" euler="0 0 -1.5708">
         <geom type="mesh" mesh="wx250s_base" pos="-0.095773 0 -0.10565" quat="0.5 0.5 0.5 0.5"
               contype="0" conaffinity="0" group="2" rgba="0.3 0.3 0.3 1"/>
 
