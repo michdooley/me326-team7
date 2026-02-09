@@ -76,7 +76,9 @@ You run **real ROS2 nodes** on your machine, not a custom client library. This:
 
 ```bash
 # SSH into robot
-ssh locobot@192.169.1.7 # NUC Ip address # ssh password: locobot
+ssh locobot@192.168.0.207 
+# NUC Ip address may change, check with ifconfig if not accessible
+# ssh password: locobot
 
 # Set up environment
 export ROS_DOMAIN_ID=42
