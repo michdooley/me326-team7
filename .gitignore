@@ -55,3 +55,5 @@ ros2_ws/log/
 
 # Captured images from demos
 **/captures/
+docs/client_machine_setup.md
+ros2_ws/MUJOCO_LOG.TXT
