@@ -24,6 +24,7 @@ install(PROGRAMS
   scripts/test_base_sim.py
   scripts/test_camera_sim.py
   scripts/test_arms_sim.py
+  scripts/test_grippers_sim.py
   scripts/test_planner_sim.py
   scripts/test_real_hardware.py
   scripts/test_base_real.py
@@ -38,10 +39,9 @@ install(PROGRAMS
   scripts/example_state_machine.py
   scripts/trajectory_tracking.py
   scripts/task_navigate_to_position.py
-  scripts/task_pickup_object.py
-  scripts/pick_up_block_sim.py
   scripts/test_simple_arm.py
   scripts/test_motion_planner.py
+  scripts/pick_up_block.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

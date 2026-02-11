@@ -25,7 +25,7 @@
     <body name="block" pos="0.55 -0.15 0.025">
       <freejoint name="block_joint"/>
       <geom name="block_geom" type="box" size="0.025 0.025 0.025" mass="0.1" material="block_material"
-        friction="1.0 0.5 0.5" solref="0.01 1" solimp="0.99 0.99 0.001"/>
+        friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
     </body>
   </worldbody>
 </mujoco>
