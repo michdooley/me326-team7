@@ -58,3 +58,4 @@ ros2_ws/log/
 
 # Audio recordings from microphone tests
 **/recordings/
+ros2_ws/MUJOCO_LOG.TXT
