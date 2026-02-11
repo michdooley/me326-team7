@@ -38,6 +38,10 @@ install(PROGRAMS
   scripts/example_state_machine.py
   scripts/trajectory_tracking.py
   scripts/task_navigate_to_position.py
+  scripts/task_pickup_object.py
+  scripts/pick_up_block_sim.py
+  scripts/test_simple_arm.py
+  scripts/test_motion_planner.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
