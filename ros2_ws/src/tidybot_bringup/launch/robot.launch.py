@@ -121,7 +121,7 @@ def launch_setup(context, *args, **kwargs):
         if use_left_arm:
             source_list.append('/left_arm/joint_states')
         if use_pan_tilt:
-            source_list.append('/pan_tilt/joint_states')
+            source_list.append('/camera/pan_tilt_state')
 
         nodes.append(Node(
             package='joint_state_publisher',

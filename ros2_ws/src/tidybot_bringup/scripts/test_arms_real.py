@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test TidyBot2 Arms, Pan-Tilt, and Grippers using simulation-compatible topics.
+Test TidyBot2 Arms and Grippers using simulation-compatible topics.
 
 This script uses the same topics as the MuJoCo simulation, allowing the same
 code to work on both simulation and real hardware (via arm_wrapper_node).
@@ -11,16 +11,14 @@ Topics used (same as simulation):
     - /right_gripper/cmd (Float64MultiArray) - right gripper (0=open, 1=closed)
     - /left_gripper/cmd (Float64MultiArray) - left gripper (0=open, 1=closed)
 
-Hardware Setup (Dual U2D2):
-    - U2D2 #1 (/dev/ttyUSB_RIGHT): Right arm (IDs 1-9) + Pan-tilt (IDs 21-22)
-    - U2D2 #2 (/dev/ttyUSB_LEFT): Left arm (IDs 11-19)
+For pan-tilt testing, see test_pan_tilt_real.py.
 
 Usage:
     # First, launch real.launch.py (includes arm_wrapper_node and gripper_wrapper_node):
     ros2 launch tidybot_bringup real.launch.py
 
     # Then run this test:
-    ros2 run tidybot_bringup test_arms_real.py
+    python3 test_arms_real.py
 """
 
 import math
@@ -29,7 +27,6 @@ import time
 
 import rclpy
 from rclpy.node import Node
-from interbotix_xs_msgs.msg import JointGroupCommand
 from interbotix_xs_msgs.srv import TorqueEnable
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
@@ -39,13 +36,6 @@ from std_msgs.msg import Float64MultiArray
 HOME_POSE = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 SLEEP_POSE = [0.0, -1.80, 1.55, 0.0, 0.8, 0.0]
 FORWARD_POSE = [0.0, -0.5, 0.5, 0.0, 0.0, 0.0]
-
-# Pan-tilt poses [pan, tilt]
-PAN_TILT_CENTER = [0.0, 0.0]
-PAN_TILT_LEFT = [0.5, 0.0]
-PAN_TILT_RIGHT = [-0.5, 0.0]
-PAN_TILT_UP = [0.0, -0.3]
-PAN_TILT_DOWN = [0.0, 0.3]
 
 
 class RobotTester(Node):
@@ -61,11 +51,6 @@ class RobotTester(Node):
             Float64MultiArray, '/left_arm/joint_cmd', 10
         )
 
-        # Pan-tilt publisher - directly to xs_sdk (no wrapper needed)
-        self.pan_tilt_pub = self.create_publisher(
-            JointGroupCommand, '/right_arm/commands/joint_group', 10
-        )
-
         # Torque clients (still needed for enabling motors)
         self.right_torque_client = self.create_client(
             TorqueEnable, '/right_arm/torque_enable'
@@ -77,15 +62,11 @@ class RobotTester(Node):
         # Subscribe to joint states from both namespaces
         self.right_joint_states = None
         self.left_joint_states = None
-        self.pan_tilt_joint_states = None
         self.right_js_sub = self.create_subscription(
             JointState, '/right_arm/joint_states', self._right_joint_state_cb, 10
         )
         self.left_js_sub = self.create_subscription(
             JointState, '/left_arm/joint_states', self._left_joint_state_cb, 10
-        )
-        self.pan_tilt_js_sub = self.create_subscription(
-            JointState, '/pan_tilt/joint_states', self._pan_tilt_joint_state_cb, 10
         )
 
         # Gripper publishers (simulation-compatible, translated by gripper_wrapper_node)
@@ -114,21 +95,17 @@ class RobotTester(Node):
     def _left_joint_state_cb(self, msg):
         self.left_joint_states = msg
 
-    def _pan_tilt_joint_state_cb(self, msg):
-        self.pan_tilt_joint_states = msg
-
     def wait_for_joint_states(self, timeout=5.0):
-        """Wait until we receive joint states from arms and pan-tilt (or timeout)."""
+        """Wait until we receive joint states from both arms (or timeout).
+
+        Returns True if at least one arm was found.
+        """
         start = time.time()
         while (time.time() - start) < timeout:
             rclpy.spin_once(self, timeout_sec=0.1)
-            # Keep spinning until we have arms and pan-tilt, or timeout
-            has_arms = (self.right_joint_states is not None or
-                       self.left_joint_states is not None)
-            has_pan_tilt = self.pan_tilt_joint_states is not None
-            if has_arms and has_pan_tilt:
+            if self.right_joint_states is not None and self.left_joint_states is not None:
                 return True
-        # Return True if we got at least one arm
+        # Timed out — return True if we got at least one
         return self.right_joint_states is not None or self.left_joint_states is not None
 
     def move_arm(self, arm_side, positions, move_time=2.0):
@@ -182,19 +159,6 @@ class RobotTester(Node):
         self.get_logger().info(f'Moving {arm_side} {joint_names[joint_index]} to {position:.2f}')
 
         self.move_arm(arm_side, positions, move_time)
-
-    def move_pan_tilt(self, positions, move_time=1.5):
-        """Move pan-tilt to specified positions (directly to xs_sdk)."""
-        msg = JointGroupCommand()
-        msg.name = 'pan_tilt'
-        msg.cmd = positions
-
-        self.get_logger().info(f'Moving pan_tilt to {[f"{p:.2f}" for p in positions]}')
-        self.pan_tilt_pub.publish(msg)
-
-        time.sleep(move_time)
-        for _ in range(10):
-            rclpy.spin_once(self, timeout_sec=0.05)
 
     def set_torque(self, namespace, group_name, enable):
         """Enable or disable torque on a group."""
@@ -252,35 +216,6 @@ class RobotTester(Node):
 
         print(f"{arm_side.upper()} ARM test complete!")
 
-    def test_pan_tilt(self):
-        """Run test routine on pan-tilt (on right_arm namespace/U2D2)."""
-        print()
-        print("Testing PAN-TILT...")
-        print("-" * 40)
-
-        # Enable torque
-        self.get_logger().info('Enabling torque on pan_tilt...')
-        self.set_torque('right_arm', 'pan_tilt', True)
-        time.sleep(0.5)
-
-        # Test sequence
-        print("[1/5] Moving to CENTER...")
-        self.move_pan_tilt(PAN_TILT_CENTER, move_time=1.5)
-
-        print("[2/5] Panning LEFT...")
-        self.move_pan_tilt(PAN_TILT_LEFT, move_time=1.5)
-
-        print("[3/5] Panning RIGHT...")
-        self.move_pan_tilt(PAN_TILT_RIGHT, move_time=1.5)
-
-        print("[4/5] Tilting UP...")
-        self.move_pan_tilt(PAN_TILT_UP, move_time=1.5)
-
-        print("[5/5] Returning to CENTER...")
-        self.move_pan_tilt(PAN_TILT_CENTER, move_time=1.5)
-
-        print("PAN-TILT test complete!")
-
     def set_gripper(self, side, position, duration=2.0):
         """
         Set gripper position using wrapper node.
@@ -315,10 +250,6 @@ class RobotTester(Node):
         print()
         print("Testing GRIPPERS (via gripper_wrapper_node)...")
         print("-" * 40)
-
-        # Allow bus to settle after pan-tilt commands
-        print("Waiting for bus to settle...")
-        time.sleep(1.0)
 
         print("[1/4] Opening RIGHT gripper...")
         self.set_gripper('right', 0.0, duration=2.0)
@@ -358,7 +289,7 @@ class RobotTester(Node):
 
 def main():
     print("=" * 60)
-    print("TidyBot2 Full Robot Test (Simulation-Compatible Topics)")
+    print("TidyBot2 Arms & Grippers Test (Simulation-Compatible Topics)")
     print("=" * 60)
     print()
     print("This test uses the same topics as simulation:")
@@ -366,31 +297,25 @@ def main():
     print("  - /left_arm/joint_cmd (Float64MultiArray)")
     print("  - /right_gripper/cmd, /left_gripper/cmd")
     print()
-    print("Hardware configuration:")
-    print("  U2D2 #1 (/dev/ttyUSB_RIGHT): Right arm + Pan-tilt")
-    print("  U2D2 #2 (/dev/ttyUSB_LEFT): Left arm")
-    print()
 
     rclpy.init()
     node = RobotTester()
 
     try:
-        # Wait for joint states from both arms
-        print("Waiting for joint states from both arms...")
+        # Wait for joint states from arms
+        print("Waiting for joint states...")
         if not node.wait_for_joint_states(timeout=10.0):
             print("ERROR: No joint states received!")
             print("Make sure to launch the arm drivers first:")
             print("  ros2 launch tidybot_bringup real.launch.py")
             return 1
 
-        # Check which components are available
+        # Check which arms are available
         right_joints = node.right_joint_states.name if node.right_joint_states else []
         left_joints = node.left_joint_states.name if node.left_joint_states else []
-        pan_tilt_joints = node.pan_tilt_joint_states.name if node.pan_tilt_joint_states else []
 
         has_right = len(right_joints) > 0
         has_left = len(left_joints) > 0
-        has_pan_tilt = 'camera_pan' in pan_tilt_joints and 'camera_tilt' in pan_tilt_joints
 
         print()
         print("Detected components:")
@@ -400,9 +325,6 @@ def main():
         print(f"  Left arm (/left_arm):   {'Yes' if has_left else 'No'}")
         if has_left:
             print(f"    Joints: {left_joints}")
-        print(f"  Pan-tilt (/pan_tilt):   {'Yes' if has_pan_tilt else 'No'}")
-        if has_pan_tilt:
-            print(f"    Joints: {pan_tilt_joints}")
 
         # Test left arm first (per user request)
         if has_left:
@@ -416,13 +338,7 @@ def main():
         else:
             print("\nSkipping right arm (not found)")
 
-        # Then test pan-tilt
-        if has_pan_tilt:
-            node.test_pan_tilt()
-        else:
-            print("\nSkipping pan-tilt (not found)")
-
-        # Test grippers (requires gripper_wrapper_node from real.launch.py)
+        # Test grippers
         if has_right or has_left:
             node.test_grippers()
         else:

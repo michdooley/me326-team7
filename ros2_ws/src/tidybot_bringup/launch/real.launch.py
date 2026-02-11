@@ -63,6 +63,7 @@ def launch_setup(context, *args, **kwargs):
     use_compression = LaunchConfiguration('use_compression').perform(context) == 'true'
     use_rviz = LaunchConfiguration('use_rviz').perform(context) == 'true'
     use_planner = LaunchConfiguration('use_planner').perform(context) == 'true'
+    use_microphone = LaunchConfiguration('use_microphone').perform(context) == 'true'
     use_sim_topics = LaunchConfiguration('use_sim_topics').perform(context) == 'true'
     load_configs = LaunchConfiguration('load_configs').perform(context) == 'true'
 
@@ -113,7 +114,7 @@ def launch_setup(context, *args, **kwargs):
         if use_left_arm:
             source_list.append('/left_arm/joint_states')
         if use_pan_tilt:
-            source_list.append('/pan_tilt/joint_states')
+            source_list.append('/camera/pan_tilt_state')
 
         nodes.append(Node(
             package='joint_state_publisher',
@@ -224,6 +225,7 @@ def launch_setup(context, *args, **kwargs):
             parameters=[{
                 'camera_name': 'camera',
                 'camera_namespace': '',
+                'serial_no': '_023422071689',
                 'base_frame_id': 'link',
                 'enable_color': True,
                 'enable_depth': True,
@@ -286,6 +288,20 @@ def launch_setup(context, *args, **kwargs):
             }]
         ))
 
+    # Microphone recording node
+    if use_microphone:
+        nodes.append(Node(
+            package='tidybot_control',
+            executable='microphone_node',
+            name='microphone',
+            output='screen',
+            parameters=[{
+                'sample_rate': 16000,
+                'channels': 1,
+                'device_index': -1,
+            }]
+        ))
+
     return nodes
 
 
@@ -319,6 +335,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'use_compression', default_value='false',
             description='Launch image compression for remote clients'
+        ),
+        DeclareLaunchArgument(
+            'use_microphone', default_value='true',
+            description='Launch microphone recording node'
         ),
         DeclareLaunchArgument(
             'use_planner', default_value='false',

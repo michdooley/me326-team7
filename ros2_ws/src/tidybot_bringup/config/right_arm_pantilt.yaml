@@ -14,7 +14,7 @@ joint_state_publisher:
 
 # Publish pan_tilt group joints to a separate topic (absolute path to avoid namespace prefix)
 group_joint_state_publishers:
-  pan_tilt: /pan_tilt/joint_states
+  pan_tilt: /camera/pan_tilt_state
 
 groups:
   right_arm: [right_waist, right_shoulder, right_elbow, right_forearm_roll, right_wrist_angle, right_wrist_rotate]
