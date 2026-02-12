@@ -40,4 +40,9 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+# utility modules
+install(DIRECTORY utilities/
+  DESTINATION lib/${PROJECT_NAME}/utilities
+)
+
 ament_package()
