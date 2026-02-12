@@ -1,0 +1,8 @@
+# Convert a 2D bounding box detection to a 3D position
+# Uses the latest cached depth frame + camera intrinsics + TF
+tidybot_msgs/Detection2D detection
+---
+bool success
+geometry_msgs/PointStamped position     # 3D point in base_link frame
+float64 distance                        # distance to object in meters
+string message

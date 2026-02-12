@@ -1,0 +1,7 @@
+# Request object detection in the current camera frame
+# Optionally filter by class name
+string target_class       # empty = detect all, or e.g. "apple" to filter
+---
+bool success
+tidybot_msgs/Detection2D[] detections
+string message

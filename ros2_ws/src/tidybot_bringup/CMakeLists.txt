@@ -37,6 +37,9 @@ install(PROGRAMS
   scripts/diagnose_dynamixel.py
   scripts/example_state_machine.py
   scripts/trajectory_tracking.py
+  scripts/task1_retrieve.py
+  scripts/voice_command.py
+  scripts/navigate_to_object.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
