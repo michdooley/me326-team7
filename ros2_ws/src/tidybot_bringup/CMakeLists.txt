@@ -43,6 +43,12 @@ install(PROGRAMS
   scripts/test_motion_planner.py
   scripts/pick_up_block.py
   scripts/frontier_exploration.py
+  scripts/objective1_task.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# Install subtask modules (importable by objective1_task.py)
+install(DIRECTORY scripts/subtasks
   DESTINATION lib/${PROJECT_NAME}
 )
 
