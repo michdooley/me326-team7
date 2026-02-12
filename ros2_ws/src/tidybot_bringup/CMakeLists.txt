@@ -42,6 +42,7 @@ install(PROGRAMS
   scripts/test_simple_arm.py
   scripts/test_motion_planner.py
   scripts/pick_up_block.py
+  scripts/frontier_exploration.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

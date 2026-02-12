@@ -1,0 +1,140 @@
+<mujoco model="tidybot obstacle scene">
+  <include file="tidybot_wx250s_bimanual.xml"/>
+
+  <statistic center="0 0 0.525" extent="1.1" meansize="0.05"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.1 0.1 0.1" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="140" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+
+    <!-- Obstacle material (grey) -->
+    <material name="obstacle_material" rgba="0.5 0.5 0.5 1"/>
+    <!-- Wall material (dark grey) -->
+    <material name="wall_material" rgba="0.35 0.35 0.35 1"/>
+
+    <!-- Cube materials (various colors) -->
+    <material name="red_cube" rgba="0.8 0.2 0.2 1"/>
+    <material name="blue_cube" rgba="0.2 0.3 0.8 1"/>
+    <material name="green_cube" rgba="0.2 0.7 0.3 1"/>
+    <material name="yellow_cube" rgba="0.9 0.8 0.1 1"/>
+    <material name="orange_cube" rgba="0.9 0.5 0.1 1"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.5" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <!-- ===== Border walls (15m x 15m, 0.5m tall) ===== -->
+    <!-- Walls are centered at (0, 0), spanning -7.5 to 7.5 on each axis -->
+    <geom name="wall_north" type="box" pos="0 7.5 0.25" size="7.5 0.05 0.25" material="wall_material"/>
+    <geom name="wall_south" type="box" pos="0 -7.5 0.25" size="7.5 0.05 0.25" material="wall_material"/>
+    <geom name="wall_east" type="box" pos="7.5 0 0.25" size="0.05 7.5 0.25" material="wall_material"/>
+    <geom name="wall_west" type="box" pos="-7.5 0 0.25" size="0.05 7.5 0.25" material="wall_material"/>
+
+    <!-- ===== Large grey obstacles (static, not pickable) ===== -->
+    <!-- 6 obstacles spread with ~0.75m+ gaps for robot passage -->
+
+    <!-- Row 1: near field -->
+
+    <!-- Tall box - near right -->
+    <body name="obstacle_tall_box_1" pos="1.2 -0.95 0.25">
+      <geom name="obstacle_tall_box_1_geom" type="box" size="0.15 0.15 0.25" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <!-- Wide flat box - near left -->
+    <body name="obstacle_wide_flat_1" pos="1.0 0.95 0.08">
+      <geom name="obstacle_wide_flat_1_geom" type="box" size="0.30 0.15 0.08" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <!-- Row 2: mid field -->
+
+    <!-- Cylinder - mid right -->
+    <body name="obstacle_cylinder_1" pos="2.0 -0.5 0.2">
+      <geom name="obstacle_cylinder_1_geom" type="cylinder" size="0.18 0.2" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <!-- Tall box - mid left -->
+    <body name="obstacle_tall_box_2" pos="1.9 0.6 0.25">
+      <geom name="obstacle_tall_box_2_geom" type="box" size="0.15 0.15 0.25" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <!-- Row 3: far field -->
+
+    <!-- Wide flat box - far right -->
+    <body name="obstacle_wide_flat_2" pos="2.8 -0.7 0.08">
+      <geom name="obstacle_wide_flat_2_geom" type="box" size="0.30 0.15 0.08" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <!-- Cylinder - far left -->
+    <body name="obstacle_cylinder_2" pos="2.7 0.5 0.2">
+      <geom name="obstacle_cylinder_2_geom" type="cylinder" size="0.18 0.2" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <!-- ===== Colored cubes (small, pickable) ===== -->
+    <!-- Distributed throughout the environment, between and around obstacles -->
+
+    <!-- Red cube - near robot -->
+    <body name="red_block" pos="0.5 -0.15 0.025">
+      <freejoint name="red_block_joint"/>
+      <geom name="red_block_geom" type="box" size="0.025 0.025 0.025" mass="0.1" material="red_cube"
+        friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
+    </body>
+
+    <!-- Blue cube - gap between near obstacles -->
+    <body name="blue_block" pos="1.1 0.0 0.025">
+      <freejoint name="blue_block_joint"/>
+      <geom name="blue_block_geom" type="box" size="0.025 0.025 0.025" mass="0.1" material="blue_cube"
+        friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
+    </body>
+
+    <!-- Green cube - between mid-field obstacles -->
+    <body name="green_block" pos="1.95 0.05 0.025">
+      <freejoint name="green_block_joint"/>
+      <geom name="green_block_geom" type="box" size="0.025 0.025 0.025" mass="0.1" material="green_cube"
+        friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
+    </body>
+
+    <!-- Yellow cube - between mid and far rows, left side -->
+    <body name="yellow_block" pos="2.35 0.55 0.025">
+      <freejoint name="yellow_block_joint"/>
+      <geom name="yellow_block_geom" type="box" size="0.025 0.025 0.025" mass="0.1" material="yellow_cube"
+        friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
+    </body>
+
+    <!-- Orange cube - far field, between far obstacles -->
+    <body name="orange_block" pos="2.75 -0.1 0.025">
+      <freejoint name="orange_block_joint"/>
+      <geom name="orange_block_geom" type="box" size="0.025 0.025 0.025" mass="0.1" material="orange_cube"
+        friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
+    </body>
+  </worldbody>
+
+  <keyframe>
+    <!-- qpos: robot(21) + 5 freejointed blocks (7 each: x y z qw qx qy qz) = 56 total -->
+    <key name="scene_home"
+      qpos="0 0 1.5708
+        0 0
+        0 0 0 0 0 0 0.037 0.037
+        0 0 0 0 0 0 0.037 0.037
+        0.5 -0.15 0.025 1 0 0 0
+        1.1 0.0 0.025 1 0 0 0
+        1.95 0.05 0.025 1 0 0 0
+        2.35 0.55 0.025 1 0 0 0
+        2.75 -0.1 0.025 1 0 0 0"
+      ctrl="0 0 1.5708 0 0 0 0 0 0 0 0 0.037 0.037 0 0 0 0 0 0 0.037 0.037"/>
+  </keyframe>
+</mujoco>
