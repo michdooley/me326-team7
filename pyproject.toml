@@ -32,6 +32,9 @@ dependencies = [
     "threadpoolctl>=3.6.0",
     "transforms3d>=0.4.1",
     "modern-robotics>=1.1.0",
+    # Grasp detection dependencies
+    "open3d>=0.18.0",
+    "scipy>=1.12.0",
 ]
 
 # =============================================================================

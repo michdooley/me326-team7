@@ -45,16 +45,29 @@ fi
 # 2. Add uv venv site-packages to PYTHONPATH (for mujoco, mink, numpy, etc.)
 #    This lets ROS2's Python import your uv-managed packages WITHOUT
 #    changing which python binary is used (which would break colcon build)
-UV_SITE_PACKAGES="$PROJECT_ROOT/.venv/lib/python$PYTHON_VERSION/site-packages"
+# Auto-detect the actual Python version in the venv
+if [ -d "$PROJECT_ROOT/.venv/lib" ]; then
+    ACTUAL_PYTHON_VERSION=$(ls "$PROJECT_ROOT/.venv/lib" | grep "^python3\." | head -1)
+    UV_SITE_PACKAGES="$PROJECT_ROOT/.venv/lib/$ACTUAL_PYTHON_VERSION/site-packages"
+else
+    # Fallback to ROS2's Python version if venv doesn't exist yet
+    UV_SITE_PACKAGES="$PROJECT_ROOT/.venv/lib/python$PYTHON_VERSION/site-packages"
+fi
+
 if [ -d "$UV_SITE_PACKAGES" ]; then
     export PYTHONPATH="$UV_SITE_PACKAGES:$PYTHONPATH"
-    echo "✓ Added uv packages to PYTHONPATH"
+    echo "✓ Added uv packages to PYTHONPATH ($ACTUAL_PYTHON_VERSION)"
 else
     echo "⚠ uv environment not found, running 'uv sync'..."
     (cd "$PROJECT_ROOT" && uv sync)
+    # Re-detect after creating venv
+    if [ -d "$PROJECT_ROOT/.venv/lib" ]; then
+        ACTUAL_PYTHON_VERSION=$(ls "$PROJECT_ROOT/.venv/lib" | grep "^python3\." | head -1)
+        UV_SITE_PACKAGES="$PROJECT_ROOT/.venv/lib/$ACTUAL_PYTHON_VERSION/site-packages"
+    fi
     if [ -d "$UV_SITE_PACKAGES" ]; then
         export PYTHONPATH="$UV_SITE_PACKAGES:$PYTHONPATH"
-        echo "✓ Created uv environment and added to PYTHONPATH"
+        echo "✓ Created uv environment and added to PYTHONPATH ($ACTUAL_PYTHON_VERSION)"
     else
         echo "✗ Failed to create uv environment"
         echo "  Try running manually: cd $PROJECT_ROOT && uv sync"
