@@ -12,6 +12,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
+from sensor_msgs.msg import JointState
 
 
 class TestPanTilt(Node):
@@ -27,9 +28,9 @@ class TestPanTilt(Node):
             Float64MultiArray, '/camera/pan_tilt_cmd', 10
         )
 
-        # Subscriber
+        # Subscriber (xs_sdk publishes JointState on this topic)
         self.state_sub = self.create_subscription(
-            Float64MultiArray, '/camera/pan_tilt_state', self.state_callback, 10
+            JointState, '/camera/pan_tilt_state', self.state_callback, 10
         )
 
         self.get_logger().info('Waiting for pan-tilt state...')
@@ -39,9 +40,11 @@ class TestPanTilt(Node):
             self.state_received = True
             self.get_logger().info('Connected!')
 
-        if len(msg.data) >= 2:
-            self.current_pan = msg.data[0]
-            self.current_tilt = msg.data[1]
+        for i, name in enumerate(msg.name):
+            if name == 'camera_pan' and i < len(msg.position):
+                self.current_pan = msg.position[i]
+            elif name == 'camera_tilt' and i < len(msg.position):
+                self.current_tilt = msg.position[i]
 
     def send_pan_tilt(self, pan, tilt, duration=1.0):
         """Send pan-tilt command."""
@@ -71,17 +74,20 @@ class TestPanTilt(Node):
         # Test positions: (pan, tilt, description)
         positions = [
             (0.0, 0.0, 'Center'),
-            (0.5, 0.0, 'Pan left (~30 deg)'),
-            (-0.5, 0.0, 'Pan right (~30 deg)'),
+            (-0.5, 0.0, 'Pan left (~30 deg)'),
             (0.0, 0.0, 'Center'),
-            (0.0, 0.3, 'Tilt up (~17 deg)'),
-            (0.0, -0.3, 'Tilt down (~17 deg)'),
+            (0.5, 0.0, 'Pan right (~30 deg)'),
+            (0.0, 0.0, 'Center'),
+            (0.0, -0.3, 'Tilt up (~17 deg)'),
+            (0.0, 0.0, 'Center'),
+            (0.0, 0.3, 'Tilt down (~17 deg)'),
             (0.0, 0.0, 'Center'),
         ]
 
         for pan, tilt, description in positions:
             self.get_logger().info(f'{description}: pan={pan:.2f}, tilt={tilt:.2f}')
             self.send_pan_tilt(pan, tilt, duration=1.0)
+            time.sleep(1.0)
 
         self.get_logger().info('')
         self.get_logger().info('Pan-tilt test complete!')

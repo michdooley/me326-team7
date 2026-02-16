@@ -50,6 +50,28 @@ Visualization Manager:
       Plane: XY
       Plane Cell Count: 20
 
+    - Class: rviz_default_plugins/Map
+      Name: Occupancy Map
+      Enabled: true
+      Topic:
+        Value: /map
+        Reliability Policy: Reliable
+      Alpha: 0.7
+      Color Scheme: map
+      Draw Behind: true
+
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Detected Objects
+      Enabled: true
+      Topic:
+        Value: /detected_objects
+
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Frontier Markers
+      Enabled: true
+      Topic:
+        Value: /frontier_markers
+
   Global Options:
     Background Color: 48; 48; 48
     Fixed Frame: odom
