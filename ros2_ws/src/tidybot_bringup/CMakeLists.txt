@@ -45,12 +45,12 @@ install(PROGRAMS
   scripts/pick_up_block_real.py
   scripts/frontier_exploration.py
   scripts/objective1_task.py
+  scripts/task_navigate_with_avoidance.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
 # Install subtask modules (importable by objective1_task.py)
 install(DIRECTORY scripts/subtasks
-  scripts/task_navigate_with_avoidance.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
