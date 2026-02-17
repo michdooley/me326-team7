@@ -53,9 +53,31 @@ class NavigationTaskNode(Node):
     FORWARD_REGION_Y_MIN_FRAC = 0.20
     MIN_BLOCKING_AREA_FRAC = 0.01
     STOP_LOG_INTERVAL = 1.0
+    DEFAULT_NAVIGATION_MODE = 'rviz_goal'
+    REACTIVE_FORWARD_STEP_M = 0.35
+    REACTIVE_TURN_STEP_RAD = 0.45
 
     def __init__(self):
         super().__init__('navigation_task_node')
+
+        # Navigation mode:
+        # - rviz_goal: click a 2D goal in RViz and navigate to it.
+        # - reactive_forward: keep driving forward; if blocked, rotate until clear.
+        self.navigation_mode = self.declare_parameter(
+            'navigation_mode', self.DEFAULT_NAVIGATION_MODE
+        ).value
+        if self.navigation_mode not in ('rviz_goal', 'reactive_forward'):
+            self.get_logger().warn(
+                f'Unknown navigation_mode="{self.navigation_mode}", using "{self.DEFAULT_NAVIGATION_MODE}".'
+            )
+            self.navigation_mode = self.DEFAULT_NAVIGATION_MODE
+
+        self.reactive_forward_step_m = float(
+            self.declare_parameter('reactive_forward_step_m', self.REACTIVE_FORWARD_STEP_M).value
+        )
+        self.reactive_turn_step_rad = float(
+            self.declare_parameter('reactive_turn_step_rad', self.REACTIVE_TURN_STEP_RAD).value
+        )
 
         # Publishing movement info
         self.base_pose_pub = self.create_publisher(Pose2D, '/base/target_pose', 10)
@@ -107,6 +129,11 @@ class NavigationTaskNode(Node):
         self.timer = self.create_timer(0.1, self.control_loop)
 
         self.get_logger().info('Ready! Click "2D Nav Goal" in RViz (or press G) to navigate.')
+        self.get_logger().info(f'Navigation mode: {self.navigation_mode}')
+        if self.navigation_mode == 'reactive_forward':
+            self.get_logger().info(
+                'Reactive mode enabled: driving forward, rotating when obstacle blocks path.'
+            )
         if CV_AVAILABLE:
             self.get_logger().info(
                 'Obstacle overlay publisher active on /camera/obstacle_overlay'
@@ -130,6 +157,10 @@ class NavigationTaskNode(Node):
 
     def goal_callback(self, msg: PoseStamped):
         """Handle RViz clicks - extract target position and heading."""
+        if self.navigation_mode != 'rviz_goal':
+            self.get_logger().info('Ignoring RViz goal_pose because navigation_mode is reactive_forward.')
+            return
+
         self.target_x = msg.pose.position.x
         self.target_y = msg.pose.position.y
 
@@ -342,6 +373,13 @@ class NavigationTaskNode(Node):
         target.theta = self.current_theta
         self.base_pose_pub.publish(target)
 
+    def publish_pose_target(self, x: float, y: float, theta: float):
+        target = Pose2D()
+        target.x = x
+        target.y = y
+        target.theta = theta
+        self.base_pose_pub.publish(target)
+
     def control_loop(self):
         current_time = self.get_clock().now()
 
@@ -356,7 +394,9 @@ class NavigationTaskNode(Node):
 
     def handle_init(self, current_time):
         """Wait for odometry and first goal click."""
-        if not self.odom_received or not self.has_goal:
+        if not self.odom_received:
+            return
+        if self.navigation_mode == 'rviz_goal' and not self.has_goal:
             return
 
         self.get_logger().info(f'Starting from ({self.current_x:.2f}, {self.current_y:.2f})')
@@ -364,6 +404,10 @@ class NavigationTaskNode(Node):
 
     def handle_navigate(self, current_time):
         """Publish target and check if we've arrived."""
+        if self.navigation_mode == 'reactive_forward':
+            self.handle_reactive_forward(current_time)
+            return
+
         if self.is_at_target():
             self.get_logger().info('Arrived!')
             self.transition_to_state(State.ARRIVED, current_time)
@@ -372,12 +416,18 @@ class NavigationTaskNode(Node):
         if self.is_obstacle_blocking():
             self.publish_hold_position()
             now = self.get_clock().now()
-            dt = (now - self.last_stop_log_time).nanoseconds / 1e9
-            if dt >= self.STOP_LOG_INTERVAL:
+            if not self.was_blocked:
                 self.get_logger().warn(
-                    f'Stopping for obstacle at {self.obstacle_distance_m:.2f}m (path blocked)'
+                    f'SAFETY STOP: blocked by obstacle at {self.obstacle_distance_m:.2f}m'
                 )
                 self.last_stop_log_time = now
+            else:
+                dt = (now - self.last_stop_log_time).nanoseconds / 1e9
+                if dt >= self.STOP_LOG_INTERVAL:
+                    self.get_logger().warn(
+                        f'Still stopped: obstacle at {self.obstacle_distance_m:.2f}m'
+                    )
+                    self.last_stop_log_time = now
             self.was_blocked = True
             return
 
@@ -386,17 +436,44 @@ class NavigationTaskNode(Node):
             self.was_blocked = False
 
         # Send target to base controller
-        target = Pose2D()
-        target.x = self.target_x
-        target.y = self.target_y
-        target.theta = self.target_theta
-        self.base_pose_pub.publish(target)
+        self.publish_pose_target(self.target_x, self.target_y, self.target_theta)
 
         # Log progress every 2 seconds
         time_in_state = (current_time - self.state_start_time).nanoseconds / 1e9
         if int(time_in_state) % 2 == 0 and int(time_in_state * 10) % 20 == 0:
             distance = self.get_distance_to_target()
             self.get_logger().info(f'{distance:.2f}m away...')
+
+    def handle_reactive_forward(self, current_time):
+        """Drive forward; if blocked, rotate in place until obstacle clears."""
+        _ = current_time
+        if self.is_obstacle_blocking():
+            now = self.get_clock().now()
+            if not self.was_blocked:
+                self.get_logger().warn(
+                    f'SAFETY STOP: obstacle at {self.obstacle_distance_m:.2f}m, rotating to clear path'
+                )
+                self.last_stop_log_time = now
+            else:
+                dt = (now - self.last_stop_log_time).nanoseconds / 1e9
+                if dt >= self.STOP_LOG_INTERVAL:
+                    self.get_logger().warn(
+                        f'Still blocked: obstacle at {self.obstacle_distance_m:.2f}m, rotating'
+                    )
+                    self.last_stop_log_time = now
+
+            rotate_theta = self.current_theta + self.reactive_turn_step_rad
+            self.publish_pose_target(self.current_x, self.current_y, rotate_theta)
+            self.was_blocked = True
+            return
+
+        if self.was_blocked:
+            self.get_logger().info('Path cleared. Continuing forward.')
+            self.was_blocked = False
+
+        forward_x = self.current_x + self.reactive_forward_step_m * np.cos(self.current_theta)
+        forward_y = self.current_y + self.reactive_forward_step_m * np.sin(self.current_theta)
+        self.publish_pose_target(forward_x, forward_y, self.current_theta)
 
     def handle_arrived(self, current_time):
         """Hold position briefly, then mark ready for next goal."""
