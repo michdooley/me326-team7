@@ -2,7 +2,7 @@
 
 This repository contains software for controlling the **TidyBot2** mobile robot with bimanual **WX250s** 6-DOF arms, developed for Professor Monroe Kennedy's 2026 Collaborative Robotics Class.
 
-## Installation
+## Innstallation
 
 There are two ways to get started:
 
