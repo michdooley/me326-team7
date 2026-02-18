@@ -40,6 +40,7 @@ install(PROGRAMS
   scripts/task1_retrieve.py
   scripts/voice_command.py
   scripts/navigate_to_object.py
+  scripts/rgbd_grasp_demo.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
