@@ -329,15 +329,15 @@ class Task1Retrieve(Node):
 
             if grasp_success:
                 self.get_logger().info(
-                    '  [verify] ✓ Grasp confirmed — object in gripper')
+                    '  [verify] Grasp confirmed — object in gripper')
                 self.transition_to(Task1State.RETURN)
             elif self.grasp_attempt_count >= MAX_GRASP_RETRIES:
                 self.get_logger().error(
-                    f'  [verify] ✗ Grasp failed after {MAX_GRASP_RETRIES} attempts — giving up')
+                    f'  [verify] Grasp failed after {MAX_GRASP_RETRIES} attempts — giving up')
                 self.transition_to(Task1State.ERROR)
             else:
                 self.get_logger().warn(
-                    f'  [verify] ✗ Grasp not confirmed — retrying '
+                    f'  [verify] Grasp not confirmed — retrying '
                     f'(attempt {self.grasp_attempt_count}/{MAX_GRASP_RETRIES})')
                 self.transition_to(Task1State.APPROACH)
 
