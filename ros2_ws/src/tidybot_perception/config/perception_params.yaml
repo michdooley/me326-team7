@@ -16,3 +16,7 @@ grasp_planner_node:
     model_path: ""                # path to GraspNet weights
     approach_offset: 0.10         # pre-grasp offset above grasp pose (meters)
     default_arm: "right"          # arm to use when "auto" is requested
+    min_depth: 0.10               # minimum depth to keep (metres)
+    max_depth: 1.50               # maximum depth to keep (metres)
+    remove_plane: true            # RANSAC ground plane removal
+    plane_distance_threshold: 0.01  # RANSAC inlier distance (metres)

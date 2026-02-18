@@ -196,19 +196,16 @@ class CameraScanner:
     # ── Main API ──────────────────────────────────────────────────────────────
 
     def scan_for_object(
-        self, color: str, max_sweeps: int = 2
+        self, color: str, **_kwargs
     ) -> Optional[Detection]:
         """
-        Tilt the camera downward in 5-degree steps across PAN_POSITIONS_DEG,
-        returning the first Detection found.
-
-        For each pan angle, tilts from TILT_START_DEG to TILT_END_DEG in
-        TILT_STEP_DEG increments, checking for `color` at each step.
+        Point camera at pan=0, tilt=0.6 rad (~34 deg down), then detect
+        the requested colour in the current frame.
         """
         if color not in COLOR_RANGES:
             raise ValueError(f'Unknown color {color!r}; choose {list(COLOR_RANGES)}')
 
-        self.logger.info(f'Scanning for {color} cube ...')
+        self.logger.info(f'Looking for {color} cube ...')
 
         # Wait for camera to come online
         self._spin(3.0)
@@ -216,50 +213,55 @@ class CameraScanner:
             self.logger.error('Camera not online after 3 s')
             return None
 
-        tilt_values = np.arange(TILT_START_DEG, TILT_END_DEG + 0.01, TILT_STEP_DEG)
+        # Point camera: pan=0 (forward), tilt=0.6 rad (~34 deg down)
+        TILT_RAD = 0.6
+        msg = Float64MultiArray()
+        msg.data = [0.0, TILT_RAD]
+        self._pan_tilt_pub.publish(msg)
+        self.logger.info(f'Camera → pan=0.0, tilt={TILT_RAD} rad')
+        self._spin(1.0)  # wait for camera to settle
 
-        for sweep in range(max_sweeps):
-            for pan_deg in PAN_POSITIONS_DEG:
-                self.logger.info(
-                    f'[sweep {sweep+1}/{max_sweeps}] pan={pan_deg:.0f} deg'
-                )
-                for tilt_deg in tilt_values:
-                    self.logger.info(
-                        f'  tilt={tilt_deg:.0f} deg ...'
-                    )
-                    self._cmd(pan_deg, tilt_deg)
+        rgb   = self._latest_rgb
+        depth = self._latest_depth
+        ci    = self._camera_info
+        if rgb is None or depth is None or ci is None:
+            self.logger.error('Missing RGB/depth/camera_info after settling')
+            return None
 
-                    rgb   = self._latest_rgb
-                    depth = self._latest_depth
-                    ci    = self._camera_info
-                    if rgb is None or depth is None or ci is None:
-                        continue
+        result = self._detect_color(rgb, color)
+        if result is None:
+            self.logger.warn(f'Could not find {color} in current frame.')
+            return None
 
-                    result = self._detect_color(rgb, color)
-                    if result is None:
-                        continue
+        cx, cy, bbox = result
+        self.logger.info(
+            f'FOUND {color}!  centroid=({cx},{cy}), bbox={bbox}'
+        )
 
-                    cx, cy, bbox = result
-                    self.logger.info(
-                        f'  FOUND {color}!  centroid=({cx},{cy}), bbox={bbox}, '
-                        f'pan={pan_deg:.0f} deg, tilt={tilt_deg:.0f} deg'
-                    )
+        return Detection(
+            pixel_cx=cx,
+            pixel_cy=cy,
+            bbox=bbox,
+            depth_image=depth.copy(),
+            camera_info=ci,
+            color=color,
+        )
 
-                    # Park camera here — resend same command so controller holds
-                    self._cmd(pan_deg, tilt_deg)
+    
+    def tilt_simple(self):
+        # Wait for camera to come online
+        self._spin(3.0)
+        if self._latest_rgb is None or self._camera_info is None:
+            self.logger.error('Camera not online after 3 s')
+            return None
 
-                    return Detection(
-                        pixel_cx=cx,
-                        pixel_cy=cy,
-                        bbox=bbox,
-                        depth_image=depth.copy(),
-                        camera_info=ci,
-                        color=color,
-                    )
-
-        self.logger.warn(f'Could not find {color} after {max_sweeps} sweeps.')
-        return None
-
+        # Point camera: pan=0 (forward), tilt=0.6 rad (~34 deg down)
+        TILT_RAD = 0.55
+        msg = Float64MultiArray()
+        msg.data = [0.0, TILT_RAD]
+        self._pan_tilt_pub.publish(msg)
+        self.logger.info(f'Camera → pan=0.0, tilt={TILT_RAD} rad')
+        self._spin(1.0)  # wait for camera to settle
 
 # ── Standalone node ───────────────────────────────────────────────────────────
 
@@ -278,14 +280,16 @@ def main(args=None):
     rclpy.init(args=args)
     node = CameraScannerNode()
     try:
-        det = node._scanner.scan_for_object(node._color)
-        if det:
-            node.get_logger().info(
-                f'Detection: pixel=({det.pixel_cx},{det.pixel_cy}), '
-                f'bbox={det.bbox}, color={det.color}'
-            )
-        else:
-            node.get_logger().warn('No detection found.')
+        node._scanner.tilt_simple()
+
+        # det = node._scanner.scan_for_object(node._color)
+        # if det:
+        #     node.get_logger().info(
+        #         f'Detection: pixel=({det.pixel_cx},{det.pixel_cy}), '
+        #         f'bbox={det.bbox}, color={det.color}'
+        #     )
+        # else:
+        #     node.get_logger().warn('No detection found.')
     except KeyboardInterrupt:
         pass
     finally:

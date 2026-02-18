@@ -21,6 +21,10 @@ Parameters:
     num_point     (int):   point cloud sample size for GraspNet (default 20000)
     collision_thresh (float): collision detection threshold (default 0.01 m)
     crop_radius   (float): radius around object position to crop cloud (default 0.20 m)
+    min_depth     (float): minimum depth to keep in metres (default 0.10 m)
+    max_depth     (float): maximum depth to keep in metres (default 1.50 m)
+    remove_plane  (bool):  run RANSAC ground plane removal (default True)
+    plane_distance_threshold (float): RANSAC inlier distance in metres (default 0.01 m)
 
 Usage:
     ros2 run tidybot_perception grasp_planner_node \\
@@ -84,6 +88,10 @@ class GraspPlannerNode(Node):
         self.declare_parameter('num_point', 20000)
         self.declare_parameter('collision_thresh', 0.01)
         self.declare_parameter('crop_radius', 0.20)
+        self.declare_parameter('min_depth', 0.10)
+        self.declare_parameter('max_depth', 1.50)
+        self.declare_parameter('remove_plane', True)
+        self.declare_parameter('plane_distance_threshold', 0.01)
 
         self.model_path = self.get_parameter('model_path').value
         self.approach_offset = self.get_parameter('approach_offset').value
@@ -91,6 +99,10 @@ class GraspPlannerNode(Node):
         self.num_point = self.get_parameter('num_point').value
         self.collision_thresh = self.get_parameter('collision_thresh').value
         self.crop_radius = self.get_parameter('crop_radius').value
+        self.min_depth = self.get_parameter('min_depth').value
+        self.max_depth = self.get_parameter('max_depth').value
+        self.remove_plane = self.get_parameter('remove_plane').value
+        self.plane_distance_threshold = self.get_parameter('plane_distance_threshold').value
 
         # ── TF2 ──────────────────────────────────────────────────────────
         self.tf_buffer = tf2_ros.Buffer()
@@ -277,19 +289,64 @@ class GraspPlannerNode(Node):
             obj_in_camera.point.z,
         ])
 
-        # Mask: valid depth + within crop_radius of object
-        valid = depth_m > 0.05
+        # Mask: depth range + within crop_radius of object
+        valid = (depth_m > self.min_depth) & (depth_m < self.max_depth)
         dists = np.linalg.norm(cloud_full - obj_xyz, axis=-1)
         mask = valid & (dists < self.crop_radius)
         cloud_masked = cloud_full[mask]
+
+        n_depth_valid = int(np.count_nonzero(valid))
+        self.get_logger().info(
+            f'Point cloud: {n_depth_valid} in depth range '
+            f'[{self.min_depth:.2f}, {self.max_depth:.2f}]m, '
+            f'{len(cloud_masked)} in crop radius {self.crop_radius:.2f}m'
+        )
 
         if len(cloud_masked) < 100:
             response.success = False
             response.message = (
                 f'Too few points ({len(cloud_masked)}) near object — '
-                'check camera tilt and depth topic'
+                'check camera tilt and depth topic, or adjust '
+                'min_depth/max_depth/crop_radius'
             )
             return response
+
+        # ── 4b. RANSAC ground plane removal ────────────────────────────
+        if self.remove_plane and len(cloud_masked) > 500:
+            try:
+                plane_cloud = o3d.geometry.PointCloud()
+                plane_cloud.points = o3d.utility.Vector3dVector(
+                    cloud_masked.astype(np.float32)
+                )
+                plane_model, inlier_idxs = plane_cloud.segment_plane(
+                    distance_threshold=self.plane_distance_threshold,
+                    ransac_n=3,
+                    num_iterations=1000,
+                )
+                a, b, c, d = plane_model
+
+                inlier_set = set(inlier_idxs)
+                outlier_mask = np.array(
+                    [i not in inlier_set for i in range(len(cloud_masked))]
+                )
+
+                self.get_logger().info(
+                    f'RANSAC plane: normal=({a:.3f}, {b:.3f}, {c:.3f}), '
+                    f'inliers={len(inlier_idxs)}, '
+                    f'outliers={int(outlier_mask.sum())}'
+                )
+
+                if outlier_mask.sum() >= 100:
+                    cloud_masked = cloud_masked[outlier_mask]
+                else:
+                    self.get_logger().warn(
+                        f'Plane removal would leave only '
+                        f'{int(outlier_mask.sum())} points — skipping'
+                    )
+            except Exception as exc:
+                self.get_logger().warn(
+                    f'RANSAC plane removal failed (skipping): {exc}'
+                )
 
         # ── 5. Subsample to num_point (seeded for determinism) ────────────
         rng = np.random.RandomState(42)
