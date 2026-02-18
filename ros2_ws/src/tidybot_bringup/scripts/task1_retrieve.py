@@ -9,6 +9,14 @@ Orchestrates the full object retrieval task:
 Each state calls a service or publishes a command, then waits for the result.
 Heavy logic lives in service nodes (detector, localizer, grasp planner, motion planner).
 
+VERIFY_GRASP sub-steps:
+    1. PRESENT_ARM  — Move grasping arm to a pose visible to the camera
+    2. AIM_CAMERA   — Tilt camera to look at the gripper region
+    3. DETECT       — Call /detect with the target object class
+    4. DECIDE       — If target detected near gripper → success → RETURN
+                      If not → increment retry counter → back to APPROACH
+                      If retries exhausted → ERROR
+
 Topics used:
     /cmd_vel (Twist) - base velocity
     /camera/pan_tilt_cmd (Float64MultiArray) - camera pointing
@@ -35,12 +43,13 @@ Usage:
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 import time
 from enum import Enum, auto
 
 from geometry_msgs.msg import Twist
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import Image, JointState
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float64MultiArray
 from tidybot_msgs.msg import ArmCommand, Detection2DArray, ObjectPose
@@ -55,10 +64,41 @@ class Task1State(Enum):
     PLAN_GRASP   = auto()  # Call /plan_grasp service
     PRE_GRASP    = auto()  # Move arm to approach pose via /plan_to_target
     GRASP        = auto()  # Execute grasp + close gripper
-    VERIFY_GRASP = auto()  # Check if object is grasped (gripper feedback)
+    VERIFY_GRASP = auto()  # Visual verification of grasp success
     RETURN       = auto()  # Navigate back to start position
     DONE         = auto()
     ERROR        = auto()
+
+
+class VerifySubState(Enum):
+    """Sub-states within VERIFY_GRASP."""
+    PRESENT_ARM = auto()   # Move arm to camera-visible pose
+    AIM_CAMERA  = auto()   # Point camera at gripper area
+    DETECT      = auto()   # Call /detect service for target object
+    DECIDE      = auto()   # Evaluate detection results
+
+
+# ── Verification configuration ──────────────────────────────────────────────
+
+MAX_GRASP_RETRIES = 3
+
+# Arm pose that holds the grasped object in front of the camera.
+# [waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate]
+# Shoulder up, elbow bent back, wrist angled so object faces the camera.
+VERIFY_ARM_POSE = [0.0, 0.4, -0.3, 0.0, 0.5, 0.0]
+VERIFY_ARM_DURATION = 2.5  # seconds to reach the pose
+
+# Camera pan/tilt to look at the gripper region during verification.
+VERIFY_CAMERA_PAN = 0.0
+VERIFY_CAMERA_TILT = 0.3
+VERIFY_CAMERA_SETTLE_TIME = 1.5  # seconds to let the camera settle
+
+# Minimum confidence to accept a detection as the target object in gripper.
+VERIFY_DETECTION_CONFIDENCE = 0.4
+
+# Minimum fraction of the image width/height the bounding box must occupy.
+# Prevents accepting tiny background detections as "in the gripper."
+VERIFY_MIN_BBOX_FRACTION = 0.05
 
 
 class Task1Retrieve(Node):
@@ -89,6 +129,14 @@ class Task1Retrieve(Node):
             Odometry, '/odom', self.odom_callback, 10
         )
 
+        # Camera RGB for resolution tracking (used in verify bounding-box check)
+        img_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.rgb_sub = self.create_subscription(
+            Image, '/camera/color/image_raw', self.rgb_callback, img_qos
+        )
+        self.image_width = 640   # sensible defaults, updated on first frame
+        self.image_height = 480
+
         # ---- Service Clients ----
         self.detect_client = self.create_client(Detect, '/detect')
         self.localize_client = self.create_client(LocalizeObject, '/localize_object')
@@ -109,6 +157,13 @@ class Task1Retrieve(Node):
         self.grasp_plan = None          # result from /plan_grasp
         self.active_arm = 'right'       # which arm to use
 
+        # ---- Verify-specific data ----
+        self.verify_sub_state = VerifySubState.PRESENT_ARM
+        self.grasp_attempt_count = 0
+        self.verify_detect_future = None
+        self.verify_arm_cmd_sent = False
+        self.verify_camera_cmd_sent = False
+
         # Control loop at 50Hz
         self.timer = self.create_timer(0.02, self.control_loop)
 
@@ -119,6 +174,7 @@ class Task1Retrieve(Node):
             'States: LISTEN → SEARCH → APPROACH → PLAN_GRASP → '
             'PRE_GRASP → GRASP → VERIFY → RETURN → DONE'
         )
+        self.get_logger().info(f'Max grasp retries: {MAX_GRASP_RETRIES}')
 
     # ---- Subscriber callbacks ----
 
@@ -134,6 +190,10 @@ class Task1Retrieve(Node):
     def odom_callback(self, msg: Odometry):
         self.latest_odom = msg
 
+    def rgb_callback(self, msg: Image):
+        self.image_width = msg.width
+        self.image_height = msg.height
+
     # ---- State machine ----
 
     def transition_to(self, new_state: Task1State):
@@ -141,6 +201,147 @@ class Task1Retrieve(Node):
         self.get_logger().info(f'State: {self.state.name} → {new_state.name}')
         self.state = new_state
         self.state_start_time = time.time()
+
+    def _begin_verify(self):
+        """Reset verify sub-state for a fresh verification pass."""
+        self.verify_sub_state = VerifySubState.PRESENT_ARM
+        self.verify_detect_future = None
+        self.verify_arm_cmd_sent = False
+        self.verify_camera_cmd_sent = False
+        self.grasp_attempt_count += 1
+        self.get_logger().info(
+            f'Starting grasp verification (attempt {self.grasp_attempt_count}/{MAX_GRASP_RETRIES})')
+
+    def _send_arm_cmd(self, joint_positions, duration):
+        """Publish an ArmCommand to the active arm."""
+        cmd = ArmCommand()
+        cmd.joint_positions = list(joint_positions)
+        cmd.duration = float(duration)
+        if self.active_arm == 'right':
+            self.right_arm_pub.publish(cmd)
+        else:
+            self.left_arm_pub.publish(cmd)
+
+    def _send_pan_tilt(self, pan, tilt):
+        """Publish a camera pan/tilt command."""
+        msg = Float64MultiArray()
+        msg.data = [float(pan), float(tilt)]
+        self.pan_tilt_pub.publish(msg)
+
+    def _detection_matches_target(self, detections) -> bool:
+        """
+        Return True if any detection in the list is the target object,
+        with sufficient confidence and bounding-box size (to confirm it's
+        actually in the gripper, not a far-away background instance).
+        """
+        if not detections:
+            return False
+
+        min_w = self.image_width * VERIFY_MIN_BBOX_FRACTION
+        min_h = self.image_height * VERIFY_MIN_BBOX_FRACTION
+
+        for det in detections:
+            name_match = (det.class_name.lower() == self.target_object.lower())
+            conf_ok = det.confidence >= VERIFY_DETECTION_CONFIDENCE
+            size_ok = det.width >= min_w and det.height >= min_h
+            if name_match and conf_ok and size_ok:
+                self.get_logger().info(
+                    f'  Verified: "{det.class_name}" conf={det.confidence:.2f} '
+                    f'bbox={det.width}x{det.height}')
+                return True
+        return False
+
+    # ---- Verify sub-state machine (called from control_loop) ----
+
+    def _run_verify_grasp(self, elapsed):
+        """Execute the VERIFY_GRASP sub-state machine."""
+
+        # ── PRESENT_ARM: move the grasping arm to a camera-visible pose ──
+        if self.verify_sub_state == VerifySubState.PRESENT_ARM:
+            if not self.verify_arm_cmd_sent:
+                self.get_logger().info('  [verify] Moving arm to present pose...')
+                self._send_arm_cmd(VERIFY_ARM_POSE, VERIFY_ARM_DURATION)
+                self.verify_arm_cmd_sent = True
+                self.state_start_time = time.time()
+                return
+
+            if elapsed >= VERIFY_ARM_DURATION + 0.5:
+                self.verify_sub_state = VerifySubState.AIM_CAMERA
+                self.state_start_time = time.time()
+
+        # ── AIM_CAMERA: tilt camera to look at the gripper region ────────
+        elif self.verify_sub_state == VerifySubState.AIM_CAMERA:
+            if not self.verify_camera_cmd_sent:
+                self.get_logger().info('  [verify] Aiming camera at gripper...')
+                self._send_pan_tilt(VERIFY_CAMERA_PAN, VERIFY_CAMERA_TILT)
+                self.verify_camera_cmd_sent = True
+                self.state_start_time = time.time()
+                return
+
+            if elapsed >= VERIFY_CAMERA_SETTLE_TIME:
+                self.verify_sub_state = VerifySubState.DETECT
+                self.state_start_time = time.time()
+
+        # ── DETECT: call /detect for the target object class ─────────────
+        elif self.verify_sub_state == VerifySubState.DETECT:
+            if self.verify_detect_future is None:
+                if not self.detect_client.service_is_ready():
+                    if elapsed > 5.0:
+                        self.get_logger().warn(
+                            '  [verify] /detect service not available — skipping visual check')
+                        self.verify_sub_state = VerifySubState.DECIDE
+                        self.state_start_time = time.time()
+                    return
+
+                self.get_logger().info(
+                    f'  [verify] Calling /detect for "{self.target_object}"...')
+                req = Detect.Request()
+                req.target_class = self.target_object
+                self.verify_detect_future = self.detect_client.call_async(req)
+                return
+
+            if self.verify_detect_future.done():
+                self.verify_sub_state = VerifySubState.DECIDE
+                self.state_start_time = time.time()
+            elif elapsed > 10.0:
+                self.get_logger().warn('  [verify] /detect call timed out')
+                self.verify_detect_future.cancel()
+                self.verify_detect_future = None
+                self.verify_sub_state = VerifySubState.DECIDE
+                self.state_start_time = time.time()
+
+        # ── DECIDE: evaluate detection results ───────────────────────────
+        elif self.verify_sub_state == VerifySubState.DECIDE:
+            grasp_success = False
+
+            if self.verify_detect_future is not None and self.verify_detect_future.done():
+                try:
+                    result = self.verify_detect_future.result()
+                    if result.success:
+                        grasp_success = self._detection_matches_target(result.detections)
+                        if not grasp_success:
+                            self.get_logger().info(
+                                f'  [verify] Target "{self.target_object}" not found in detections')
+                    else:
+                        self.get_logger().warn(f'  [verify] Detection failed: {result.message}')
+                except Exception as e:
+                    self.get_logger().error(f'  [verify] Detection exception: {e}')
+
+            if grasp_success:
+                self.get_logger().info(
+                    '  [verify] ✓ Grasp confirmed — object in gripper')
+                self.transition_to(Task1State.RETURN)
+            elif self.grasp_attempt_count >= MAX_GRASP_RETRIES:
+                self.get_logger().error(
+                    f'  [verify] ✗ Grasp failed after {MAX_GRASP_RETRIES} attempts — giving up')
+                self.transition_to(Task1State.ERROR)
+            else:
+                self.get_logger().warn(
+                    f'  [verify] ✗ Grasp not confirmed — retrying '
+                    f'(attempt {self.grasp_attempt_count}/{MAX_GRASP_RETRIES})')
+                self.transition_to(Task1State.APPROACH)
+
+    # ---- Main control loop ----
 
     def control_loop(self):
         """Main control loop — runs the state machine at 50Hz."""
@@ -198,10 +399,9 @@ class Task1Retrieve(Node):
 
         # ==================== VERIFY_GRASP ====================
         elif self.state == Task1State.VERIFY_GRASP:
-            # TODO: Check gripper joint state — if fingers stopped short of
-            # fully closed, object is likely grasped
-            # Transition to RETURN on success, ERROR on failure
-            pass
+            if elapsed < 0.05 and self.verify_sub_state == VerifySubState.PRESENT_ARM:
+                self._begin_verify()
+            self._run_verify_grasp(elapsed)
 
         # ==================== RETURN ====================
         elif self.state == Task1State.RETURN:
