@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """
-RGB-D Grasp Demo
+RGB-D Grasp Demo with Post-Grasp Verification
 
 Detects colored objects using HSV segmentation, estimates 3D position
-via depth back-projection + TF2, and executes a top-down pick-and-place grasp.
+via depth back-projection + TF2, executes a top-down grasp, and then
+verifies success by presenting the gripper to the camera.
+
+Verification steps (after closing gripper):
+    1. Move arm to a camera-visible "present" pose
+    2. Tilt camera to look at the gripper region
+    3. Run HSV color detection for the target color
+    4. If target color blob found → grasp confirmed → continue to lift
+       If not found → open gripper, re-detect object on table, retry grasp
+       After MAX_GRASP_RETRIES failures → abort
 
 Usage:
     # Terminal 1: Start simulation with grasp scene
@@ -38,9 +47,26 @@ PRE_GRASP_Z_OFFSET = 0.10   # 10 cm above grasp for approach
 GRASP_Z_OFFSET = 0.00       # offset from detected surface (camera sees object top)
 LIFT_HEIGHT = 0.15           # lift 15 cm after grasping
 
+# ── Verification configuration ──────────────────────────────────────────────
+MAX_GRASP_RETRIES = 3
+
+# Arm pose that holds the grasped object in front of the camera.
+# [waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate]
+VERIFY_ARM_POSE = [0.0, 0.4, -0.3, 0.0, 0.5, 0.0]
+VERIFY_ARM_DURATION = 2.5  # seconds to reach the pose
+
+# Camera pan/tilt to look at the gripper region during verification.
+VERIFY_CAMERA_PAN = 0.0
+VERIFY_CAMERA_TILT = 0.3
+VERIFY_CAMERA_SETTLE_TIME = 1.5  # seconds to let the camera image update
+
+# Minimum blob area (pixels) to accept as "object in gripper."
+# Smaller than the table-detection threshold since the object is closer.
+VERIFY_MIN_BLOB_AREA = 100
+
 
 class RGBDGraspDemo(Node):
-    """Self-contained node for detect → grasp → place pipeline."""
+    """Self-contained node for detect → grasp → verify → place pipeline."""
 
     def __init__(self):
         super().__init__('rgbd_grasp_demo')
@@ -50,11 +76,13 @@ class RGBDGraspDemo(Node):
         self.declare_parameter('arm', 'right')
         self.declare_parameter('camera_tilt', 0.5)
         self.declare_parameter('duration', 2.0)
+        self.declare_parameter('max_retries', MAX_GRASP_RETRIES)
 
         self.target_color = self.get_parameter('color').value
         self.arm_name = self.get_parameter('arm').value
         self.camera_tilt = self.get_parameter('camera_tilt').value
         self.move_duration = self.get_parameter('duration').value
+        self.max_retries = self.get_parameter('max_retries').value
 
         # Perception (subscribes to camera topics + sets up TF2)
         self.detector = RGBDObjectDetector(self)
@@ -187,14 +215,107 @@ class RGBDGraspDemo(Node):
         qw, qx, qy, qz = ORIENT_FINGERS_DOWN
         return self.make_pose(x, y, z, qw, qx, qy, qz)
 
+    def set_arm_joints(self, joint_positions, duration):
+        """Publish an ArmCommand to the active arm and wait."""
+        msg = ArmCommand()
+        msg.joint_positions = list(joint_positions)
+        msg.duration = float(duration)
+        self.arm_pub.publish(msg)
+        time.sleep(duration + 0.5)
+
+    # ── Post-grasp verification ─────────────────────────────────────
+
+    def verify_grasp(self) -> bool:
+        """
+        Present the gripper to the camera and check whether the target
+        color is visible (i.e. the object is in the gripper).
+
+        Returns True if the object is detected, False otherwise.
+        """
+        self.get_logger().info('  [verify] Moving arm to present pose...')
+        self.set_arm_joints(VERIFY_ARM_POSE, VERIFY_ARM_DURATION)
+
+        self.get_logger().info('  [verify] Aiming camera at gripper...')
+        self.set_camera(pan=VERIFY_CAMERA_PAN, tilt=VERIFY_CAMERA_TILT)
+        self.spin_for(VERIFY_CAMERA_SETTLE_TIME)
+
+        self.get_logger().info(
+            f'  [verify] Checking for "{self.target_color}" in camera view...')
+        centroid = self.detector.detect_color(
+            self.target_color, min_area=VERIFY_MIN_BLOB_AREA)
+
+        if centroid is not None:
+            u, v = centroid
+            self.get_logger().info(
+                f'  [verify] Object detected at pixel ({u}, {v}) — grasp confirmed')
+            return True
+        else:
+            self.get_logger().warn(
+                f'  [verify] Target color "{self.target_color}" not found — grasp failed')
+            return False
+
     # ── Main pipeline ──────────────────────────────────────────────
+
+    def _detect_object(self):
+        """Point camera at table and localize the target object.
+        Returns (ox, oy, oz) in base_link or None."""
+        self.get_logger().info('Setting camera tilt')
+        self.set_camera(pan=0.0, tilt=self.camera_tilt)
+        self.spin_for(2.0)
+
+        self.get_logger().info(f'Detecting {self.target_color} object')
+        result = self.detector.detect_and_localize(self.target_color)
+        if result is None:
+            self.get_logger().error(
+                f'Could not find {self.target_color} object in camera view!')
+            return None
+        (u, v), base_pt = result
+        ox, oy, oz = base_pt.point.x, base_pt.point.y, base_pt.point.z
+        self.get_logger().info(f'  Detected at pixel ({u}, {v})')
+        self.get_logger().info(
+            f'  Object in base_link: ({ox:.3f}, {oy:.3f}, {oz:.3f})')
+        return (ox, oy, oz)
+
+    def _execute_grasp(self, ox, oy, oz):
+        """Run the pre-grasp → grasp → close gripper sequence.
+        Returns True if all motions succeeded."""
+        grasp_z = oz + GRASP_Z_OFFSET
+        pre_grasp_z = grasp_z + PRE_GRASP_Z_OFFSET
+
+        self.publish_marker(ox, oy, oz, 0.0, 1.0, 0.0,
+                            label='detected_surface', scale=0.02)
+        self.publish_marker(ox, oy, grasp_z, 1.0, 0.0, 0.0,
+                            label='grasp_target', scale=0.02)
+        self.publish_marker(ox, oy, pre_grasp_z, 0.0, 0.0, 1.0,
+                            label='pre_grasp', scale=0.02)
+
+        self.get_logger().info('Opening gripper')
+        self.set_gripper(0.0)
+
+        self.get_logger().info('Moving to pre-grasp')
+        pre_grasp = self.grasp_pose_at(ox, oy, pre_grasp_z)
+        if not self.plan_and_execute(pre_grasp, 'pre-grasp'):
+            self.get_logger().error('Pre-grasp motion failed')
+            return False
+
+        self.get_logger().info('Descending to grasp')
+        grasp = self.grasp_pose_at(ox, oy, grasp_z)
+        if not self.plan_and_execute(grasp, 'grasp'):
+            self.get_logger().error('Grasp motion failed')
+            return False
+
+        self.get_logger().info('Closing gripper')
+        self.set_gripper(1.0)
+        time.sleep(1.0)
+        return True
 
     def run(self):
         self.get_logger().info('=' * 50)
-        self.get_logger().info('RGB-D Grasp Demo')
+        self.get_logger().info('RGB-D Grasp Demo (with verification)')
         self.get_logger().info(f'  Target color : {self.target_color}')
         self.get_logger().info(f'  Arm          : {self.arm_name}')
         self.get_logger().info(f'  Camera tilt  : {self.camera_tilt}')
+        self.get_logger().info(f'  Max retries  : {self.max_retries}')
         self.get_logger().info('=' * 50)
 
         # Wait for motion planner
@@ -203,85 +324,78 @@ class RGBDGraspDemo(Node):
             self.get_logger().info('  ...waiting')
         self.get_logger().info('Service available.')
 
-        # ── Step 1: Point camera down ───────────────────────────────
-        self.get_logger().info('Step 1: Setting camera tilt')
-        self.set_camera(pan=0.0, tilt=self.camera_tilt)
-        self.spin_for(2.0)  # let images arrive
+        # ── Grasp + verify loop ─────────────────────────────────────
+        grasp_confirmed = False
+        for attempt in range(1, self.max_retries + 1):
+            self.get_logger().info('')
+            self.get_logger().info(f'=== Grasp attempt {attempt}/{self.max_retries} ===')
 
-        # ── Step 2: Detect and localize object ──────────────────────
-        self.get_logger().info(f'Step 2: Detecting {self.target_color} object')
-        result = self.detector.detect_and_localize(self.target_color)
-        if result is None:
+            # Detect object on the table
+            detection = self._detect_object()
+            if detection is None:
+                self.get_logger().error('Object detection failed — aborting')
+                return
+            ox, oy, oz = detection
+
+            # Execute grasp (pre-grasp → descend → close gripper)
+            if not self._execute_grasp(ox, oy, oz):
+                self.get_logger().error('Grasp execution failed — aborting')
+                return
+
+            # Verify: present to camera and check for target color
+            self.get_logger().info('Verifying grasp...')
+            if self.verify_grasp():
+                grasp_confirmed = True
+                break
+
+            # Verification failed — release and retry
+            self.get_logger().warn(
+                f'Grasp verification failed (attempt {attempt}/{self.max_retries})')
+            self.get_logger().info('Opening gripper to release...')
+            self.set_gripper(0.0)
+            time.sleep(0.5)
+            self.get_logger().info('Returning arm to home before retry...')
+            self.go_home()
+
+        if not grasp_confirmed:
             self.get_logger().error(
-                f'Could not find {self.target_color} object in camera view!')
+                f'Grasp failed after {self.max_retries} attempts — giving up')
+            self.go_home()
             return
-        (u, v), base_pt = result
-        ox = base_pt.point.x
-        oy = base_pt.point.y
-        oz = base_pt.point.z
-        self.get_logger().info(f'  Detected at pixel ({u}, {v})')
-        self.get_logger().info(
-            f'  Object in base_link: ({ox:.3f}, {oy:.3f}, {oz:.3f})')
 
-        # ── Publish debug markers in RViz ───────────────────────────
+        # ── Grasp verified — continue with post-grasp actions ───────
+
+        self.get_logger().info('')
+        self.get_logger().info('Grasp confirmed — proceeding to lift')
+
+        # Lift
         grasp_z = oz + GRASP_Z_OFFSET
         pre_grasp_z = grasp_z + PRE_GRASP_Z_OFFSET
-        self.publish_marker(ox, oy, oz, 0.0, 1.0, 0.0,
-                            label='detected_surface', scale=0.02)
-        self.publish_marker(ox, oy, grasp_z, 1.0, 0.0, 0.0,
-                            label='grasp_target', scale=0.02)
-        self.publish_marker(ox, oy, pre_grasp_z, 0.0, 0.0, 1.0,
-                            label='pre_grasp', scale=0.02)
-
-        # ── Step 3: Open gripper ────────────────────────────────────
-        self.get_logger().info('Step 3: Opening gripper')
-        self.set_gripper(0.0)
-
-        # ── Step 4: Move to pre-grasp ───────────────────────────────
-        self.get_logger().info('Step 4: Moving to pre-grasp')
-        pre_grasp = self.grasp_pose_at(ox, oy, pre_grasp_z)
-        if not self.plan_and_execute(pre_grasp, 'pre-grasp'):
-            self.get_logger().error('Pre-grasp motion failed')
-            return
-
-        # ── Step 5: Move to grasp ───────────────────────────────────
-        self.get_logger().info('Step 5: Descending to grasp')
-        grasp = self.grasp_pose_at(ox, oy, grasp_z)
-        if not self.plan_and_execute(grasp, 'grasp'):
-            self.get_logger().error('Grasp motion failed')
-            return
-
-        # ── Step 6: Close gripper ───────────────────────────────────
-        self.get_logger().info('Step 6: Closing gripper')
-        self.set_gripper(1.0)
-        time.sleep(1.0)
-
-        # ── Step 7: Lift ────────────────────────────────────────────
-        self.get_logger().info('Step 7: Lifting object')
+        self.get_logger().info('Lifting object')
         lift = self.grasp_pose_at(ox, oy, grasp_z + LIFT_HEIGHT)
         if not self.plan_and_execute(lift, 'lift'):
             self.get_logger().error('Lift motion failed')
             return
 
-        # ── Step 8: Place back down ─────────────────────────────────
-        self.get_logger().info('Step 8: Placing object back down')
+        # Place back down
+        self.get_logger().info('Placing object back down')
         place = self.grasp_pose_at(ox, oy, grasp_z)
         if not self.plan_and_execute(place, 'place-down'):
             self.get_logger().error('Place motion failed')
             return
 
-        # ── Step 9: Release ─────────────────────────────────────────
-        self.get_logger().info('Step 9: Releasing object')
+        # Release
+        self.get_logger().info('Releasing object')
         self.set_gripper(0.0)
         time.sleep(0.5)
 
-        # ── Step 10: Retract ────────────────────────────────────────
-        self.get_logger().info('Step 10: Retracting arm')
+        # Retract
+        self.get_logger().info('Retracting arm')
         retract = self.grasp_pose_at(ox, oy, pre_grasp_z)
         self.plan_and_execute(retract, 'retract')
 
-        # ── Step 11: Return to home ─────────────────────────────────
-        self.get_logger().info('Step 11: Returning to home')
+        # Home
+        self.get_logger().info('Returning to home')
         self.go_home()
 
         self.get_logger().info('')
