@@ -3,7 +3,7 @@ name = "collaborative-robotics-2026"
 version = "0.1.0"
 description = "TidyBot2 with WX250s arm control for MuJoCo simulation and Real Hardware"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     # Core simulation
     "mujoco>=3.2.0",
@@ -32,6 +32,11 @@ dependencies = [
     "threadpoolctl>=3.6.0",
     "transforms3d>=0.4.1",
     "modern-robotics>=1.1.0",
+    # GraspNet dependencies
+    # Note: torch/torchvision and graspnetAPI installed separately (see below)
+    "scipy>=1.12.0",
+    "open3d>=0.19.0",
+    "tqdm>=4.66.0",
 ]
 
 # =============================================================================
@@ -41,13 +46,11 @@ dependencies = [
 # Uncomment and run `uv sync` to install.
 #
 # [Numerical / Scientific]
-# "scipy>=1.12.0",
 # "matplotlib>=3.8.0",
 #
 # [Video / 3D]
 # "imageio>=2.37.0",
 # "imageio-ffmpeg>=0.6.0",
-# "open3d>=0.19.0",
 #
 # [Robotics utilities]
 # "spatialmath-python>=1.1.0",
@@ -58,17 +61,14 @@ dependencies = [
 # "h5py>=3.11.0",
 # "pyyaml>=6.0.0",
 #
-# [ML/DL - Large downloads, ~4-5GB total]
-# "torch>=2.0.0",
-# "torchvision>=0.15.0",
+# [ML/DL - additional]
 # "transformers>=4.51.0",
 # "diffusers>=0.32.0",
 # "accelerate>=1.6.0",
 # "safetensors>=0.5.0",
-# "huggingface-hub>=0.30.0",
+# "hugginghouse-hub>=0.30.0",
 #
 # [Utilities]
-# "tqdm>=4.66.0",
 # "colorama>=0.4.6",
 # "python-dotenv>=1.1.0",
 # "requests>=2.32.0",
@@ -106,3 +106,7 @@ dev = [
     "jupyterlab>=4.1.0",
     "ipykernel>=6.29.0",
 ]
+
+# Use PyTorch CUDA 12.4 wheels (compatible with CUDA driver 13.0).
+# torch/torchvision are NOT installed via uv sync — install them manually:
+#   uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124

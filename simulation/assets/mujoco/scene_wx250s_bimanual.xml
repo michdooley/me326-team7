@@ -20,4 +20,18 @@
     <light pos="0 0 1.5" directional="true"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
   </worldbody>
+
+  <!-- qpos: base(3) + pan_tilt(2) + right_arm(6) + right_gripper(2) + left_arm(6) + left_gripper(2) = 21 -->
+  <keyframe>
+    <key name="home" qpos="0 0 1.5708
+        0 0
+        0 0 0 0 0 0 0.037 0.037
+        0 0 0 0 0 0 0.037 0.037"
+      ctrl="0 0 1.5708 0 0 0 0 0 0 0 0 0.037 0.037 0 0 0 0 0 0 0.037 0.037"/>
+    <key name="retract" qpos="0 0 1.5708
+        0 0
+        0 -0.5 1.57 0 0 0 0.037 0.037
+        0 -0.5 1.57 0 0 0 0.037 0.037"
+      ctrl="0 0 1.5708 0 0 0 -0.5 1.57 0 0 0 0.037 0.037 0 -0.5 1.57 0 0 0 0.037 0.037"/>
+  </keyframe>
 </mujoco>

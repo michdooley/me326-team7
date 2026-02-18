@@ -1,0 +1,79 @@
+<mujoco model="tidybot grasp scene">
+  <include file="tidybot_wx250s_bimanual.xml"/>
+
+  <statistic center="0 0 0.525" extent="1.1" meansize="0.05"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.1 0.1 0.1" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="140" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+    <!-- Cube materials -->
+    <material name="red_material"   rgba="0.85 0.15 0.15 1"/>
+    <material name="green_material" rgba="0.15 0.75 0.15 1"/>
+    <material name="blue_material"  rgba="0.15 0.25 0.85 1"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.5" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <!--
+      Cube positions are in the WORLD frame.
+      With base_th = pi/2 (robot facing +X):
+        world +X = robot forward  (base_link -Y direction)
+        world -Y = robot right    (base_link -X direction)
+        world +Y = robot left     (base_link +X direction)
+
+      Red cube:   directly ahead, center         (world: 0.45,  0.00, 0.025)
+      Green cube: ahead and slightly to robot's left  (world: 0.50,  0.12, 0.025)
+      Blue cube:  ahead and slightly to robot's right (world: 0.50, -0.12, 0.025)
+
+      Approximate base_link coordinates (for IK reference):
+        Red:   (-0.00, -0.45, 0.025)
+        Green: ( 0.12, -0.50, 0.025)
+        Blue:  (-0.12, -0.50, 0.025)
+    -->
+
+    <!-- Red cube: straight ahead -->
+    <body name="red_cube" pos="0.45 0.0 0.025">
+      <freejoint name="red_cube_joint"/>
+      <geom name="red_cube_geom" type="box" size="0.025 0.025 0.025" mass="0.1"
+        material="red_material" friction="1.0 0.5 0.5"
+        solref="0.01 1" solimp="0.99 0.99 0.001"/>
+    </body>
+
+    <!-- Green cube: REMOVED for clean testing -->
+    <!-- Blue cube: REMOVED for clean testing -->
+
+  </worldbody>
+
+  <!--
+    qpos breakdown (28 total):
+      robot(21):     base(3) + pan_tilt(2) + right_arm(6) + right_gripper(2) + left_arm(6) + left_gripper(2)
+      red_cube(7):   x y z qw qx qy qz
+    ctrl stays 21 values (cube freejoint has no actuator).
+  -->
+  <keyframe>
+    <key name="home"
+      qpos="0 0 1.5708
+        0 0
+        0 0 0 0 0 0 0.037 0.037
+        0 0 0 0 0 0 0.037 0.037
+        0.45  0.00 0.025 1 0 0 0"
+      ctrl="0 0 1.5708 0 0 0 0 0 0 0 0 0.037 0.037 0 0 0 0 0 0 0.037 0.037"/>
+    <key name="retract"
+      qpos="0 0 1.5708
+        0 0
+        0 -0.5 1.57 0 0 0 0.037 0.037
+        0 -0.5 1.57 0 0 0 0.037 0.037
+        0.45  0.00 0.025 1 0 0 0"
+      ctrl="0 0 1.5708 0 0 0 -0.5 1.57 0 0 0 0.037 0.037 0 -0.5 1.57 0 0 0 0.037 0.037"/>
+  </keyframe>
+</mujoco>

@@ -40,6 +40,10 @@ install(PROGRAMS
   scripts/task1_retrieve.py
   scripts/voice_command.py
   scripts/navigate_to_object.py
+  scripts/camera_scanner.py
+  scripts/grasp_demo.py
+  scripts/test_camera_interrupt.py
+  scripts/grasp_execute.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
