@@ -15,7 +15,7 @@ Verification steps (after closing gripper):
        After MAX_GRASP_RETRIES failures → abort
 
 Usage:
-    # Terminal 1: Start simulation with grasp scene
+    # Terminal 1: Start simulation with grasp
     ros2 launch tidybot_bringup sim.launch.py scene:=scene_rgbd_grasp.xml
 
     # Terminal 2: Run this demo (defaults to red cube, right arm)
