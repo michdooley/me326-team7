@@ -61,7 +61,8 @@ def main():
     print("Transcription:\n", transcription)
     
     model = genai.GenerativeModel("gemini-2.0-flash")
-    response = model.generate_content(f"return the verb and the object, based on what the next sentense." + "{transcription}")
+    message = f"return the verb and the object, based on what the next sentense." + transcription
+    response = model.generate_content(message)
     print(response.text)
 
 
