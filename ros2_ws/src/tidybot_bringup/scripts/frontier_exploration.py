@@ -133,6 +133,7 @@ class FrontierExplorer(Node):
 
     # ── Frontier selection ────────────────────────────────────────────────────
     MIN_FRONTIER_SIZE   = 8    # cells — ignore tiny frontier clusters
+    MIN_FRONTIER_DIST   = 1.5  # m — ignore frontiers closer than this to the robot
     FRONTIER_NAV_OFFSET = 0.4  # m — goal set this far in front of centroid
 
     # ── Navigation ────────────────────────────────────────────────────────────
@@ -596,6 +597,12 @@ class FrontierExplorer(Node):
             mgy = int(np.mean([c[1] for c in cluster]))
             wx, wy = self.grid_to_world(mgx, mgy)
             dist   = np.hypot(wx - bx, wy - by)
+
+            # Skip frontiers too close to the robot.  These arise at the edge
+            # of the footprint-clearing radius and score deceptively high
+            # because the distance denominator is tiny.
+            if dist < self.MIN_FRONTIER_DIST:
+                continue
 
             # Count UNKNOWN cells within sensor range of this frontier centroid.
             y_lo = max(0,             mgy - r_cells)
