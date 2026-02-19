@@ -31,9 +31,9 @@
     <geom name="wall_east" type="box" pos="7.5 0 0.25" size="0.05 7.5 0.25" material="wall_material"/>
     <geom name="wall_west" type="box" pos="-7.5 0 0.25" size="0.05 7.5 0.25" material="wall_material"/>
 
-    <!-- Large obstacle 1m in front of initial robot pose/direction -->
-    <body name="obstacle_start_ahead_box" pos="1.0 0.0 0.25">
-      <geom name="obstacle_start_ahead_box_geom" type="box" size="0.35 0.35 0.25" material="obstacle_material"
+    <!-- Small-footprint tall rectangular obstacle in front of start pose -->
+    <body name="obstacle_front_tall_rect_1" pos="0.9 0.0 0.35">
+      <geom name="obstacle_front_tall_rect_1_geom" type="box" size="0.06 0.06 0.35" material="obstacle_material"
         mass="10.0" friction="2.0 1.0 1.0"/>
     </body>
 
