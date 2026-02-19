@@ -41,6 +41,7 @@ install(PROGRAMS
   scripts/voice_command.py
   scripts/navigate_to_object.py
   scripts/rgbd_grasp_demo.py
+  scripts/rgbd_grasp_demo_real.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
