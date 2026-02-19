@@ -10,7 +10,7 @@
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
-#include <gpd/util/config.h>
+#include <gpd/util/config_file.h>
 #include <gpd/grasp_detector.h>
 
 /**

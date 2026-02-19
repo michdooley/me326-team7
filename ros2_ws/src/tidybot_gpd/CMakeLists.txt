@@ -10,29 +10,52 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# Find dependencies
+# Find ROS2 dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(tidybot_msgs REQUIRED)
-find_package(pcl REQUIRED)
-find_package(pcl_ros REQUIRED)
-find_package(tf2 REQUIRED)
-find_package(tf2_geometry_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 
-# Find GPD library (installed via sudo make install in ~/grasp_libraries/gpd/build)
-# If CMake can't find it, set this manually:
-# set(GPD_DIR /path/to/gpd/install)
-find_package(gpd REQUIRED)
+# Find PCL manually (system library, not ROS2 package)
+find_library(PCL_COMMON_LIB pcl_common PATHS /usr/lib/aarch64-linux-gnu)
+find_library(PCL_FILTERS_LIB pcl_filters PATHS /usr/lib/aarch64-linux-gnu)
+find_library(PCL_KDTREE_LIB pcl_kdtree PATHS /usr/lib/aarch64-linux-gnu)
+find_library(PCL_SEGMENTATION_LIB pcl_segmentation PATHS /usr/lib/aarch64-linux-gnu)
+find_library(PCL_IO_LIB pcl_io PATHS /usr/lib/aarch64-linux-gnu)
+find_library(PCL_FEATURES_LIB pcl_features PATHS /usr/lib/aarch64-linux-gnu)
+
+set(PCL_INCLUDE_DIRS /usr/include/pcl-1.12)
+set(PCL_LIBRARIES 
+  ${PCL_COMMON_LIB}
+  ${PCL_FILTERS_LIB}
+  ${PCL_KDTREE_LIB}
+  ${PCL_SEGMENTATION_LIB}
+  ${PCL_IO_LIB}
+  ${PCL_FEATURES_LIB}
+)
+
+# Find GPD library (installed manually to /usr/local)
+find_path(GPD_INCLUDE_DIR gpd/grasp_detector.h PATHS /usr/local/include)
+find_library(GPD_LIBRARY NAMES gpd PATHS /usr/local/lib)
+
+if(NOT GPD_LIBRARY OR NOT GPD_INCLUDE_DIR)
+  message(FATAL_ERROR "GPD library not found. Please check /usr/local/lib/libgpd.so and /usr/local/include/gpd/")
+endif()
+
+message(STATUS "Found GPD: ${GPD_LIBRARY}")
+message(STATUS "Found GPD include: ${GPD_INCLUDE_DIR}")
 
 # Include directories
 include_directories(
   include
   ${PCL_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIR}
+  ${GPD_INCLUDE_DIR}/..
 )
 
 # Create grasp planner node executable
@@ -45,7 +68,7 @@ target_link_libraries(grasp_planner_node
   ${PCL_LIBRARIES}
   ${EIGEN3_LIBRARIES}
   ${OpenCV_LIBRARIES}
-  gpd
+  ${GPD_LIBRARY}
 )
 
 # Link ROS2 dependencies
@@ -54,7 +77,6 @@ ament_target_dependencies(grasp_planner_node
   geometry_msgs
   sensor_msgs
   tidybot_msgs
-  pcl_ros
   tf2
   tf2_geometry_msgs
 )

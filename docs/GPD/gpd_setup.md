@@ -61,27 +61,37 @@ If OpenVINO setup is complex, skip it — GPD will fallback to Caffe or Eigen (s
 
 ---
 
-## Step 2: Build and Install GPD Library
+sudo make install
+## Step 2: Build and Install GPD Library (reproducible)
 
-Clone and build the GPD library (this is a requirement for the ROS2 wrapper):
+We now provide a reproducible installer script in the repo so you can build and install the same GPD layout across machines.
+
+Recommended layout (this repository expects the source at):
+
+`/home/elisabeth/me326-team7/grasp_libraries/gpd`
+
+If you placed the GPD source at that location, run the bundled installer from the repository root:
 
 ```bash
-# Create a directory for GPD (outside your ROS workspace)
-mkdir -p ~/grasp_libraries
-cd ~/grasp_libraries
+cd /home/elisabeth/me326-team7
+chmod +x grasp_libraries/install_gpd.sh
+./grasp_libraries/install_gpd.sh
+```
 
-# Clone GPD repository
-git clone https://github.com/atenpas/gpd.git
-cd gpd
+What the script does:
+- Builds GPD with conservative compiler flags compatible with both x86 and ARM
+- Runs `sudo make install` and copies the shared library to `/usr/local/lib`
+- Copies headers to `/usr/local/include/gpd`
+- Installs a `Findgpd.cmake` helper to `/usr/local/share/cmake/Findgpd.cmake`
+- Runs `sudo ldconfig`
 
-# Create build directory
+If you prefer to build manually, the steps are the same but using the GPD source path above:
+
+```bash
+cd /home/elisabeth/me326-team7/grasp_libraries/gpd
 mkdir -p build && cd build
-
-# Build with CMake (without OpenVINO first, can add later)
-cmake ..
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17
 make -j$(nproc)
-
-# Install as a shared library (important for ROS2 wrapper to find it)
 sudo make install
 ```
 
@@ -90,10 +100,10 @@ sudo make install
 If you installed OpenVINO, rebuild GPD with it:
 
 ```bash
-cd ~/grasp_libraries/gpd/build
+cd /home/elisabeth/me326-team7/grasp_libraries/gpd/build
 rm CMakeCache.txt
 
-# Set OpenVINO path
+# Set OpenVINO path (adjust if your OpenVINO version/location differs)
 export InferenceEngine_DIR=/opt/intel/openvino_2023/runtime/cmake
 
 # Reconfigure and build
@@ -104,16 +114,21 @@ sudo make install
 
 ### Verify Installation
 
-Test GPD with a sample point cloud:
+After running the installer, verify the key files are present:
 
 ```bash
-cd ~/grasp_libraries/gpd
-
-# Run on a sample PCD file
-./build/detect_grasps cfg/eigen_params.cfg tutorials/krylon.pcd
+ls -lh /usr/local/lib/libgpd.so
+ls -la /usr/local/include/gpd | head -n 20
+ls -lh /usr/local/share/cmake/Findgpd.cmake
 ```
 
-You should see a PCL viewer with grasp poses visualized.
+You can also run the standalone detect executable from the build tree (if you kept the build directory):
+
+```bash
+/home/elisabeth/me326-team7/grasp_libraries/gpd/build/detect_grasps /home/elisabeth/me326-team7/ros2_ws/src/tidybot_perception/config/gpd_params.cfg tutorials/krylon.pcd
+```
+
+If `detect_grasps` launches a PCL viewer and shows grasps, the install is working.
 
 ---
 
