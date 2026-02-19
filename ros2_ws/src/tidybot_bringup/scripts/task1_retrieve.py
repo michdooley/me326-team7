@@ -6,8 +6,10 @@ Orchestrates the full object retrieval task:
     LISTEN → SEARCH → APPROACH → PLAN_GRASP → PRE_GRASP → GRASP →
     VERIFY_GRASP → RETURN → DONE
 
-Uses NavigateToObject for search/approach, YOLOObjectDetector for
-class-based object detection, and /plan_to_target for arm motion planning.
+Uses NavigateToObject for search/approach, the external classifier node
+(/objbbox) for YOLO detections, and /plan_to_target for arm motion planning.
+
+Requires: ros2 run object_classification classifier
 
 VERIFY_GRASP sub-steps:
     1. PRESENT_ARM  — Move grasping arm to a pose visible to the camera
@@ -49,8 +51,13 @@ from std_msgs.msg import Float64MultiArray
 from tidybot_msgs.msg import ArmCommand
 from tidybot_msgs.srv import PlanToTarget
 
-from tidybot_perception.yolo_object_detector import YOLOObjectDetector
-from navigate_to_object import NavigateToObject, _normalize_angle
+from sensor_msgs.msg import Image, CameraInfo
+from vision_msgs.msg import Detection2DArray
+from cv_bridge import CvBridge
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+
+from tidybot_perception.coord_converter import CoordConverter
+from navigate_to_object import NavigateToObject, _normalize_angle, YOLO_CLASS_IDS
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -149,12 +156,24 @@ class Task1Retrieve(Node):
 
         self.nav_node = nav_node
 
-        # ── Perception (YOLO detection + depth localization) ──
-        self.detector = YOLOObjectDetector(self)
-
         # ── TF2 (for odom→base_link lookups in RETURN) ──
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.coord_conv = CoordConverter(self.tf_buffer)
+
+        # ── Perception: subscribe to external classifier + depth ──
+        self._bridge = CvBridge()
+        self.latest_depth = None
+        self.camera_info = None
+        self.latest_detections = None
+
+        qos_be = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.create_subscription(
+            Detection2DArray, '/objbbox', self._detections_cb, 10)
+        self.create_subscription(
+            Image, '/camera/depth/image_raw', self._depth_cb, qos_be)
+        self.create_subscription(
+            CameraInfo, '/camera/color/camera_info', self._info_cb, 10)
 
         # ── Publishers ──
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
@@ -267,6 +286,58 @@ class Task1Retrieve(Node):
             return self.right_gripper_pub
         return self.left_gripper_pub
 
+    # ── Classifier subscription callbacks ──
+
+    def _detections_cb(self, msg):
+        self.latest_detections = msg
+
+    def _depth_cb(self, msg):
+        self.latest_depth = self._bridge.imgmsg_to_cv2(msg, '16UC1')
+
+    def _info_cb(self, msg):
+        self.camera_info = msg
+
+    # ── Detection helpers (consume external classifier) ──
+
+    def _detect(self, target_class):
+        """Find the best detection matching target_class from /objbbox.
+
+        Returns:
+            (u, v) pixel centroid of highest-confidence match, or None.
+        """
+        if self.latest_detections is None:
+            return None
+        target_id = YOLO_CLASS_IDS.get(target_class.lower())
+        if target_id is None:
+            return None
+
+        best, best_conf = None, 0.0
+        for det in self.latest_detections.detections:
+            for hyp in det.results:
+                if hyp.hypothesis.class_id == target_id and hyp.hypothesis.score > best_conf:
+                    best = (int(det.bbox.center.position.x),
+                            int(det.bbox.center.position.y))
+                    best_conf = hyp.hypothesis.score
+        return best
+
+    def _detect_and_localize(self, target_class):
+        """Detect an object and return its 3D position in base_link.
+
+        Returns:
+            ((u, v), PointStamped_in_base_link), or None.
+        """
+        centroid = self._detect(target_class)
+        if centroid is None:
+            return None
+
+        base_pt = self.coord_conv.pixel_to_base_link(
+            centroid[0], centroid[1],
+            self.latest_depth, self.camera_info, self.get_clock())
+        if base_pt is None:
+            return None
+
+        return (centroid, base_pt)
+
     def _send_plan_to_target(self, target_pose, label):
         """Send async /plan_to_target request. Sets self.plan_future."""
         req = PlanToTarget.Request()
@@ -292,7 +363,7 @@ class Task1Retrieve(Node):
             clearance: tuple of bools (True = clear).
             distances: tuple of floats (meters to nearest obstacle).
         """
-        depth = self.detector.latest_depth
+        depth = self.latest_depth
         if depth is None:
             return (True, True, True), (999.0, 999.0, 999.0)
 
@@ -426,8 +497,7 @@ class Task1Retrieve(Node):
 
             self.get_logger().info(
                 f'  [verify] Checking for "{self.target_object}" via YOLO...')
-            centroid = self.detector.detect(
-                self.target_object, min_area=VERIFY_MIN_BLOB_AREA)
+            centroid = self._detect(self.target_object)
 
             self.verify_detect_result = centroid
             self.verify_sub_state = VerifySubState.DECIDE
@@ -527,8 +597,8 @@ class Task1Retrieve(Node):
             if elapsed < 2.0:
                 return  # camera settling + let detector get fresh frames
 
-            # Use YOLOObjectDetector to re-detect object for grasp planning
-            result = self.detector.detect_and_localize(self.target_object)
+            # Re-detect object for grasp planning via classifier
+            result = self._detect_and_localize(self.target_object)
             if result is None:
                 if elapsed > 8.0:
                     self.get_logger().error(

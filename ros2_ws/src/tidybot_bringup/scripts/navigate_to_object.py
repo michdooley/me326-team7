@@ -6,18 +6,22 @@ Searches for a target object (e.g., 'banana', 'apple') by scanning the environme
 explores with frontier-based navigation and obstacle avoidance using a depth-based
 occupancy grid, and positions the robot within grasping range.
 
-Uses YOLO object detection via YOLOObjectDetector for class-based recognition.
+Uses YOLO detections from the external classifier node (object_classification/classifier.py)
+via the /objbbox topic, rather than running its own YOLO model internally.
 
 Internal sub-states: INIT → SCAN → EXPLORE → APPROACH → ALIGN → POSITIONED
 
-Subscribes (via YOLOObjectDetector):
-    /camera/color/image_raw (Image) - RGB for YOLO detection
+Subscribes:
+    /objbbox (vision_msgs/Detection2DArray) - YOLO detections from classifier node
     /camera/depth/image_raw (Image) - depth for obstacle avoidance + 3D localization
     /camera/color/camera_info (CameraInfo) - intrinsics
 
 Publishes:
     /cmd_vel (Twist) - base velocity
     /camera/pan_tilt_cmd (Float64MultiArray) - camera pointing
+
+Requires:
+    The classifier node must be running: ros2 run object_classification classifier
 
 Usage:
     # As a standalone test:
@@ -43,7 +47,13 @@ from nav_msgs.msg import OccupancyGrid, MapMetaData
 
 import tf2_ros
 
-from tidybot_perception.yolo_object_detector import YOLOObjectDetector
+from sensor_msgs.msg import Image, CameraInfo
+from vision_msgs.msg import Detection2DArray
+from cv_bridge import CvBridge
+from geometry_msgs.msg import PointStamped
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+
+from tidybot_perception.coord_converter import CoordConverter
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -85,6 +95,13 @@ DEPTH_SUBSAMPLE = 4            # process every Nth pixel for speed
 MIN_FRONTIER_SIZE = 10         # minimum cells in a frontier cluster
 FRONTIER_NAV_OFFSET = 0.3      # navigate slightly in front of frontier (meters)
 OBSTACLE_INFLATION_RADIUS = 6  # cells to inflate around obstacles (6 * 0.05m = 0.30m buffer)
+
+# YOLO COCO class name → string ID (must match classifier.py output)
+YOLO_CLASS_IDS = {'person': '0', 'banana': '46', 'apple': '47', 'orange': '49'}
+
+# Depth back-projection
+DEPTH_PATCH_RADIUS = 5         # half-size of patch for robust depth estimation (11x11)
+FLOOR_Z_MIN = 0.005            # metres — clamp z above floor
 
 
 class NavState(Enum):
@@ -345,9 +362,10 @@ def _normalize_angle(angle):
 
 class NavigateToObject(Node):
     """
-    Navigate to a target object using YOLO detection, frontier
-    exploration, and reactive obstacle avoidance.
+    Navigate to a target object using external YOLO classifier detections,
+    frontier exploration, and reactive obstacle avoidance.
 
+    Requires the classifier node to be running for /objbbox detections.
     Can be run standalone or used by the state machine.
     """
 
@@ -356,12 +374,24 @@ class NavigateToObject(Node):
 
         self.target_object = target_object
 
-        # ── Perception (YOLO detection + depth localization) ──
-        self.detector = YOLOObjectDetector(self)
-
         # ── TF2 (for odom→base_link lookups) ──
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.coord_conv = CoordConverter(self.tf_buffer)
+
+        # ── Perception: subscribe to external classifier + depth ──
+        self._bridge = CvBridge()
+        self.latest_depth = None
+        self.camera_info = None
+        self.latest_detections = None
+
+        qos_be = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.create_subscription(
+            Detection2DArray, '/objbbox', self._detections_cb, 10)
+        self.create_subscription(
+            Image, '/camera/depth/image_raw', self._depth_cb, qos_be)
+        self.create_subscription(
+            CameraInfo, '/camera/color/camera_info', self._info_cb, 10)
 
         # ── Publishers ──
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
@@ -500,6 +530,65 @@ class NavigateToObject(Node):
         msg.data = [float(pan), float(tilt)]
         self.pan_tilt_pub.publish(msg)
 
+    # ── Classifier subscription callbacks ──
+
+    def _detections_cb(self, msg):
+        self.latest_detections = msg
+
+    def _depth_cb(self, msg):
+        self.latest_depth = self._bridge.imgmsg_to_cv2(msg, '16UC1')
+
+    def _info_cb(self, msg):
+        self.camera_info = msg
+
+    # ── Detection helpers (consume external classifier) ──
+
+    def _detect(self, target_class):
+        """Find the best detection matching target_class from /objbbox.
+
+        Args:
+            target_class: COCO class name (e.g. 'banana'). Case-insensitive.
+
+        Returns:
+            (u, v) pixel centroid of highest-confidence match, or None.
+        """
+        if self.latest_detections is None:
+            return None
+        target_id = YOLO_CLASS_IDS.get(target_class.lower())
+        if target_id is None:
+            return None
+
+        best, best_conf = None, 0.0
+        for det in self.latest_detections.detections:
+            for hyp in det.results:
+                if hyp.hypothesis.class_id == target_id and hyp.hypothesis.score > best_conf:
+                    best = (int(det.bbox.center.position.x),
+                            int(det.bbox.center.position.y))
+                    best_conf = hyp.hypothesis.score
+        return best
+
+    def _detect_and_localize(self, target_class):
+        """Detect an object and return its 3D position in base_link.
+
+        Args:
+            target_class: COCO class name (e.g. 'banana').
+
+        Returns:
+            ((u, v), PointStamped_in_base_link), or None.
+        """
+        centroid = self._detect(target_class)
+        if centroid is None:
+            return None
+
+        base_pt = self.coord_conv.pixel_to_base_link(
+            centroid[0], centroid[1],
+            self.latest_depth, self.camera_info, self.get_clock(),
+            patch_radius=DEPTH_PATCH_RADIUS, floor_z_min=FLOOR_Z_MIN)
+        if base_pt is None:
+            return None
+
+        return (centroid, base_pt)
+
     def _analyze_depth_obstacles(self):
         """Analyze depth image for obstacles in left/center/right sectors.
 
@@ -508,7 +597,7 @@ class NavigateToObject(Node):
             clearance: tuple of bools (True = clear).
             distances: tuple of floats (meters to nearest obstacle).
         """
-        depth = self.detector.latest_depth
+        depth = self.latest_depth
         if depth is None:
             return (True, True, True), (999.0, 999.0, 999.0)
 
@@ -593,15 +682,15 @@ class NavigateToObject(Node):
 
     def _update_occupancy_grid(self):
         """Update the occupancy grid from the latest depth image."""
-        depth = self.detector.latest_depth
-        if depth is None or self.detector.camera_info is None:
+        depth = self.latest_depth
+        if depth is None or self.camera_info is None:
             return
 
         R, t = self._get_camera_transform()
         if R is None:
             return
 
-        camera_K = np.array(self.detector.camera_info.k).reshape(3, 3)
+        camera_K = np.array(self.camera_info.k).reshape(3, 3)
         self.occ_grid.update_from_depth(depth, camera_K, R, t)
 
     def _publish_map(self):
@@ -641,9 +730,9 @@ class NavigateToObject(Node):
 
     def _handle_init(self):
         """Wait for sensor data and TF to be available."""
-        if (self.detector.latest_rgb is None
-                or self.detector.latest_depth is None
-                or self.detector.camera_info is None):
+        if (self.latest_detections is None
+                or self.latest_depth is None
+                or self.camera_info is None):
             return
 
         try:
@@ -666,7 +755,7 @@ class NavigateToObject(Node):
     def _handle_scan(self):
         """Rotate 360° in place scanning for the target color."""
         # Check for target on every tick
-        detection = self.detector.detect_and_localize(self.target_object)
+        detection = self._detect_and_localize(self.target_object)
         if detection is not None:
             pixel, base_pt = detection
             self.target_base_pt = base_pt
@@ -719,9 +808,9 @@ class NavigateToObject(Node):
         self._update_occupancy_grid()
 
         # Check for target continuously while exploring
-        detection = self.detector.detect(self.target_object)
+        detection = self._detect(self.target_object)
         if detection is not None:
-            full = self.detector.detect_and_localize(self.target_object)
+            full = self._detect_and_localize(self.target_object)
             if full is not None:
                 pixel, base_pt = full
                 self.target_base_pt = base_pt
@@ -788,7 +877,7 @@ class NavigateToObject(Node):
     def _handle_approach(self):
         """Drive toward the detected object while avoiding obstacles."""
         # Re-detect on every tick for live tracking
-        detection = self.detector.detect_and_localize(self.target_object)
+        detection = self._detect_and_localize(self.target_object)
         if detection is not None:
             pixel, base_pt = detection
             self.target_base_pt = base_pt
@@ -856,7 +945,7 @@ class NavigateToObject(Node):
     def _handle_align(self):
         """Fine-tune position: center the object in view and adjust distance."""
         # Detect pixel position
-        pixel = self.detector.detect(self.target_object)
+        pixel = self._detect(self.target_object)
         if pixel is None:
             # Lost during alignment — go back to approach
             self.get_logger().warn('[ALIGN] Lost object, returning to APPROACH')
@@ -872,7 +961,7 @@ class NavigateToObject(Node):
         angular_correction = -0.003 * pixel_error
 
         # Get 3D position for distance check
-        full = self.detector.detect_and_localize(self.target_object)
+        full = self._detect_and_localize(self.target_object)
         if full is not None:
             _, base_pt = full
             self.target_base_pt = base_pt
