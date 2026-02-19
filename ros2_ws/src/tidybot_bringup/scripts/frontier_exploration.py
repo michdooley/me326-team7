@@ -498,12 +498,18 @@ class FrontierExplorer(Node):
 
     def find_frontiers(self):
         """
-        Return frontier clusters sorted by score (size / distance).
+        Return frontier clusters sorted by information-gain score.
 
         A frontier cell is FREE (log_odds ≤ FREE_THRESH) and 4-adjacent to
-        at least one UNKNOWN cell (FREE_THRESH < log_odds < OCC_THRESH).
-        Connected components (8-connected) smaller than MIN_FRONTIER_SIZE
-        are discarded.
+        at least one UNKNOWN cell.  Connected components (8-connected) smaller
+        than MIN_FRONTIER_SIZE are discarded.
+
+        Score = unknown_cells_within_sensor_range / distance_to_frontier
+
+        'unknown_cells_within_sensor_range' counts all UNKNOWN grid cells
+        within MAX_DEPTH_M of the frontier centroid — an estimate of how much
+        new information the robot would gain by navigating there and scanning.
+        Dividing by distance balances exploration gain against travel cost.
         """
         free_mask    = self.log_odds <= self.LOG_ODDS_FREE_THRESH
         # Use the same confirmed-obstacle definition as publish_map so that
@@ -551,13 +557,36 @@ class FrontierExplorer(Node):
             return []
         bx, by, _ = base_pose
 
+        # Pre-build a boolean disc mask of radius MAX_DEPTH_M in grid cells.
+        # Reused for every cluster so we only allocate it once.
+        r_cells = int(self.MAX_DEPTH_M / self.GRID_RESOLUTION)
+        side    = 2 * r_cells + 1
+        ky, kx  = np.ogrid[-r_cells:r_cells + 1, -r_cells:r_cells + 1]
+        disc    = (ky ** 2 + kx ** 2) <= r_cells ** 2   # (side × side) bool
+
         results = []
         for cluster in clusters:
-            mgx = np.mean([c[0] for c in cluster])
-            mgy = np.mean([c[1] for c in cluster])
-            wx, wy = self.grid_to_world(int(mgx), int(mgy))
+            mgx = int(np.mean([c[0] for c in cluster]))
+            mgy = int(np.mean([c[1] for c in cluster]))
+            wx, wy = self.grid_to_world(mgx, mgy)
             dist   = np.hypot(wx - bx, wy - by)
-            score  = len(cluster) / max(dist, 0.5)
+
+            # Count UNKNOWN cells within sensor range of this frontier centroid.
+            y_lo = max(0,             mgy - r_cells)
+            y_hi = min(self.GRID_SIZE, mgy + r_cells + 1)
+            x_lo = max(0,             mgx - r_cells)
+            x_hi = min(self.GRID_SIZE, mgx + r_cells + 1)
+
+            # Corresponding slice of the disc kernel (handles grid edges)
+            ky_lo = y_lo - (mgy - r_cells)
+            ky_hi = ky_lo + (y_hi - y_lo)
+            kx_lo = x_lo - (mgx - r_cells)
+            kx_hi = kx_lo + (x_hi - x_lo)
+
+            patch = unknown_mask[y_lo:y_hi, x_lo:x_hi]
+            nearby_unknown = int(np.sum(patch & disc[ky_lo:ky_hi, kx_lo:kx_hi]))
+
+            score = nearby_unknown / max(dist, 0.5)
             results.append((wx, wy, len(cluster), score))
 
         results.sort(key=lambda r: r[3], reverse=True)
@@ -703,7 +732,7 @@ class FrontierExplorer(Node):
         wx, wy, size, score = frontiers[0]
         self.get_logger().info(
             f'[SELECT] Best frontier ({wx:.2f}, {wy:.2f}) '
-            f'size={size} score={score:.1f}')
+            f'cluster={size} info_score={score:.0f}')
 
         base_pose = self.get_base_pose()
         if base_pose is None:
