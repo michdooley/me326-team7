@@ -291,32 +291,58 @@ class FrontierExplorer(Node):
             return
 
         # ── 1. Look up camera pose in odom ───────────────────────────────────
-        # The MuJoCo bridge broadcasts a TF with the exact same timestamp as
-        # the depth image, so this stamped lookup has zero lag.
+        # Compose two independent lookups instead of one chained lookup:
+        #
+        #   odom → base_link           stamped to depth image timestamp
+        #   base_link → camera_optical  latest (effectively static: pan=tilt=0)
+        #
+        # This avoids the fallback race condition where a full chained lookup
+        # of odom→camera_depth_optical_frame falls through to rclpy.time.Time()
+        # (latest TF) because robot_state_publisher's joint TFs don't have an
+        # entry at exactly the image timestamp.  During rotation, the "latest"
+        # odom→base_link in the buffer is from a publish_callback that ran
+        # AFTER the image was rendered, placing obstacles at the wrong angle.
+        #
+        # With this split: odom→base_link is stamped (zero-lag, bridge synced),
+        # and base_link→camera_optical only changes when pan/tilt move so its
+        # latest-time lookup is always correct for exploration.
         try:
-            stamp = rclpy.time.Time.from_msg(self.latest_depth_stamp)
-            tf = self.tf_buffer.lookup_transform(
-                'odom', 'camera_depth_optical_frame',
-                stamp, timeout=Duration(seconds=0.1))
+            stamp  = rclpy.time.Time.from_msg(self.latest_depth_stamp)
+            tf_ob  = self.tf_buffer.lookup_transform(
+                'odom', 'base_link', stamp, timeout=Duration(seconds=0.1))
         except Exception:
-            # Fallback to latest if stamped lookup fails (e.g. on startup)
+            # Startup: synced TF not yet in buffer — accept a small lag.
             try:
-                tf = self.tf_buffer.lookup_transform(
-                    'odom', 'camera_depth_optical_frame',
+                tf_ob = self.tf_buffer.lookup_transform(
+                    'odom', 'base_link',
                     rclpy.time.Time(), timeout=Duration(seconds=0.05))
             except Exception:
                 return
 
-        t  = tf.transform.translation
-        q  = tf.transform.rotation
-        cam_origin = np.array([t.x, t.y, t.z])
+        try:
+            tf_bc = self.tf_buffer.lookup_transform(
+                'base_link', 'camera_depth_optical_frame',
+                rclpy.time.Time(), timeout=Duration(seconds=0.1))
+        except Exception:
+            return
 
-        qw, qx, qy, qz = q.w, q.x, q.y, q.z
-        R = np.array([
-            [1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw), 2*(qx*qz+qy*qw)],
-            [2*(qx*qy+qz*qw),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
-            [2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw),   1-2*(qx*qx+qy*qy)],
-        ])
+        def _q2m(q):
+            """Quaternion ROS msg → 3×3 rotation matrix (frame → parent)."""
+            qw, qx, qy, qz = q.w, q.x, q.y, q.z
+            return np.array([
+                [1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw), 2*(qx*qz+qy*qw)],
+                [2*(qx*qy+qz*qw),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
+                [2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw),   1-2*(qx*qx+qy*qy)],
+            ])
+
+        R_ob = _q2m(tf_ob.transform.rotation)
+        R_bc = _q2m(tf_bc.transform.rotation)
+        to   = tf_ob.transform.translation
+        tc   = tf_bc.transform.translation
+
+        # Composed odom→camera: t_oc = R_ob @ t_bc + t_ob,  R_oc = R_ob @ R_bc
+        cam_origin = R_ob @ np.array([tc.x, tc.y, tc.z]) + np.array([to.x, to.y, to.z])
+        R          = R_ob @ R_bc
 
         # ── 2. Back-project depth pixels to odom frame ───────────────────────
         fx = self.camera_K[0, 0];  fy = self.camera_K[1, 1]
