@@ -58,6 +58,21 @@ include_directories(
   ${GPD_INCLUDE_DIR}/..
 )
 
+# VTK headers (PCL visualizer requires vtkSmartPointer.h)
+include_directories(/usr/include/vtk-9.1)
+
+# ROS2 pcl_conversions headers
+find_package(pcl_conversions REQUIRED)
+include_directories(/opt/ros/humble/include)
+
+# Some ROS header packages (pcl_conversions) install nested include folders.
+# Add the specific pcl_conversions include dir so <pcl_conversions/pcl_conversions.h>
+# resolves correctly.
+include_directories(/opt/ros/humble/include/pcl_conversions)
+
+# Some message packages like pcl_msgs also install nested include folders
+include_directories(/opt/ros/humble/include/pcl_msgs)
+
 # Create grasp planner node executable
 add_executable(grasp_planner_node
   src/grasp_planner_node.cpp
@@ -70,6 +85,10 @@ target_link_libraries(grasp_planner_node
   ${OpenCV_LIBRARIES}
   ${GPD_LIBRARY}
 )
+
+# Ensure target picks up ROS include subdir for pcl_conversions
+target_include_directories(grasp_planner_node PRIVATE /opt/ros/humble/include/pcl_conversions)
+target_include_directories(grasp_planner_node PRIVATE /opt/ros/humble/include/pcl_msgs)
 
 # Link ROS2 dependencies
 ament_target_dependencies(grasp_planner_node

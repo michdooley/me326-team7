@@ -4,8 +4,8 @@
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
-#include <gpd/grasp.h>
-#include <gpd/grasp_set.h>
+#include <gpd/candidate/hand.h>
+#include <gpd/candidate/hand_set.h>
 
 #include <memory>
 #include <chrono>
@@ -41,8 +41,7 @@ GraspPlannerNode::GraspPlannerNode(const rclcpp::NodeOptions& options)
   }
 
   try {
-    gpd::util::Config config(config_file_);
-    grasp_detector_ = std::make_unique<gpd::GraspDetector>(config.getRoot());
+    grasp_detector_ = std::make_unique<gpd::GraspDetector>(config_file_);
     RCLCPP_INFO(get_logger(), "GPD detector initialized successfully");
   } catch (const std::exception& e) {
     RCLCPP_ERROR(get_logger(), "Failed to initialize GPD detector: %s", e.what());
@@ -104,9 +103,31 @@ void GraspPlannerNode::plan_grasp_callback(
   try {
     // Run GPD detector on the point cloud
     RCLCPP_INFO(get_logger(), "Running GPD on point cloud with %ld points...", latest_cloud_.size());
-    std::vector<gpd::GraspSet> grasps = grasp_detector_->detectGrasps(latest_cloud_);
+    // Convert pcl::PointCloud<pcl::PointXYZ> to gpd::util::PointCloudRGB
+    using PointXYZRGBA = pcl::PointXYZRGBA;
+    pcl::PointCloud<PointXYZRGBA>::Ptr cloud_rgb(new pcl::PointCloud<PointXYZRGBA>());
+    cloud_rgb->width = static_cast<uint32_t>(latest_cloud_.size());
+    cloud_rgb->height = 1;
+    cloud_rgb->is_dense = false;
+    cloud_rgb->points.resize(latest_cloud_.size());
+    for (size_t i = 0; i < latest_cloud_.size(); ++i) {
+      const auto &p = latest_cloud_.points[i];
+      PointXYZRGBA q;
+      q.x = p.x; q.y = p.y; q.z = p.z;
+      q.r = q.g = q.b = 0;
+      q.a = 255;
+      cloud_rgb->points[i] = q;
+    }
 
-    if (grasps.empty()) {
+    // camera_source: single camera observing all points
+    Eigen::MatrixXi camera_source = Eigen::MatrixXi::Constant(1, (int)cloud_rgb->points.size(), 1);
+    Eigen::Matrix3Xd view_points = Eigen::Matrix3Xd::Zero(3, 1);
+
+    gpd::util::Cloud gpd_cloud(cloud_rgb, camera_source, view_points);
+
+    std::vector<std::unique_ptr<gpd::candidate::Hand>> hands = grasp_detector_->detectGrasps(gpd_cloud);
+
+    if (hands.empty()) {
       response->success = false;
       response->message = "No grasps found in point cloud";
       RCLCPP_WARN(get_logger(), "%s", response->message.c_str());
@@ -114,28 +135,21 @@ void GraspPlannerNode::plan_grasp_callback(
     }
 
     // Get the best grasp (highest score)
-    size_t best_grasp_idx = 0;
+    size_t best_idx = 0;
     double best_score = -1.0;
-    for (size_t i = 0; i < grasps.size(); ++i) {
-      if (grasps[i].getGrasps().empty()) continue;
-      double score = grasps[i].getGrasps()[0].getScore();
+    for (size_t i = 0; i < hands.size(); ++i) {
+      if (!hands[i]) continue;
+      double score = hands[i]->getScore();
       if (score > best_score) {
         best_score = score;
-        best_grasp_idx = i;
+        best_idx = i;
       }
     }
 
-    if (grasps[best_grasp_idx].getGrasps().empty()) {
-      response->success = false;
-      response->message = "Best grasp set is empty";
-      RCLCPP_ERROR(get_logger(), "%s", response->message.c_str());
-      return;
-    }
-
-    RCLCPP_INFO(get_logger(), "Found %ld grasp sets, best score: %.4f", grasps.size(), best_score);
+    RCLCPP_INFO(get_logger(), "Found %ld grasp candidates, best score: %.4f", hands.size(), best_score);
 
     // Convert best grasp to ROS message
-    response->grasp_pose = gvec_to_pose(grasps[best_grasp_idx], 0);
+    response->grasp_pose = hand_to_pose(*hands[best_idx]);
 
     // Create pre-grasp pose by offsetting along approach direction
     // For parallel-jaw grippers, approach direction is typically along Z (down)
@@ -169,24 +183,17 @@ pcl::PointCloud<pcl::PointXYZ> GraspPlannerNode::point_cloud2_to_pcl(
   return cloud;
 }
 
-geometry_msgs::msg::Pose GraspPlannerNode::gvec_to_pose(const gpd::GraspSet& grasps, size_t idx) {
+geometry_msgs::msg::Pose GraspPlannerNode::hand_to_pose(const gpd::candidate::Hand& hand) {
   geometry_msgs::msg::Pose pose;
 
-  if (idx >= grasps.getGrasps().size()) {
-    RCLCPP_ERROR(get_logger(), "Grasp index %zu out of range", idx);
-    return pose;
-  }
-
-  const auto& grasp = grasps.getGrasps()[idx];
-
   // Get grasp position
-  Eigen::Vector3d position = grasp.getPosition();
+  Eigen::Vector3d position = hand.getPosition();
   pose.position.x = position(0);
   pose.position.y = position(1);
   pose.position.z = position(2);
 
   // Get grasp orientation (rotation matrix to quaternion)
-  Eigen::Matrix3d rotation = grasp.getOrientation();
+  Eigen::Matrix3d rotation = hand.getOrientation();
   Eigen::Quaterniond quat(rotation);
 
   pose.orientation.w = quat.w();

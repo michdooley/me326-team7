@@ -12,6 +12,7 @@
 #include <pcl/point_types.h>
 #include <gpd/util/config_file.h>
 #include <gpd/grasp_detector.h>
+#include <gpd/candidate/hand.h>
 
 /**
  * @brief ROS2 gripper for converting depth images + bounding boxes to 3D object positions.
@@ -43,7 +44,7 @@ class GraspPlannerNode : public rclcpp::Node {
 
   // Helper methods
   pcl::PointCloud<pcl::PointXYZ> point_cloud2_to_pcl(const sensor_msgs::msg::PointCloud2& cloud_msg);
-  geometry_msgs::msg::Pose gvec_to_pose(const gpd::GraspSet& grasps, size_t idx);
+  geometry_msgs::msg::Pose hand_to_pose(const gpd::candidate::Hand& hand);
 
   // ROS2 service, subscribers, publishers
   rclcpp::Service<tidybot_msgs::srv::PlanGrasp>::SharedPtr grasp_service_;
