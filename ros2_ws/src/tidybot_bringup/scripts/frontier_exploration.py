@@ -106,10 +106,10 @@ class FrontierExplorer(Node):
     # ── Log-odds belief (Thrun, Burgard & Fox, Ch. 9) ────────────────────────
     LOG_ODDS_HIT         =  0.85   # evidence of occupancy per observation
     LOG_ODDS_MISS        = -0.40   # evidence of free space per ray cell
-    LOG_ODDS_MIN         = -3.00   # clamp floor  (P ≈ 0.05  very free)
-    LOG_ODDS_MAX         =  3.00   # clamp ceiling (P ≈ 0.95  very occupied)
-    LOG_ODDS_FREE_THRESH = -0.50   # below → publish   0 (FREE)
-    LOG_ODDS_OCC_THRESH  =  1.50   # log-odds threshold for raytrace early-exit
+    LOG_ODDS_MIN         = -10.0   # clamp floor  — needs ~25 net MISSes to reach
+    LOG_ODDS_MAX         =  10.0   # clamp ceiling — needs ~12 net HITs to reach
+    LOG_ODDS_FREE_THRESH = -0.50   # frontier detection: below this → FREE cell
+    LOG_ODDS_OCC_THRESH  =  1.50   # raytrace early-exit threshold (≈ 2 net HITs)
 
     # ── Angular-diversity obstacle confirmation ───────────────────────────────
     # A smeared cell is only ever seen from ONE camera angle (the angle at
@@ -543,14 +543,29 @@ class FrontierExplorer(Node):
     # ── Publishing ────────────────────────────────────────────────────────────
 
     def publish_map(self):
-        grid = np.full((self.GRID_SIZE, self.GRID_SIZE), -1, dtype=np.int8)
-        grid[self.log_odds <= self.LOG_ODDS_FREE_THRESH] = 0
-        # OCCUPIED only when confirmed from ≥ MIN_HIT_COUNT distinct angles.
-        # Cells with high log_odds but hit_count < 2 are smear artifacts —
-        # they stay UNKNOWN (gray) and remain correctable by MISS updates.
-        confirmed = ((self.log_odds  >= self.LOG_ODDS_OCC_THRESH) &
-                     (self.hit_count >= self.MIN_HIT_COUNT))
-        grid[confirmed] = 100
+        # ── Continuous grayscale occupancy ────────────────────────────────────
+        # Map log_odds linearly to [0, 100]:
+        #   LOG_ODDS_MIN (−10) → 0   (pure white  — strongly free)
+        #   log_odds = 0        → 50  (mid-gray    — neutral / uncertain)
+        #   LOG_ODDS_MAX (+10) → 100  (pure black  — strongly occupied)
+        #
+        # Saturation now requires ~12 net HITs (10 / 0.85) or ~25 net MISSes,
+        # giving a gradual buildup rather than snapping after just 2 hits.
+        span  = float(self.LOG_ODDS_MAX - self.LOG_ODDS_MIN)
+        ratio = (self.log_odds - self.LOG_ODDS_MIN) / span
+        occ   = np.clip(ratio * 100.0, 0.0, 100.0)
+
+        # Cells not yet confirmed from 2+ distinct angles (hit_count < 2) are
+        # capped at 80 so fully-confirmed obstacles remain visually distinct
+        # from single-direction detections (e.g. smear artifacts).
+        occ[self.hit_count < self.MIN_HIT_COUNT] = np.minimum(
+            occ[self.hit_count < self.MIN_HIT_COUNT], 80.0)
+
+        grid = occ.astype(np.int8)
+
+        # Cells that have never been updated (no HIT, log_odds still exactly 0)
+        # are published as −1 (unknown / gray in RViz).
+        grid[(self.hit_count == 0) & (self.log_odds == 0.0)] = -1
 
         msg = OccupancyGrid()
         msg.header.stamp              = self.get_clock().now().to_msg()
@@ -566,10 +581,16 @@ class FrontierExplorer(Node):
         msg.data = grid.ravel().tolist()
         self.map_pub.publish(msg)
 
-        # RGB debug image: gray=unknown, white=free, black=occupied
-        img = np.full((self.GRID_SIZE, self.GRID_SIZE, 3), 128, dtype=np.uint8)
-        img[grid == 0]   = [255, 255, 255]
-        img[grid == 100] = [  0,   0,   0]
+        # RGB debug image: continuous grayscale
+        #   unknown (−1) → 128 mid-gray
+        #   free    (0)  → 255 white
+        #   occupied(100)→   0 black
+        brightness = np.where(
+            grid < 0,
+            128,
+            255 - (grid.astype(np.int16) * 255 // 100)
+        ).astype(np.uint8)
+        img     = np.stack([brightness, brightness, brightness], axis=-1)
         img_msg = self.cv_bridge.cv2_to_imgmsg(img, encoding='rgb8')
         img_msg.header.stamp    = msg.header.stamp
         img_msg.header.frame_id = 'odom'
@@ -704,14 +725,16 @@ class FrontierExplorer(Node):
         self.publish_map()
 
         free     = int(np.sum(self.log_odds <= self.LOG_ODDS_FREE_THRESH))
-        occupied = int(np.sum(self.log_odds >= self.LOG_ODDS_OCC_THRESH))
+        occupied = int(np.sum(
+            (self.log_odds  >= self.LOG_ODDS_OCC_THRESH) &
+            (self.hit_count >= self.MIN_HIT_COUNT)))
         total    = self.GRID_SIZE ** 2
 
         self.get_logger().info('=' * 55)
         self.get_logger().info('EXPLORATION COMPLETE')
         self.get_logger().info(f'  Coverage : {(free+occupied)/total*100:.1f}%')
         self.get_logger().info(f'  Free     : {free}')
-        self.get_logger().info(f'  Occupied : {occupied}')
+        self.get_logger().info(f'  Confirmed occupied : {occupied}')
         self.get_logger().info(f'  Unknown  : {total - free - occupied}')
         self.get_logger().info('=' * 55)
 
