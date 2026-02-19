@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>tidybot_gpd</name>
+  <version>0.1.0</version>
+  <description>
+    ROS 2 wrapper for GPD (Grasp Pose Detection) library.
+    Provides grasp pose detection for parallel-jaw grippers on TidyBot2.
+  </description>
+  <maintainer email="team@stanford.edu">TidyBot2 Team</maintainer>
+  <license>BSD</license>
+
+  <!-- Core dependencies -->
+  <depend>ament_cmake</depend>
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tidybot_msgs</depend>
+
+  <!-- PCL and point cloud processing -->
+  <depend>pcl</depend>
+  <depend>pcl_ros</depend>
+
+  <!-- Math libraries -->
+  <depend>eigen</depend>
+  <depend>tf2</depend>
+  <depend>tf2_geometry_msgs</depend>
+
+  <!-- Linting -->
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
