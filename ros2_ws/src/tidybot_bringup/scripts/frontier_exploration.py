@@ -109,13 +109,18 @@ class FrontierExplorer(Node):
     LOG_ODDS_MIN         = -3.00   # clamp floor  (P ≈ 0.05  very free)
     LOG_ODDS_MAX         =  3.00   # clamp ceiling (P ≈ 0.95  very occupied)
     LOG_ODDS_FREE_THRESH = -0.50   # below → publish   0 (FREE)
-    LOG_ODDS_OCC_THRESH  =  1.50   # above → publish 100 (OCCUPIED)
-    # Cells between the two thresholds → publish -1 (UNKNOWN / gray)
-    #
-    # OCC_THRESH = 1.50 means 2 independent hits (2 × 0.85 = 1.70) are
-    # required before a cell is considered a confirmed obstacle.  A single-
-    # frame noise spike (0.85) stays below the threshold and can be
-    # corrected by subsequent MISS updates.
+    LOG_ODDS_OCC_THRESH  =  1.50   # log-odds threshold for raytrace early-exit
+
+    # ── Angular-diversity obstacle confirmation ───────────────────────────────
+    # A smeared cell is only ever seen from ONE camera angle (the angle at
+    # which TF lag placed it incorrectly).  A real obstacle is seen from
+    # many angles during the 360° sweep.  We require hits from at least
+    # MIN_HIT_COUNT distinct directions (separated by MIN_HIT_ANGLE_SEP) before
+    # a cell is published as OCCUPIED or used to stop free-space rays.
+    # The raytrace early-exit is also gated on hit_count so smeared cells
+    # remain correctable by MISS updates from other directions.
+    MIN_HIT_ANGLE_SEP = np.radians(20)  # rad — min gap between accepted hits
+    MIN_HIT_COUNT     = 2               # distinct-angle hits to confirm obstacle
 
     # ── Map publishing ────────────────────────────────────────────────────────
     MAP_PUBLISH_RATE = 2.0   # Hz
@@ -138,8 +143,20 @@ class FrontierExplorer(Node):
         super().__init__('frontier_explorer')
 
         # Persistent log-odds grid (never cleared between scans)
-        self.log_odds = np.zeros(
+        self.log_odds  = np.zeros(
             (self.GRID_SIZE, self.GRID_SIZE), dtype=np.float32)
+
+        # Angular-diversity confirmation maps.
+        # hit_count[y,x] = number of distinct-angle HITs received so far.
+        # hit_angle[y,x] = camera heading (rad) of the most recently accepted
+        #                  HIT (NaN = no hit yet).  A new HIT is "accepted" only
+        #                  if the current heading differs from hit_angle by at
+        #                  least MIN_HIT_ANGLE_SEP, preventing the same scan arc
+        #                  from incrementing the counter on every frame.
+        self.hit_count = np.zeros(
+            (self.GRID_SIZE, self.GRID_SIZE), dtype=np.uint8)
+        self.hit_angle = np.full(
+            (self.GRID_SIZE, self.GRID_SIZE), np.nan, dtype=np.float32)
 
         # Camera state
         self.latest_depth       = None   # np.ndarray (H×W, uint16, mm)
@@ -381,6 +398,45 @@ class FrontierExplorer(Node):
             np.add.at(self.log_odds, (gys[obs_mask], gxs[obs_mask]), self.LOG_ODDS_HIT)
             np.clip(self.log_odds, self.LOG_ODDS_MIN, self.LOG_ODDS_MAX, out=self.log_odds)
 
+        # ── 7. Update angular-diversity hit count ──────────────────────────────
+        # For each unique grid cell that received a HIT this frame, check
+        # whether the current camera heading differs from the cell's stored
+        # heading by at least MIN_HIT_ANGLE_SEP.  If so (or if this is the
+        # first hit), record the new heading and increment hit_count.
+        # Multiple depth pixels mapping to the same cell in one frame count
+        # only once (deduplicated via np.unique).
+        if len(obs_idx) > 0:
+            base_pose = self.get_base_pose()
+            if base_pose is not None:
+                cam_theta = float(base_pose[2])
+
+                # Deduplicate: many pixels may project to the same cell
+                u_yx = np.unique(
+                    np.stack([gys[obs_mask], gxs[obs_mask]], axis=1), axis=0)
+                u_gy, u_gx = u_yx[:, 0], u_yx[:, 1]
+
+                # First-hit cells
+                no_prior = np.isnan(self.hit_angle[u_gy, u_gx])
+                if np.any(no_prior):
+                    self.hit_angle[u_gy[no_prior], u_gx[no_prior]] = cam_theta
+                    self.hit_count[u_gy[no_prior], u_gx[no_prior]] = 1
+
+                # Subsequent hits — only count if angle is sufficiently different
+                has_prior = ~no_prior
+                if np.any(has_prior):
+                    hp_gy     = u_gy[has_prior]
+                    hp_gx     = u_gx[has_prior]
+                    prior     = self.hit_angle[hp_gy, hp_gx]
+                    diff      = np.abs(cam_theta - prior)
+                    diff      = np.minimum(diff, 2 * np.pi - diff)  # wrap to [0, π]
+                    diverse   = diff >= self.MIN_HIT_ANGLE_SEP
+                    if np.any(diverse):
+                        d_gy = hp_gy[diverse];  d_gx = hp_gx[diverse]
+                        self.hit_count[d_gy, d_gx] = np.minimum(
+                            self.hit_count[d_gy, d_gx].astype(np.uint16) + 1,
+                            255).astype(np.uint8)
+                        self.hit_angle[d_gy, d_gx] = cam_theta
+
     def _raytrace_free(self, x0: int, y0: int, x1: int, y1: int):
         """
         Bresenham ray from (x0,y0) to (x1,y1) exclusive, applying
@@ -400,8 +456,12 @@ class FrontierExplorer(Node):
 
         while not (x == x1 and y == y1):
             if self.in_grid(x, y):
-                if self.log_odds[y, x] >= self.LOG_ODDS_OCC_THRESH:
-                    break   # confirmed obstacle — preserve it
+                # Stop only at cells confirmed from multiple distinct angles.
+                # Smeared cells (hit_count < MIN_HIT_COUNT) are NOT protected
+                # so MISS updates from other directions can clear them.
+                if (self.hit_count[y, x] >= self.MIN_HIT_COUNT and
+                        self.log_odds[y, x] >= self.LOG_ODDS_OCC_THRESH):
+                    break
                 self.log_odds[y, x] = max(
                     self.LOG_ODDS_MIN,
                     self.log_odds[y, x] + self.LOG_ODDS_MISS)
@@ -423,8 +483,11 @@ class FrontierExplorer(Node):
         are discarded.
         """
         free_mask    = self.log_odds <= self.LOG_ODDS_FREE_THRESH
-        unknown_mask = ((self.log_odds >  self.LOG_ODDS_FREE_THRESH) &
-                        (self.log_odds <  self.LOG_ODDS_OCC_THRESH))
+        # Use the same confirmed-obstacle definition as publish_map so that
+        # smeared cells (hit_count < MIN_HIT_COUNT) count as UNKNOWN, not walls.
+        confirmed_occ = ((self.log_odds  >= self.LOG_ODDS_OCC_THRESH) &
+                         (self.hit_count >= self.MIN_HIT_COUNT))
+        unknown_mask  = ~free_mask & ~confirmed_occ
 
         frontier_mask = np.zeros_like(self.log_odds, dtype=bool)
         for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
@@ -482,7 +545,12 @@ class FrontierExplorer(Node):
     def publish_map(self):
         grid = np.full((self.GRID_SIZE, self.GRID_SIZE), -1, dtype=np.int8)
         grid[self.log_odds <= self.LOG_ODDS_FREE_THRESH] = 0
-        grid[self.log_odds >= self.LOG_ODDS_OCC_THRESH]  = 100
+        # OCCUPIED only when confirmed from ≥ MIN_HIT_COUNT distinct angles.
+        # Cells with high log_odds but hit_count < 2 are smear artifacts —
+        # they stay UNKNOWN (gray) and remain correctable by MISS updates.
+        confirmed = ((self.log_odds  >= self.LOG_ODDS_OCC_THRESH) &
+                     (self.hit_count >= self.MIN_HIT_COUNT))
+        grid[confirmed] = 100
 
         msg = OccupancyGrid()
         msg.header.stamp              = self.get_clock().now().to_msg()
