@@ -42,6 +42,7 @@ install(PROGRAMS
   scripts/navigate_to_object.py
   scripts/rgbd_grasp_demo.py
   scripts/rgbd_grasp_demo_real.py
+  scripts/save_image_pairs.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

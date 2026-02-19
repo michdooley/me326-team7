@@ -116,12 +116,21 @@ class MuJoCoBridgeNode(Node):
             self.model = mujoco.MjModel.from_xml_path(model_path)
             self.data = mujoco.MjData(self.model)
 
-            # Load home keyframe if available for stable initial state
-            try:
-                home_key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, 'home')
-                mujoco.mj_resetDataKeyframe(self.model, self.data, home_key_id)
-                self.get_logger().info('Loaded home keyframe for stable initial state')
+            # Load keyframe for stable initial state
+            # Prefer scene_home (includes freejoint positions), fall back to home
+            keyframe_loaded = False
+            for key_name in ['scene_home', 'home']:
+                try:
+                    key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, key_name)
+                    if key_id >= 0:
+                        mujoco.mj_resetDataKeyframe(self.model, self.data, key_id)
+                        self.get_logger().info(f'Loaded keyframe "{key_name}" for stable initial state')
+                        keyframe_loaded = True
+                        break
+                except Exception:
+                    continue
 
+            if keyframe_loaded:
                 # Restore freejoint positions from qpos0 — the keyframe only
                 # defines robot DOFs so freejoint objects get zeroed out
                 for i in range(self.model.njnt):
@@ -133,8 +142,8 @@ class MuJoCoBridgeNode(Node):
                             f'Restored freejoint {jname!r} to pos='
                             f'({self.data.qpos[adr]:.3f}, {self.data.qpos[adr+1]:.3f}, {self.data.qpos[adr+2]:.3f})'
                         )
-            except Exception:
-                self.get_logger().warn('No home keyframe found, using default state')
+            else:
+                self.get_logger().warn('No keyframe found, using default state')
 
         except Exception as e:
             self.get_logger().error(f'Failed to load MuJoCo model: {e}')
@@ -623,8 +632,6 @@ class MuJoCoBridgeNode(Node):
         if not HAS_CV_BRIDGE:
             return
 
-        now = self.get_clock().now().to_msg()
-
         with self.lock:
             # Render RGB image
             self.renderer.update_scene(self.data, camera='d435_rgb')
@@ -640,6 +647,45 @@ class MuJoCoBridgeNode(Node):
             self.renderer.disable_depth_rendering()
             # Flip vertically and horizontally to match ROS camera convention
             depth_image = np.fliplr(np.flipud(depth_image)).copy()
+
+            # Capture timestamp and robot state AFTER rendering while the lock
+            # is still held.  This ensures 'now' matches the exact sim state
+            # that was just rendered — eliminating the timestamp mismatch that
+            # occurred when 'now' was sampled before acquiring the lock.
+            now = self.get_clock().now().to_msg()
+
+            cam_base_x = 0.0
+            cam_base_y = 0.0
+            cam_base_th = 0.0
+            if 'joint_x' in self.joint_ids:
+                cam_base_x = float(
+                    self.data.qpos[self.model.jnt_qposadr[self.joint_ids['joint_x']]])
+            if 'joint_y' in self.joint_ids:
+                cam_base_y = float(
+                    self.data.qpos[self.model.jnt_qposadr[self.joint_ids['joint_y']]])
+            if 'joint_th' in self.joint_ids:
+                cam_base_th = float(
+                    self.data.qpos[self.model.jnt_qposadr[self.joint_ids['joint_th']]])
+
+        # Broadcast odom→base_link TF with the SAME timestamp as the depth
+        # image, using the robot state read from the exact sim snapshot that
+        # was rendered.  This TF is sent BEFORE the depth message so that it
+        # is already in the TF buffer when the subscriber processes the depth
+        # frame and calls lookup_transform(msg.header.stamp).
+        cy_tf = np.cos(cam_base_th * 0.5)
+        sy_tf = np.sin(cam_base_th * 0.5)
+        cam_tf = TransformStamped()
+        cam_tf.header.stamp = now
+        cam_tf.header.frame_id = 'odom'
+        cam_tf.child_frame_id = 'base_link'
+        cam_tf.transform.translation.x = cam_base_x
+        cam_tf.transform.translation.y = cam_base_y
+        cam_tf.transform.translation.z = 0.0
+        cam_tf.transform.rotation.x = 0.0
+        cam_tf.transform.rotation.y = 0.0
+        cam_tf.transform.rotation.z = sy_tf
+        cam_tf.transform.rotation.w = cy_tf
+        self.tf_broadcaster.sendTransform(cam_tf)
 
         # Publish RGB image
         try:
