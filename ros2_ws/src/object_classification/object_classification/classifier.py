@@ -16,6 +16,9 @@ class ObjectClassifier(Node):
         # Publisher for bounding boxes
         self.bbox_pub = self.create_publisher(Detection2DArray, '/objbbox', 10)
 
+        # Publisher for annotated image (viewable in RViz)
+        self.yolo_image_pub = self.create_publisher(Image, '/camera/color/image_yolo', 10)
+
         self.subscription = self.create_subscription(
             Image, '/camera/color/image_raw', self.listener_callback, 10)
 
@@ -50,92 +53,16 @@ class ObjectClassifier(Node):
 
         # Publish the final list of boxes
         self.bbox_pub.publish(detection_array)
-        
-        # Optional: Local visualization
-        # cv2.imshow("YOLO Live", r.plot())
-        # cv2.waitKey(1)
+
+        # Publish YOLO-annotated image for RViz
+        annotated_frame = results[0].plot()
+        yolo_msg = self.bridge.cv2_to_imgmsg(annotated_frame, encoding='bgr8')
+        yolo_msg.header = msg.header
+        self.yolo_image_pub.publish(yolo_msg)
 
 def main(args=None):
     rclpy.init(args=args)
     node = ObjectClassifier()
     rclpy.spin(node)
     rclpy.shutdown()
-
-
-
-# #!/usr/bin/env python3
-# import rclpy
-# from rclpy.node import Node
-# from rclpy.qos import QoSProfile, ReliabilityPolicy
-# from sensor_msgs.msg import Image
-# from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
-# from cv_bridge import CvBridge
-# from ultralytics import YOLO
-# import cv2
-
-# class ObjectClassifier(Node):
-#     def __init__(self):
-#         super().__init__('object_classifier')
-        
-#         # 1. Initialize YOLOv8 Nano
-#         self.model = YOLO('yolov8n.pt') 
-#         self.bridge = CvBridge()
-
-#         # 2. Define QoS (Best Effort is better for high-bandwidth camera data)
-#         # qos_profile = QoSProfile(
-#         #     reliability=ReliabilityPolicy.BEST_EFFORT,
-#         #     depth=1
-#         # )
-#         self.bbox_pub = self.create_publisher(Detection2DArray, '/objbbox', 10)
-
-#         # 3. Create Subscription to the RealSense Topic
-#         self.subscription = self.create_subscription(
-#             Image,
-#             '/camera/color/image_raw',
-#             self.listener_callback,
-#             10)
-            
-#         self.get_logger().info("YOLOv8 Live Classifier Node Started")
-
-#     def listener_callback(self, msg):
-#         try:
-#             # Convert ROS Image message to OpenCV format
-#             frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-            
-#             # Run YOLOv8 Inference
-#             # Using conf=0.5 to reduce false positives
-#             results = self.model(frame, classes=[0, 46, 47], conf=0.5, verbose=False)
-
-#             detection_array = Detection2DArray()
-#             detection_array.header = msg.header
-
-#             # Process results
-#             for r in results:
-#                 # Plot the bounding boxes on the frame
-#                 annotated_frame = r.plot()
-                
-#                 # Log detections to terminal
-#                 for box in r.boxes:
-#                     cls_id = int(box.cls[0])
-#                     label = self.model.names[cls_id]
-#                     self.get_logger().info(f"Detected: {label} ({box.conf[0]:.2f})")
-
-#             # Display the live feed
-#             cv2.imshow("YOLOv8 Real-Time Detection", annotated_frame)
-#             cv2.waitKey(1)
-
-#         except Exception as e:
-#             self.get_logger().error(f"Failed to process image: {e}")
-
-# def main(args=None):
-#     rclpy.init(args=args)
-#     node = ObjectClassifier()
-#     try:
-#         rclpy.spin(node)
-#     except KeyboardInterrupt:
-#         pass
-#     finally:
-#         cv2.destroyAllWindows()
-#         node.destroy_node()
-#         rclpy.shutdown()
 

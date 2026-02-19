@@ -33,6 +33,14 @@ Visualization Manager:
       Queue Size: 2
 
     - Class: rviz_default_plugins/Image
+      Name: YOLO Detections
+      Enabled: true
+      Topic:
+        Value: /camera/color/image_yolo
+      Transport Hint: raw
+      Queue Size: 2
+
+    - Class: rviz_default_plugins/Image
       Name: Depth Camera
       Enabled: true
       Topic:
