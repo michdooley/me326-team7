@@ -91,9 +91,11 @@ class FrontierExplorer(Node):
     GRID_ORIGIN_Y   = -7.5   # world Y of grid row    0  (m)
 
     # ── Depth filtering ───────────────────────────────────────────────────────
-    MIN_DEPTH_M     = 0.30   # ignore returns closer than this (robot body)
-    MAX_DEPTH_M     = 5.00   # ignore returns farther  than this
-    DEPTH_SUBSAMPLE = 4      # process every Nth pixel (speed vs. quality)
+    MIN_DEPTH_M       = 0.30   # ignore returns closer than this (robot body)
+    MAX_DEPTH_M       = 5.00   # ignore returns farther  than this
+    DEPTH_SUBSAMPLE   = 4      # process every Nth pixel (speed vs. quality)
+    ROBOT_BODY_RADIUS = 0.60   # m — XY radius around camera to exclude self-hits
+    FREE_TRACE_MAX_M  = 3.00   # m — max free-ray length for floor/ceiling returns
 
     # ── Height filter ─────────────────────────────────────────────────────────
     # Only 3-D points in this Z band vote for OCCUPIED — floor and ceiling
@@ -119,7 +121,7 @@ class FrontierExplorer(Node):
     MAP_PUBLISH_RATE = 2.0   # Hz
 
     # ── 360° scan ─────────────────────────────────────────────────────────────
-    SCAN_ANGULAR_VEL = 1.5   # rad/s  (~4 s per revolution)
+    SCAN_ANGULAR_VEL = 0.8   # rad/s  (~8 s per revolution, slower = less TF lag error)
     SCAN_SETTLE_TIME = 1.0   # s — wait after stopping for vibration to die
 
     # ── Frontier selection ────────────────────────────────────────────────────
@@ -328,32 +330,56 @@ class FrontierExplorer(Node):
         gxs = ((pts_odom[:, 0] - self.GRID_ORIGIN_X) / self.GRID_RESOLUTION).astype(int)
         gys = ((pts_odom[:, 1] - self.GRID_ORIGIN_Y) / self.GRID_RESOLUTION).astype(int)
 
-        # ── 4. Height-filter: keep only obstacle-band returns ─────────────────
-        obs_mask = (
-            (pts_odom[:, 2] > self.MIN_OBSTACLE_Z) &
-            (pts_odom[:, 2] < self.MAX_OBSTACLE_Z) &
-            (gxs >= 0) & (gxs < self.GRID_SIZE) &
-            (gys >= 0) & (gys < self.GRID_SIZE)
-        )
+        # ── 4. Build masks ────────────────────────────────────────────────────
+        # 4a. Self-exclusion: ignore returns whose XY is within ROBOT_BODY_RADIUS
+        #     of the camera origin — these are the robot's own body / TF-axis
+        #     visualizations that appear at the base frame origin.
+        dist_xy  = np.hypot(pts_odom[:, 0] - cam_origin[0],
+                            pts_odom[:, 1] - cam_origin[1])
+        not_self = dist_xy > self.ROBOT_BODY_RADIUS
 
-        if not np.any(obs_mask):
+        in_bounds = ((gxs >= 0) & (gxs < self.GRID_SIZE) &
+                     (gys >= 0) & (gys < self.GRID_SIZE))
+        in_height = ((pts_odom[:, 2] > self.MIN_OBSTACLE_Z) &
+                     (pts_odom[:, 2] < self.MAX_OBSTACLE_Z))
+
+        # Obstacle returns → free raytrace + HIT
+        obs_mask = not_self & in_bounds & in_height
+
+        # Floor/ceiling returns → free raytrace only (no HIT), limited depth so
+        # rays don't cross distant walls they can't physically see in 3-D.
+        # The early exit in _raytrace_free stops any ray at a confirmed obstacle
+        # (log_odds ≥ OCC_THRESH), protecting established wall cells.
+        floor_mask = (not_self & in_bounds & ~in_height &
+                      (depths_m < self.FREE_TRACE_MAX_M))
+
+        obs_idx   = np.where(obs_mask)[0]
+        floor_idx = np.where(floor_mask)[0]
+
+        if len(obs_idx) == 0 and len(floor_idx) == 0:
             return
 
-        # ── 5. Free-space raytrace for obstacle returns only ──────────────────
-        # Tracing only to obstacle-band endpoints means we never generate a
-        # ray that originates above a wall and terminates on the floor behind
-        # it — which would clear the wall's grid cells in 2-D even though
-        # the wall genuinely blocks that region.
         cam_gx, cam_gy = self.world_to_grid(cam_origin[0], cam_origin[1])
 
-        obs_idx  = np.where(obs_mask)[0]
-        ray_step = max(1, len(obs_idx) // 500)   # cap at ~500 rays / frame
-        for i in obs_idx[::ray_step]:
-            self._raytrace_free(cam_gx, cam_gy, int(gxs[i]), int(gys[i]))
+        # ── 5a. Free-space raytrace: obstacle returns ─────────────────────────
+        if len(obs_idx) > 0:
+            ray_step = max(1, len(obs_idx) // 500)
+            for i in obs_idx[::ray_step]:
+                self._raytrace_free(cam_gx, cam_gy, int(gxs[i]), int(gys[i]))
+
+        # ── 5b. Free-space raytrace: floor/ceiling returns ────────────────────
+        # These rays mark empty space in directions where no obstacle-height
+        # return was seen (e.g. the robot faces an open corridor).  They do NOT
+        # add any HIT, so they cannot create false obstacles.
+        if len(floor_idx) > 0:
+            ray_step2 = max(1, len(floor_idx) // 300)
+            for i in floor_idx[::ray_step2]:
+                self._raytrace_free(cam_gx, cam_gy, int(gxs[i]), int(gys[i]))
 
         # ── 6. Mark obstacle cells with HIT ───────────────────────────────────
-        np.add.at(self.log_odds, (gys[obs_mask], gxs[obs_mask]), self.LOG_ODDS_HIT)
-        np.clip(self.log_odds, self.LOG_ODDS_MIN, self.LOG_ODDS_MAX, out=self.log_odds)
+        if len(obs_idx) > 0:
+            np.add.at(self.log_odds, (gys[obs_mask], gxs[obs_mask]), self.LOG_ODDS_HIT)
+            np.clip(self.log_odds, self.LOG_ODDS_MIN, self.LOG_ODDS_MAX, out=self.log_odds)
 
     def _raytrace_free(self, x0: int, y0: int, x1: int, y1: int):
         """
