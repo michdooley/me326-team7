@@ -57,7 +57,7 @@ from collections import deque
 from enum import Enum
 
 import numpy as np
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import binary_dilation, label as ndimage_label
 import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -534,6 +534,12 @@ class FrontierExplorer(Node):
         at least one UNKNOWN cell.  Connected components (8-connected) smaller
         than MIN_FRONTIER_SIZE are discarded.
 
+        Clusters are additionally filtered by:
+          • MIN_FRONTIER_DIST  — centroid must be > 1.5 m from the robot.
+          • ROBOT_CLEARANCE    — centroid must not be inside the obstacle-inflated zone.
+          • Reachability       — centroid must be in the same free-space connected
+                                 component as the robot (scipy label flood-fill).
+
         Score = unknown_cells_within_MAX_DEPTH_M / distance
 
         Counts every UNKNOWN cell within the sensor range disc centred on the
@@ -594,6 +600,21 @@ class FrontierExplorer(Node):
         if base_pose is None:
             return []
         bx, by, _ = base_pose
+        robot_gx, robot_gy = self.world_to_grid(bx, by)
+
+        # ── Reachability: connected-component labeling of free non-obstacle cells ──
+        # Flood-fills (via scipy) through cells that are confirmed free AND not
+        # inside the inflated obstacle zone.  Only frontier centroids whose grid
+        # cell belongs to the same component as the robot are kept — this removes
+        # frontiers that are physically cut off behind walls even though they look
+        # free on the 2-D map projection.
+        traversable = free_mask & ~self._inflated_occ
+        _labeled, _ = ndimage_label(traversable, structure=np.ones((3, 3), dtype=bool))
+        if (self.in_grid(robot_gx, robot_gy) and
+                _labeled[robot_gy, robot_gx] > 0):
+            reachable = (_labeled == _labeled[robot_gy, robot_gx])
+        else:
+            reachable = None  # robot not yet on confirmed-free cell; skip filter
 
         # Pre-build a boolean disc mask of radius MAX_DEPTH_M in grid cells.
         # Reused for every cluster so we only allocate it once.
@@ -618,6 +639,11 @@ class FrontierExplorer(Node):
             # Skip if the centroid is within ROBOT_CLEARANCE of any confirmed
             # obstacle — the robot cannot safely stand at this location.
             if self._inflated_occ[mgy, mgx]:
+                continue
+
+            # Skip if the centroid is unreachable from the robot via confirmed
+            # free space — i.e. it is behind a wall with no navigable path.
+            if reachable is not None and not reachable[mgy, mgx]:
                 continue
 
             # Count UNKNOWN cells within sensor range of this frontier centroid.
