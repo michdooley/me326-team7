@@ -18,10 +18,16 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CartesianVelocityCommand.msg"
   "msg/GripperCommand.msg"
   "msg/PanTilt.msg"
+  "msg/Detection2D.msg"
+  "msg/Detection2DArray.msg"
+  "msg/ObjectPose.msg"
   "srv/SolveIK.srv"
   "srv/GetJointState.srv"
   "srv/PlanToTarget.srv"
   "srv/AudioRecord.srv"
+  "srv/Detect.srv"
+  "srv/LocalizeObject.srv"
+  "srv/PlanGrasp.srv"
   DEPENDENCIES std_msgs geometry_msgs sensor_msgs builtin_interfaces
 )
 

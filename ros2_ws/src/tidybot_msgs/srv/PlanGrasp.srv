@@ -1,0 +1,11 @@
+# Plan a grasp for an object at a given 3D position
+geometry_msgs/PointStamped object_position   # where the object is
+string object_class                          # what it is (affects grasp strategy)
+string arm_name                              # "right", "left", or "auto"
+---
+bool success
+geometry_msgs/Pose grasp_pose                # target end-effector pose for grasping
+geometry_msgs/Pose pre_grasp_pose            # approach pose (offset above grasp)
+string arm_used                              # which arm was selected
+float64 grasp_width                          # suggested gripper width
+string message

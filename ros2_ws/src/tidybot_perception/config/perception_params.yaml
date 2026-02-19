@@ -1,0 +1,18 @@
+detector_node:
+  ros__parameters:
+    model_path: ""                # path to YOLO weights (e.g. yolov8n.pt)
+    confidence_threshold: 0.5
+    publish_rate: 10.0            # max Hz for continuous /detections publishing
+    device: "cpu"                 # "cpu" or "cuda:0"
+
+object_localizer_node:
+  ros__parameters:
+    depth_scale: 0.001            # depth image scale to meters (1mm default for RealSense)
+    max_depth: 3.0                # ignore depth readings beyond this (meters)
+    target_frame: "base_link"     # output frame for 3D positions
+
+grasp_planner_node:
+  ros__parameters:
+    model_path: ""                # path to GraspNet weights
+    approach_offset: 0.10         # pre-grasp offset above grasp pose (meters)
+    default_arm: "right"          # arm to use when "auto" is requested
