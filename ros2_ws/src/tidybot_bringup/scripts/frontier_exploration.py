@@ -38,7 +38,7 @@ Publishes:
 
 Subscribes:
   /camera/depth/image_raw    — depth frames (16UC1, mm)
-  /camera/color/camera_info  — camera intrinsics
+  /camera/depth/camera_info  — depth camera intrinsics (fovy=57°)
   /base/goal_reached         — Bool, fired when navigation completes
 
 Commands:
@@ -184,7 +184,7 @@ class FrontierExplorer(Node):
         be = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(Image,      '/camera/depth/image_raw',
                                  self._depth_cb,       be)
-        self.create_subscription(CameraInfo, '/camera/color/camera_info',
+        self.create_subscription(CameraInfo, '/camera/depth/camera_info',
                                  self._camera_info_cb, be)
         self.create_subscription(Bool, '/base/goal_reached',
                                  self._goal_reached_cb, 10)

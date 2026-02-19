@@ -223,6 +223,7 @@ class MuJoCoBridgeNode(Node):
         self.rgb_pub = self.create_publisher(Image, '/camera/color/image_raw', qos)
         self.depth_pub = self.create_publisher(Image, '/camera/depth/image_raw', qos)
         self.camera_info_pub = self.create_publisher(CameraInfo, '/camera/color/camera_info', qos)
+        self.depth_info_pub  = self.create_publisher(CameraInfo, '/camera/depth/camera_info', qos)
         self.goal_reached_pub = self.create_publisher(Bool, '/base/goal_reached', 10)
 
         # TF broadcaster
@@ -708,6 +709,21 @@ class MuJoCoBridgeNode(Node):
         camera_info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
         camera_info.p = [fx, 0.0, 320.0, 0.0, 0.0, fy, 240.0, 0.0, 0.0, 0.0, 1.0, 0.0]
         self.camera_info_pub.publish(camera_info)
+
+        # Depth camera uses a wider FOV (57° vs 42° for RGB) — publish its own
+        # camera_info so depth projection uses the correct intrinsics.
+        fy_d = 480 / (2 * np.tan(np.radians(57) / 2))
+        fx_d = fy_d  # Square pixels
+        depth_info = CameraInfo()
+        depth_info.header.stamp    = now
+        depth_info.header.frame_id = 'camera_depth_optical_frame'
+        depth_info.width  = 640
+        depth_info.height = 480
+        depth_info.k = [fx_d, 0.0, 320.0, 0.0, fy_d, 240.0, 0.0, 0.0, 1.0]
+        depth_info.d = [0.0, 0.0, 0.0, 0.0, 0.0]
+        depth_info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        depth_info.p = [fx_d, 0.0, 320.0, 0.0, 0.0, fy_d, 240.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+        self.depth_info_pub.publish(depth_info)
 
     def destroy_node(self):
         """Clean up resources."""
