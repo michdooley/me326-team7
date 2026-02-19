@@ -8,7 +8,7 @@ the full exploration run.  The exploration loop repeats:
   1. SCANNING   — rotates the base 360° in place, integrating every depth
                   frame into the map.
   2. SELECTING  — clusters frontier cells (FREE↔UNKNOWN boundary) and picks
-                  the highest-scoring one (score = cluster_size / distance).
+                  the highest-scoring one (score = nearby_unknown / distance).
   3. NAVIGATING — drives to the selected frontier, mapping along the way.
 
 Key design choices
@@ -20,18 +20,20 @@ Key design choices
 
 • Obstacle-only raytrace — free-space rays are traced ONLY for depth
   returns that fall in the obstacle height band [MIN_OBSTACLE_Z,
-  MAX_OBSTACLE_Z].  Floor and ceiling returns are silently dropped.
-  This prevents a 3-D→2-D artefact where a floor point visible beside a
-  wall in 3-D produces a 2-D ray that crosses the wall's grid footprint
-  and erroneously marks it as free ("see-through" walls).
+  MAX_OBSTACLE_Z].  Floor returns below the band also generate free-space
+  rays (capped at FREE_TRACE_MAX_M) to clear open corridors, but never
+  mark HIT.  This prevents "see-through" walls from 3-D→2-D projection.
 
-• Early-exit raytrace — each free-space ray stops when it reaches a cell
-  already above LOG_ODDS_OCC_THRESH (≥ 2 confirmed hits).  Cells below the
-  threshold (single-frame noise) are still correctable by MISS updates.
+• Early-exit raytrace — each free-space ray stops at a cell confirmed from
+  ≥ MIN_HIT_COUNT distinct angles (hit_count ≥ 2 AND log_odds ≥ OCC_THRESH).
+  Smeared cells (hit_count < 2) are not protected and can be corrected.
+
+• Angular-diversity confirmation — a grid cell is only published as OCCUPIED
+  when it has been hit from ≥ 2 directions separated by ≥ MIN_HIT_ANGLE_SEP.
+  This suppresses smear artefacts that are only seen from a single angle.
 
 Publishes:
-  /map               nav_msgs/OccupancyGrid   — standard RViz map
-  /map_image         sensor_msgs/Image        — RGB debug view
+  /map               nav_msgs/OccupancyGrid   — grayscale confidence map
   /frontier_markers  visualization_msgs/MarkerArray
 
 Subscribes:
@@ -188,9 +190,8 @@ class FrontierExplorer(Node):
                                  self._goal_reached_cb, 10)
 
         # Publishers
-        self.map_pub       = self.create_publisher(OccupancyGrid, '/map',              10)
-        self.map_image_pub = self.create_publisher(Image,         '/map_image',        10)
-        self.frontier_pub  = self.create_publisher(MarkerArray,   '/frontier_markers', 10)
+        self.map_pub      = self.create_publisher(OccupancyGrid, '/map',              10)
+        self.frontier_pub = self.create_publisher(MarkerArray,   '/frontier_markers', 10)
         self.cmd_vel_pub   = self.create_publisher(Twist,         '/cmd_vel',          10)
         self.base_goal_pub = self.create_publisher(Pose2D,        '/base/target_pose', 10)
 
@@ -504,12 +505,11 @@ class FrontierExplorer(Node):
         at least one UNKNOWN cell.  Connected components (8-connected) smaller
         than MIN_FRONTIER_SIZE are discarded.
 
-        Score = unknown_cells_within_sensor_range / distance_to_frontier
+        Score = unknown_cells_within_MAX_DEPTH_M / distance
 
-        'unknown_cells_within_sensor_range' counts all UNKNOWN grid cells
-        within MAX_DEPTH_M of the frontier centroid — an estimate of how much
-        new information the robot would gain by navigating there and scanning.
-        Dividing by distance balances exploration gain against travel cost.
+        Counts every UNKNOWN cell within the sensor range disc centred on the
+        frontier — an estimate of information gain — then divides by travel
+        distance to balance exploration value against travel cost.
         """
         free_mask    = self.log_odds <= self.LOG_ODDS_FREE_THRESH
         # Use the same confirmed-obstacle definition as publish_map so that
@@ -632,21 +632,6 @@ class FrontierExplorer(Node):
         msg.info.origin.orientation.w = 1.0
         msg.data = grid.ravel().tolist()
         self.map_pub.publish(msg)
-
-        # RGB debug image: continuous grayscale
-        #   unknown (−1) → 128 mid-gray
-        #   free    (0)  → 255 white
-        #   occupied(100)→   0 black
-        brightness = np.where(
-            grid < 0,
-            128,
-            255 - (grid.astype(np.int16) * 255 // 100)
-        ).astype(np.uint8)
-        img     = np.stack([brightness, brightness, brightness], axis=-1)
-        img_msg = self.cv_bridge.cv2_to_imgmsg(img, encoding='rgb8')
-        img_msg.header.stamp    = msg.header.stamp
-        img_msg.header.frame_id = 'odom'
-        self.map_image_pub.publish(img_msg)
 
     def publish_frontiers(self, frontiers):
         ma = MarkerArray()
