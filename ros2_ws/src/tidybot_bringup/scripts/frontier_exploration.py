@@ -473,7 +473,16 @@ class FrontierExplorer(Node):
     # ── State machine helpers ─────────────────────────────────────────────────
 
     def _start_scan(self):
-        """Reset rotation state and enter SCANNING."""
+        """Reset rotation state and enter SCANNING.
+
+        The log-odds grid is cleared each time so that map evidence
+        accumulated while the robot was stationary (e.g. during sensor
+        initialisation or navigation) does not pre-bias the fresh 360° scan.
+        Without this reset, cells near the starting pose accumulate very
+        high log-odds and take many MISS frames to clear, producing the
+        characteristic smear at the beginning of each scan.
+        """
+        self.log_odds[:] = 0.0          # clear stale evidence
         self.scan_accumulated  = 0.0
         self.scan_last_heading = None
         self.scan_settle_start = None
