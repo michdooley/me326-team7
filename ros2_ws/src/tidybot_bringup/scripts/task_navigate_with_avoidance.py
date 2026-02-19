@@ -14,6 +14,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Pose2D, PoseStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image
+from std_msgs.msg import Float64MultiArray
 from enum import Enum
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -90,6 +91,14 @@ class NavigationTaskNode(Node):
     APPROACH_DETECT_FRAMES = 3
     APPROACH_LOST_FRAMES = 12
     APPROACH_TARGET_MEMORY_S = 0.8
+    AUTO_TILT_ENABLE = True
+    AUTO_TILT_TARGET_Y_FRAC = 0.62
+    AUTO_TILT_DEADBAND_FRAC = 0.08
+    AUTO_TILT_STEP_RAD = 0.03
+    AUTO_TILT_MIN_RAD = -0.85
+    AUTO_TILT_MAX_RAD = 0.30
+    AUTO_TILT_NEAR_DIST_M = 0.75
+    AUTO_TILT_NEAR_EXTRA_DOWN = 0.08
     EXPLORE_MEMORY_CELL_SIZE_M = 0.5
     EXPLORE_CANDIDATE_COUNT = 12
     EXPLORE_UNEXPLORED_VISITS_THRESHOLD = 1
@@ -281,6 +290,30 @@ class NavigationTaskNode(Node):
                 self.APPROACH_TARGET_MEMORY_S
             ).value
         )
+        self.auto_tilt_enable = bool(
+            self.declare_parameter('auto_tilt_enable', self.AUTO_TILT_ENABLE).value
+        )
+        self.auto_tilt_target_y_frac = float(
+            self.declare_parameter('auto_tilt_target_y_frac', self.AUTO_TILT_TARGET_Y_FRAC).value
+        )
+        self.auto_tilt_deadband_frac = float(
+            self.declare_parameter('auto_tilt_deadband_frac', self.AUTO_TILT_DEADBAND_FRAC).value
+        )
+        self.auto_tilt_step_rad = float(
+            self.declare_parameter('auto_tilt_step_rad', self.AUTO_TILT_STEP_RAD).value
+        )
+        self.auto_tilt_min_rad = float(
+            self.declare_parameter('auto_tilt_min_rad', self.AUTO_TILT_MIN_RAD).value
+        )
+        self.auto_tilt_max_rad = float(
+            self.declare_parameter('auto_tilt_max_rad', self.AUTO_TILT_MAX_RAD).value
+        )
+        self.auto_tilt_near_dist_m = float(
+            self.declare_parameter('auto_tilt_near_dist_m', self.AUTO_TILT_NEAR_DIST_M).value
+        )
+        self.auto_tilt_near_extra_down = float(
+            self.declare_parameter('auto_tilt_near_extra_down', self.AUTO_TILT_NEAR_EXTRA_DOWN).value
+        )
         self.explore_memory_cell_size_m = float(
             self.declare_parameter(
                 'explore_memory_cell_size_m',
@@ -302,6 +335,7 @@ class NavigationTaskNode(Node):
 
         # Publishing movement info
         self.base_pose_pub = self.create_publisher(Pose2D, '/base/target_pose', 10)
+        self.pan_tilt_pub = self.create_publisher(Float64MultiArray, '/camera/pan_tilt_cmd', 10)
 
         # Subscriber
         self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
@@ -344,6 +378,8 @@ class NavigationTaskNode(Node):
         self.visit_counts = {}
         self.last_visited_cell = None
         self.scanned_cells = set()
+        self.camera_pan_cmd = 0.0
+        self.camera_tilt_cmd = 0.0
 
         if CV_AVAILABLE:
             camera_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -519,6 +555,8 @@ class NavigationTaskNode(Node):
             self.last_red_seen_time = self.get_clock().now()
             self.last_red_bbox_color = self.red_bbox_color
             self.last_red_distance_m = self.red_target_distance_m
+            if self.auto_tilt_enable:
+                self._update_camera_tilt_for_target(self.red_bbox_color, self.red_target_distance_m)
             rx, ry, rw, rh = self.red_bbox_color
             cv2.rectangle(overlay, (rx, ry), (rx + rw, ry + rh), (0, 255, 0), 2)
             if self.red_target_distance_m is not None:
@@ -557,6 +595,35 @@ class NavigationTaskNode(Node):
         overlay_msg = self.cv_bridge.cv2_to_imgmsg(overlay, encoding='bgr8')
         overlay_msg.header = msg.header
         self.overlay_pub.publish(overlay_msg)
+
+    def _update_camera_tilt_for_target(self, bbox, distance_m):
+        """Tilt camera to keep low/near target in view while approaching."""
+        if bbox is None or self.latest_color_shape is None:
+            return
+        _, y, _, h = bbox
+        image_h = float(max(self.latest_color_shape[0], 1))
+        center_y_frac = (y + 0.5 * h) / image_h
+
+        desired_y_frac = self.auto_tilt_target_y_frac
+        if distance_m is not None and distance_m < self.auto_tilt_near_dist_m:
+            desired_y_frac = min(0.90, desired_y_frac + self.auto_tilt_near_extra_down)
+
+        error = desired_y_frac - center_y_frac
+        if abs(error) < self.auto_tilt_deadband_frac:
+            return
+
+        # Positive error => target appears too high -> tilt down (more negative tilt).
+        if error > 0.0:
+            self.camera_tilt_cmd -= self.auto_tilt_step_rad
+        else:
+            self.camera_tilt_cmd += self.auto_tilt_step_rad
+
+        self.camera_tilt_cmd = float(
+            np.clip(self.camera_tilt_cmd, self.auto_tilt_min_rad, self.auto_tilt_max_rad)
+        )
+        msg = Float64MultiArray()
+        msg.data = [self.camera_pan_cmd, self.camera_tilt_cmd]
+        self.pan_tilt_pub.publish(msg)
 
     def _to_mm_depth(self, depth_image: np.ndarray) -> np.ndarray:
         """Normalize depth image to millimeters."""
@@ -976,8 +1043,14 @@ class NavigationTaskNode(Node):
             bbox = self.last_red_bbox_color
             if distance_m is None:
                 distance_m = self.last_red_distance_m
+        else:
+            # If target is visible but depth ROI dropped out, use recent target range estimate.
+            if distance_m is None and self.last_red_seen_time is not None and self.last_red_distance_m is not None:
+                dt = (self.get_clock().now() - self.last_red_seen_time).nanoseconds / 1e9
+                if dt <= self.approach_target_memory_s:
+                    distance_m = self.last_red_distance_m
 
-        blocked = self._is_approach_path_blocked(distance_m)
+        blocked = self._is_approach_path_blocked(distance_m, self.red_target_visible)
         obstacle_is_target = False
         if (
             blocked
@@ -1070,7 +1143,7 @@ class NavigationTaskNode(Node):
         target_y = self.current_y + advance * np.sin(target_theta)
         self.publish_pose_target(target_x, target_y, target_theta)
 
-    def _is_approach_path_blocked(self, target_distance_m) -> bool:
+    def _is_approach_path_blocked(self, target_distance_m, target_visible) -> bool:
         """
         Less-strict obstacle check for approach mode.
         Detects obstacles in a broad forward corridor, even if they don't satisfy generic blocker heuristics.
@@ -1090,6 +1163,9 @@ class NavigationTaskNode(Node):
                         np.percentile(roi_depth[roi_valid], self.approach_block_corridor_percentile) / 1000.0
                     )
                     if corridor_distance_m <= self.approach_block_max_distance_m:
+                        # If target is visible but depth is uncertain, only emergency-stop for very close obstacles.
+                        if target_visible and target_distance_m is None:
+                            return corridor_distance_m <= self.CRITICAL_STOP_DISTANCE_M
                         if (
                             target_distance_m is None
                             or corridor_distance_m < (target_distance_m - self.approach_obstacle_target_margin_m)
@@ -1111,6 +1187,9 @@ class NavigationTaskNode(Node):
             return False
         if self.obstacle_distance_m > self.approach_block_max_distance_m:
             return False
+
+        if target_visible and target_distance_m is None:
+            return self.obstacle_distance_m <= self.CRITICAL_STOP_DISTANCE_M
 
         depth_h, depth_w = self.latest_depth_shape
         x, y, w, h = self.obstacle_bbox_depth

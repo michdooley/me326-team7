@@ -44,6 +44,7 @@ install(PROGRAMS
   scripts/pick_up_block.py
   scripts/pick_up_block_real.py
   scripts/frontier_exploration.py
+  scripts/frontier_exploration_codex.py
   scripts/objective1_task.py
   scripts/task_navigate_with_avoidance.py
   DESTINATION lib/${PROJECT_NAME}

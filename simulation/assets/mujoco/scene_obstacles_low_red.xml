@@ -1,4 +1,4 @@
-<mujoco model="tidybot obstacle scene">
+<mujoco model="tidybot obstacle scene low red">
   <include file="tidybot_wx250s_bimanual.xml"/>
 
   <statistic center="0 0 0.525" extent="1.1" meansize="0.05"/>
@@ -42,8 +42,9 @@
         mass="10.0" friction="2.0 1.0 1.0"/>
     </body>
 
-    <body name="obstacle_cylinder_1" pos="2.0 -0.5 0.25">
-      <geom name="obstacle_cylinder_1_geom" type="cylinder" size="0.18 0.25" material="red_obstacle_material"
+    <!-- Red target cylinder made short/low so camera must tilt down near approach -->
+    <body name="obstacle_cylinder_1" pos="2.0 -0.5 0.08">
+      <geom name="obstacle_cylinder_1_geom" type="cylinder" size="0.18 0.08" material="red_obstacle_material"
         mass="10.0" friction="2.0 1.0 1.0"/>
     </body>
 
