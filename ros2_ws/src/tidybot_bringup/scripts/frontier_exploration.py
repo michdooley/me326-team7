@@ -373,10 +373,33 @@ class FrontierExplorer(Node):
         obs_idx   = np.where(obs_mask)[0]
         floor_idx = np.where(floor_mask)[0]
 
+        cam_gx, cam_gy = self.world_to_grid(cam_origin[0], cam_origin[1])
+
+        # ── 4b. Mark robot footprint as free ──────────────────────────────────
+        # The depth camera looks outward and cannot see the floor directly
+        # beneath the robot.  Those cells never receive MISS updates so they
+        # stay UNKNOWN (log_odds = 0).  The frontier detector then scores the
+        # robot's own position as a high-value frontier (close + large cluster
+        # of adjacent unknown cells), causing the robot to navigate back to
+        # where it started.  Clearing the footprint on every depth frame
+        # prevents this false frontier from forming.
+        r_cells = int(self.ROBOT_BODY_RADIUS / self.GRID_RESOLUTION) + 1
+        fy_min  = max(0, cam_gy - r_cells)
+        fy_max  = min(self.GRID_SIZE, cam_gy + r_cells + 1)
+        fx_min  = max(0, cam_gx - r_cells)
+        fx_max  = min(self.GRID_SIZE, cam_gx + r_cells + 1)
+        ffy, ffx = np.meshgrid(
+            np.arange(fy_min, fy_max), np.arange(fx_min, fx_max), indexing='ij')
+        in_fp   = ((ffy - cam_gy)**2 + (ffx - cam_gx)**2) <= r_cells ** 2
+        fp_gy   = ffy[in_fp];  fp_gx = ffx[in_fp]
+        # Don't clear cells already confirmed as real obstacles (hit_count ≥ 2)
+        clearable = self.hit_count[fp_gy, fp_gx] < self.MIN_HIT_COUNT
+        self.log_odds[fp_gy[clearable], fp_gx[clearable]] = np.maximum(
+            self.LOG_ODDS_MIN,
+            self.log_odds[fp_gy[clearable], fp_gx[clearable]] + self.LOG_ODDS_MISS)
+
         if len(obs_idx) == 0 and len(floor_idx) == 0:
             return
-
-        cam_gx, cam_gy = self.world_to_grid(cam_origin[0], cam_origin[1])
 
         # ── 5a. Free-space raytrace: obstacle returns ─────────────────────────
         if len(obs_idx) > 0:
