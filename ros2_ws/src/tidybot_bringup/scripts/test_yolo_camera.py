@@ -30,7 +30,7 @@ import cv2
 from tidybot_perception.yolo_object_detector import YOLOObjectDetector
 
 
-TILT_DOWN_RAD = np.radians(-40)  # 40 degrees down (negative = down)
+TILT_DOWN_RAD = np.radians(40) 
 SETTLE_TIME = 2.0  # seconds to wait after tilting
 
 
