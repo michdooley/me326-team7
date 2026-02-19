@@ -331,13 +331,19 @@ class FrontierExplorer(Node):
         """Bresenham's line: apply LOG_ODDS_MISS to every cell from (x0,y0)
         up to (but not including) the endpoint (x1,y1).
 
-        MISS is applied to ALL cells along the ray, including cells already
-        above OCC_THRESH.  This is essential for log-odds self-correction:
-        small TF timing errors cause walls to be painted ~1 cell off their
-        true position; subsequent rays from new angles must be able to apply
-        MISS to those stale cells so they decay back to UNKNOWN.  A real wall
-        receives far more HIT updates than MISS, so it stays OCCUPIED; a
-        single-frame false positive receives mostly MISS and clears quickly.
+        The raytrace stops when it hits a cell whose log-odds are already at
+        or above LOG_ODDS_OCC_THRESH (currently 1.50 — requiring two
+        consistent hits to reach).  This prevents a 3-D→2-D projection
+        artefact: a depth point visible beside or below a wall in 3-D can
+        produce a 2-D ray that crosses the wall's grid footprint.  Stopping
+        at a well-established obstacle keeps the occluded cells UNKNOWN
+        rather than erroneously marking them FREE ("see-through" walls).
+
+        Because LOG_ODDS_OCC_THRESH is now 1.50 (vs the old 0.50), a
+        single-frame TF error only raises a cell to 0.85 — still below the
+        threshold — so those borderline cells are still correctable by
+        subsequent MISS updates.  Only cells that have been confirmed by two
+        or more independent observations trigger the early stop.
         """
         dx = abs(x1 - x0);  sx = 1 if x0 < x1 else -1
         dy = abs(y1 - y0);  sy = 1 if y0 < y1 else -1
@@ -346,6 +352,8 @@ class FrontierExplorer(Node):
 
         while not (x == x1 and y == y1):
             if self.in_grid(x, y):
+                if self.log_odds[y, x] >= self.LOG_ODDS_OCC_THRESH:
+                    break   # confirmed obstacle — stop, don't clear behind it
                 self.log_odds[y, x] = max(
                     self.LOG_ODDS_MIN,
                     self.log_odds[y, x] + self.LOG_ODDS_MISS)
