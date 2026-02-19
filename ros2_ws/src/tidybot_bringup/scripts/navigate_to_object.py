@@ -2,16 +2,16 @@
 """
 Navigate to Object Module
 
-Searches for a target-colored object (default: red) by scanning the environment,
+Searches for a target object (e.g., 'banana', 'apple') by scanning the environment,
 explores with frontier-based navigation and obstacle avoidance using a depth-based
 occupancy grid, and positions the robot within grasping range.
 
-Uses HSV color detection via RGBDObjectDetector — no YOLO required.
+Uses YOLO object detection via YOLOObjectDetector for class-based recognition.
 
 Internal sub-states: INIT → SCAN → EXPLORE → APPROACH → ALIGN → POSITIONED
 
-Subscribes (via RGBDObjectDetector):
-    /camera/color/image_raw (Image) - RGB for HSV detection
+Subscribes (via YOLOObjectDetector):
+    /camera/color/image_raw (Image) - RGB for YOLO detection
     /camera/depth/image_raw (Image) - depth for obstacle avoidance + 3D localization
     /camera/color/camera_info (CameraInfo) - intrinsics
 
@@ -21,7 +21,7 @@ Publishes:
 
 Usage:
     # As a standalone test:
-    ros2 run tidybot_bringup navigate_to_object.py --ros-args -p target_color:=red
+    ros2 run tidybot_bringup navigate_to_object.py --ros-args -p target_object:=banana
 
     # Or import in the state machine:
     from navigate_to_object import NavigateToObject
@@ -43,7 +43,7 @@ from nav_msgs.msg import OccupancyGrid, MapMetaData
 
 import tf2_ros
 
-from tidybot_perception.rgbd_object_detector import RGBDObjectDetector
+from tidybot_perception.yolo_object_detector import YOLOObjectDetector
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -345,19 +345,19 @@ def _normalize_angle(angle):
 
 class NavigateToObject(Node):
     """
-    Navigate to a target-colored object using HSV detection, frontier
+    Navigate to a target object using YOLO detection, frontier
     exploration, and reactive obstacle avoidance.
 
     Can be run standalone or used by the state machine.
     """
 
-    def __init__(self, target_color: str = 'red'):
+    def __init__(self, target_object: str = 'banana'):
         super().__init__('navigate_to_object')
 
-        self.target_color = target_color
+        self.target_object = target_object
 
-        # ── Perception (HSV detection + depth localization) ──
-        self.detector = RGBDObjectDetector(self)
+        # ── Perception (YOLO detection + depth localization) ──
+        self.detector = YOLOObjectDetector(self)
 
         # ── TF2 (for odom→base_link lookups) ──
         self.tf_buffer = tf2_ros.Buffer()
@@ -398,7 +398,7 @@ class NavigateToObject(Node):
         # ── Control loop at 10Hz ──
         self.timer = self.create_timer(0.1, self.control_loop)
 
-        self.get_logger().info(f'NavigateToObject: searching for "{target_color}"')
+        self.get_logger().info(f'NavigateToObject: searching for "{target_object}"')
 
     # ═══════════════════════════════════════════════════════════════════
     # Public interface
@@ -412,11 +412,11 @@ class NavigateToObject(Node):
         """Returns the latest PointStamped of the target in base_link, or None."""
         return self.target_base_pt
 
-    def set_target(self, color: str):
-        """Set a new target color and reset to INIT state."""
-        self.target_color = color
+    def set_target(self, target_class: str):
+        """Set a new target object class and reset to INIT state."""
+        self.target_object = target_class
         self.reset()
-        self.get_logger().info(f'New target color: "{color}"')
+        self.get_logger().info(f'New target object: "{target_class}"')
 
     def reset(self):
         """Reset the full state machine."""
@@ -666,14 +666,14 @@ class NavigateToObject(Node):
     def _handle_scan(self):
         """Rotate 360° in place scanning for the target color."""
         # Check for target on every tick
-        detection = self.detector.detect_and_localize(self.target_color)
+        detection = self.detector.detect_and_localize(self.target_object)
         if detection is not None:
             pixel, base_pt = detection
             self.target_base_pt = base_pt
             self.last_detection_time = time.time()
             self._stop_base()
             self.get_logger().info(
-                f'[SCAN] Detected {self.target_color} at pixel {pixel}, '
+                f'[SCAN] Detected {self.target_object} at pixel {pixel}, '
                 f'base_link=({base_pt.point.x:.2f}, {base_pt.point.y:.2f}, '
                 f'{base_pt.point.z:.2f})')
             self._transition_to(NavState.APPROACH)
@@ -696,7 +696,7 @@ class NavigateToObject(Node):
             self._stop_base()
             self.scan_count += 1
             self.get_logger().info(
-                f'[SCAN] Full rotation #{self.scan_count}, no {self.target_color} found')
+                f'[SCAN] Full rotation #{self.scan_count}, no {self.target_object} found')
 
             if self.scan_count >= MAX_EXPLORE_SCANS:
                 self.get_logger().warn(
@@ -719,16 +719,16 @@ class NavigateToObject(Node):
         self._update_occupancy_grid()
 
         # Check for target continuously while exploring
-        detection = self.detector.detect_color(self.target_color)
+        detection = self.detector.detect(self.target_object)
         if detection is not None:
-            full = self.detector.detect_and_localize(self.target_color)
+            full = self.detector.detect_and_localize(self.target_object)
             if full is not None:
                 pixel, base_pt = full
                 self.target_base_pt = base_pt
                 self.last_detection_time = time.time()
                 self._stop_base()
                 self.get_logger().info(
-                    f'[EXPLORE] Found {self.target_color} while exploring!')
+                    f'[EXPLORE] Found {self.target_object} while exploring!')
                 self._transition_to(NavState.APPROACH)
                 return
 
@@ -788,7 +788,7 @@ class NavigateToObject(Node):
     def _handle_approach(self):
         """Drive toward the detected object while avoiding obstacles."""
         # Re-detect on every tick for live tracking
-        detection = self.detector.detect_and_localize(self.target_color)
+        detection = self.detector.detect_and_localize(self.target_object)
         if detection is not None:
             pixel, base_pt = detection
             self.target_base_pt = base_pt
@@ -856,7 +856,7 @@ class NavigateToObject(Node):
     def _handle_align(self):
         """Fine-tune position: center the object in view and adjust distance."""
         # Detect pixel position
-        pixel = self.detector.detect_color(self.target_color)
+        pixel = self.detector.detect(self.target_object)
         if pixel is None:
             # Lost during alignment — go back to approach
             self.get_logger().warn('[ALIGN] Lost object, returning to APPROACH')
@@ -872,7 +872,7 @@ class NavigateToObject(Node):
         angular_correction = -0.003 * pixel_error
 
         # Get 3D position for distance check
-        full = self.detector.detect_and_localize(self.target_color)
+        full = self.detector.detect_and_localize(self.target_object)
         if full is not None:
             _, base_pt = full
             self.target_base_pt = base_pt
@@ -917,7 +917,7 @@ class NavigateToObject(Node):
 
     def control_loop(self):
         """Navigation state machine at 10Hz."""
-        if not self.target_color:
+        if not self.target_object:
             return
 
         # Publish map to RViz at 2Hz
@@ -942,14 +942,14 @@ class NavigateToObject(Node):
 # ═══════════════════════════════════════════════════════════════════════
 
 def main(args=None):
-    """Standalone test: search for a colored object."""
+    """Standalone test: search for an object by class name."""
     rclpy.init(args=args)
 
-    node = NavigateToObject(target_color='red')
-    node.declare_parameter('target_color', 'red')
-    color = node.get_parameter('target_color').value
-    if color:
-        node.set_target(color)
+    node = NavigateToObject(target_object='banana')
+    node.declare_parameter('target_object', 'banana')
+    target = node.get_parameter('target_object').value
+    if target:
+        node.set_target(target)
 
     try:
         rclpy.spin(node)
