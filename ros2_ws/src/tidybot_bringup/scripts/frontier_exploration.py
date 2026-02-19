@@ -57,6 +57,7 @@ from collections import deque
 from enum import Enum
 
 import numpy as np
+from scipy.ndimage import binary_dilation
 import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -134,6 +135,7 @@ class FrontierExplorer(Node):
     # ── Frontier selection ────────────────────────────────────────────────────
     MIN_FRONTIER_SIZE   = 8    # cells — ignore tiny frontier clusters
     MIN_FRONTIER_DIST   = 1.5  # m — ignore frontiers closer than this to the robot
+    ROBOT_CLEARANCE     = 0.45 # m — min clearance from obstacles for goals/centroids
     FRONTIER_NAV_OFFSET = 0.4  # m — goal set this far in front of centroid
 
     # ── Navigation ────────────────────────────────────────────────────────────
@@ -545,6 +547,15 @@ class FrontierExplorer(Node):
                          (self.hit_count >= self.MIN_HIT_COUNT))
         unknown_mask  = ~free_mask & ~confirmed_occ
 
+        # Inflate confirmed obstacles by ROBOT_CLEARANCE.  Frontier centroids
+        # and nav goals inside this inflated zone are within the robot's body
+        # radius of a wall and unsafe to navigate to.  Cache the mask so that
+        # _state_select() can also validate the final goal position.
+        r_clear = int(np.ceil(self.ROBOT_CLEARANCE / self.GRID_RESOLUTION))
+        ky_c, kx_c = np.ogrid[-r_clear:r_clear + 1, -r_clear:r_clear + 1]
+        clear_disc = (ky_c ** 2 + kx_c ** 2) <= r_clear ** 2
+        self._inflated_occ = binary_dilation(confirmed_occ, structure=clear_disc)
+
         frontier_mask = np.zeros_like(self.log_odds, dtype=bool)
         for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
             frontier_mask |= (free_mask &
@@ -602,6 +613,11 @@ class FrontierExplorer(Node):
             # of the footprint-clearing radius and score deceptively high
             # because the distance denominator is tiny.
             if dist < self.MIN_FRONTIER_DIST:
+                continue
+
+            # Skip if the centroid is within ROBOT_CLEARANCE of any confirmed
+            # obstacle — the robot cannot safely stand at this location.
+            if self._inflated_occ[mgy, mgx]:
                 continue
 
             # Count UNKNOWN cells within sensor range of this frontier centroid.
@@ -766,6 +782,34 @@ class FrontierExplorer(Node):
             goal_y = by + dy * ratio
         else:
             goal_x, goal_y = wx, wy
+
+        # If the goal falls inside the inflated obstacle zone (e.g. the
+        # frontier centroid is near a wall even after the offset), walk the
+        # goal back along the robot→frontier line one grid cell at a time
+        # until it reaches obstacle-free space.
+        if hasattr(self, '_inflated_occ'):
+            gx_g = int((goal_x - self.GRID_ORIGIN_X) / self.GRID_RESOLUTION)
+            gy_g = int((goal_y - self.GRID_ORIGIN_Y) / self.GRID_RESOLUTION)
+            if (self.in_grid(gx_g, gy_g) and self._inflated_occ[gy_g, gx_g]):
+                norm = dist if dist > 0 else 1.0
+                ux, uy = dx / norm, dy / norm
+                step = self.GRID_RESOLUTION
+                found = False
+                for t in np.arange(dist - self.FRONTIER_NAV_OFFSET - step,
+                                   self.MIN_FRONTIER_DIST, -step):
+                    gx_t = int((bx + ux * t - self.GRID_ORIGIN_X) / self.GRID_RESOLUTION)
+                    gy_t = int((by + uy * t - self.GRID_ORIGIN_Y) / self.GRID_RESOLUTION)
+                    if (self.in_grid(gx_t, gy_t) and
+                            not self._inflated_occ[gy_t, gx_t]):
+                        goal_x = bx + ux * t
+                        goal_y = by + uy * t
+                        found = True
+                        break
+                if not found:
+                    self.get_logger().warn(
+                        '[SELECT] No clear goal along robot→frontier line — re-scanning.')
+                    self._start_scan()
+                    return
 
         goal_theta = np.arctan2(dy, dx)
         user_theta = goal_theta - np.pi / 2   # bridge frame convention
