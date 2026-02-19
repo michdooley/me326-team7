@@ -2,6 +2,21 @@
 
 This guide explains how to integrate the GPD (Grasp Pose Detection) grasp planner into TidyBot2's Task 1 object retrieval pipeline.
 
+Note: the repository includes `grasp_libraries/install_gpd.sh` and tracks the GPD source as a git submodule at `grasp_libraries/gpd`.
+After cloning this repo run:
+
+```bash
+git submodule update --init --recursive
+```
+
+Then run the installer from the repo root to build and install GPD consistently across machines:
+
+```bash
+cd /home/elisabeth/me326-team7
+chmod +x grasp_libraries/install_gpd.sh
+./grasp_libraries/install_gpd.sh
+```
+
 ## Overview
 
 The GPD grasp planner is a high-quality grasp detection algorithm that:
@@ -42,21 +57,16 @@ Task 1 State Machine (task1_retrieve.py)
 
 ### 1. Install GPD Library (one-time setup)
 
-Follow the instructions in [gpd_setup.md](./gpd_setup.md). Summary:
+Follow the instructions in [gpd_setup.md](./gpd_setup.md) or use the repo installer (recommended). Summary (repo-based):
 
 ```bash
-# Install dependencies
-sudo apt install -y libpcl-dev libeigen3-dev libopencv-dev
+# Ensure system deps are installed
+sudo apt install -y libpcl-dev libeigen3-dev libopencv-dev libvtk-dev build-essential cmake
 
-# Clone and build GPD library
-mkdir -p ~/grasp_libraries
-cd ~/grasp_libraries
-git clone https://github.com/atenpas/gpd.git
-cd gpd
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-sudo make install  # IMPORTANT: Must install as library
+# From the repo root (after initializing submodules):
+cd /home/elisabeth/me326-team7
+chmod +x grasp_libraries/install_gpd.sh
+./grasp_libraries/install_gpd.sh
 ```
 
 ### 2. Copy GPD Config & Models to TidyBot Workspace

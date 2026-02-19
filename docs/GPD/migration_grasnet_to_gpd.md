@@ -105,7 +105,15 @@ ros2 service call /plan_grasp tidybot_msgs/srv/PlanGrasp "{...}"
 ## Checklist
 
 - [ ] Delete old placeholder: `rm tidybot_perception/grasp_planner_node.py`
-- [ ] Install GPD library (see [gpd_setup.md](./gpd_setup.md))
+- [ ] Initialize submodules and install GPD (see [gpd_setup.md](./gpd_setup.md)):
+
+```bash
+git submodule update --init --recursive
+cd /home/elisabeth/me326-team7
+chmod +x grasp_libraries/install_gpd.sh
+./grasp_libraries/install_gpd.sh
+```
+
 - [ ] Build tidybot_gpd: `colcon build --packages-select tidybot_gpd`
 - [ ] Test grasp planner standalone (see [gpd_quick_start.md](./gpd_quick_start.md))
 - [ ] Update task1_retrieve.py to use new client (see code above)

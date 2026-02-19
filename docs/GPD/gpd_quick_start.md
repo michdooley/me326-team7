@@ -10,25 +10,25 @@ Use this checklist to set up the GPD (Grasp Pose Detection) grasp planner for Ti
 
 **Estimated time: 15 minutes + compile time**
 
+Note: this repo includes `grasp_libraries/install_gpd.sh` and tracks `grasp_libraries/gpd` as a git submodule. After cloning run `git submodule update --init --recursive` and then run the installer from the repo root.
+
 - [ ] Install system dependencies
   ```bash
   sudo apt update
   sudo apt install -y libpcl-dev libeigen3-dev libopencv-dev cmake build-essential git
   ```
 
-- [ ] Clone and build GPD
-  ```bash
-  mkdir -p ~/grasp_libraries
-  cd ~/grasp_libraries
-  git clone https://github.com/atenpas/gpd.git
-  cd gpd && mkdir build && cd build
-  cmake ..
-  make -j$(nproc)
-  ```
 
-- [ ] **IMPORTANT:** Install GPD as a library
+- [ ] Build & install GPD (recommended: use repo installer)
   ```bash
-  sudo make install
+  # Ensure system deps are present
+  sudo apt update
+  sudo apt install -y libpcl-dev libeigen3-dev libopencv-dev libvtk-dev build-essential cmake
+
+  # From repo root (after initializing submodules)
+  cd /home/elisabeth/me326-team7
+  chmod +x grasp_libraries/install_gpd.sh
+  ./grasp_libraries/install_gpd.sh
   ```
 
 - [ ] Verify installation
@@ -42,10 +42,11 @@ Use this checklist to set up the GPD (Grasp Pose Detection) grasp planner for Ti
 
 **Estimated time: 5 minutes**
 
+
 - [ ] Copy GPD pre-trained models to TidyBot workspace
   ```bash
   mkdir -p /home/elisabeth/me326-team7/ros2_ws/src/tidybot_perception/models
-  cp -r ~/grasp_libraries/gpd/models/* /home/elisabeth/me326-team7/ros2_ws/src/tidybot_perception/models/
+  cp -r /home/elisabeth/me326-team7/grasp_libraries/gpd/models/* /home/elisabeth/me326-team7/ros2_ws/src/tidybot_perception/models/
   ```
 
 - [ ] Verify config files exist
@@ -122,10 +123,11 @@ Use this checklist to set up the GPD (Grasp Pose Detection) grasp planner for Ti
 ```bash
 # Verify GPD was installed:
 ls -la /usr/local/lib/libgpd.so
-ls -la /usr/local/lib/cmake/gpd/
+ls -la /usr/local/include/gpd/
+ls -la /usr/local/share/cmake/Findgpd.cmake
 
-# If missing, reinstall:
-cd ~/grasp_libraries/gpd/build
+# If missing, reinstall using the repo script or manual build:
+cd /home/elisabeth/me326-team7/grasp_libraries/gpd/build
 sudo make install
 ```
 

@@ -23,6 +23,8 @@ A complete integration of the **GPD (Grasp Pose Detection)** library into TidyBo
    - **gpd_quick_start.md** - Quick reference checklist
    - **This file** - Summary of the integration
 
+   Note: the repository now includes `grasp_libraries/install_gpd.sh` and tracks `grasp_libraries/gpd` as a git submodule. After cloning run `git submodule update --init --recursive` and then run the installer from the repo root to reproduce the same install layout on other machines.
+
 ### 3. **Client Library**
    - `utilities/grasp_planner_client.py` - Python helper for calling the grasp service from task scripts
    - Provides both synchronous and asynchronous APIs
@@ -33,18 +35,18 @@ A complete integration of the **GPD (Grasp Pose Detection)** library into TidyBo
 ## Quick Start
 
 ### 1. Install GPD (one-time)
+Use the repo installer (recommended) after initializing submodules:
 ```bash
-sudo apt install -y libpcl-dev libeigen3-dev libopencv-dev
-mkdir -p ~/grasp_libraries && cd ~/grasp_libraries
-git clone https://github.com/atenpas/gpd.git
-cd gpd && mkdir build && cd build && cmake && make -j$(nproc)
-sudo make install  # Critical!
+git submodule update --init --recursive
+cd /home/elisabeth/me326-team7
+chmod +x grasp_libraries/install_gpd.sh
+./grasp_libraries/install_gpd.sh
 ```
 
 ### 2. Copy models & build
 ```bash
 mkdir -p /home/elisabeth/me326-team7/ros2_ws/src/tidybot_perception/models
-cp -r ~/grasp_libraries/gpd/models/* /home/elisabeth/me326-team7/ros2_ws/src/tidybot_perception/models/
+cp -r /home/elisabeth/me326-team7/grasp_libraries/gpd/models/* /home/elisabeth/me326-team7/ros2_ws/src/tidybot_perception/models/
 
 cd /home/elisabeth/me326-team7/ros2_ws
 colcon build --packages-select tidybot_gpd
