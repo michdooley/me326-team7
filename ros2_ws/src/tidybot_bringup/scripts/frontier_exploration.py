@@ -241,19 +241,28 @@ class FrontierExplorer(Node):
     def update_map(self):
         """Project the current depth frame into the log-odds occupancy grid.
 
-        Called directly from _depth_cb so that the TF lookup happens within
-        ~1 ms of frame capture.  At 1.5 rad/s that is <0.1° of rotational
-        error — far below what produces visible smearing.
+        Uses the depth image's own header.stamp for the TF lookup.  The
+        MuJoCo bridge now broadcasts an odom→base_link TF with the EXACT
+        same timestamp as the depth image (captured inside the render lock),
+        so this lookup returns a transform that corresponds to the precise
+        sim state that was rendered — zero lag, zero smear.
         """
         if self.latest_depth is None or self.camera_K is None:
             return
 
         try:
+            stamp = rclpy.time.Time.from_msg(self.latest_depth_stamp)
             tf = self.tf_buffer.lookup_transform(
                 'odom', 'camera_depth_optical_frame',
-                rclpy.time.Time(), timeout=Duration(seconds=0.1))
+                stamp, timeout=Duration(seconds=0.1))
         except Exception:
-            return
+            # Fallback: use latest available TF if stamped lookup fails
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    'odom', 'camera_depth_optical_frame',
+                    rclpy.time.Time(), timeout=Duration(seconds=0.05))
+            except Exception:
+                return
 
         t = tf.transform.translation
         q = tf.transform.rotation

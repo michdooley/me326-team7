@@ -619,8 +619,6 @@ class MuJoCoBridgeNode(Node):
         if not HAS_CV_BRIDGE:
             return
 
-        now = self.get_clock().now().to_msg()
-
         with self.lock:
             # Render RGB image
             self.renderer.update_scene(self.data, camera='d435_rgb')
@@ -636,6 +634,45 @@ class MuJoCoBridgeNode(Node):
             self.renderer.disable_depth_rendering()
             # Flip vertically and horizontally to match ROS camera convention
             depth_image = np.fliplr(np.flipud(depth_image)).copy()
+
+            # Capture timestamp and robot state AFTER rendering while the lock
+            # is still held.  This ensures 'now' matches the exact sim state
+            # that was just rendered — eliminating the timestamp mismatch that
+            # occurred when 'now' was sampled before acquiring the lock.
+            now = self.get_clock().now().to_msg()
+
+            cam_base_x  = 0.0
+            cam_base_y  = 0.0
+            cam_base_th = 0.0
+            if 'joint_x' in self.joint_ids:
+                cam_base_x = float(
+                    self.data.qpos[self.model.jnt_qposadr[self.joint_ids['joint_x']]])
+            if 'joint_y' in self.joint_ids:
+                cam_base_y = float(
+                    self.data.qpos[self.model.jnt_qposadr[self.joint_ids['joint_y']]])
+            if 'joint_th' in self.joint_ids:
+                cam_base_th = float(
+                    self.data.qpos[self.model.jnt_qposadr[self.joint_ids['joint_th']]])
+
+        # Broadcast odom→base_link TF with the SAME timestamp as the depth
+        # image, using the robot state read from the exact sim snapshot that
+        # was rendered.  This TF is sent BEFORE the depth message so that it
+        # is already in the TF buffer when the subscriber processes the depth
+        # frame and calls lookup_transform(msg.header.stamp).
+        cy = np.cos(cam_base_th * 0.5)
+        sy = np.sin(cam_base_th * 0.5)
+        cam_tf = TransformStamped()
+        cam_tf.header.stamp        = now
+        cam_tf.header.frame_id     = 'odom'
+        cam_tf.child_frame_id      = 'base_link'
+        cam_tf.transform.translation.x = cam_base_x
+        cam_tf.transform.translation.y = cam_base_y
+        cam_tf.transform.translation.z = 0.0
+        cam_tf.transform.rotation.x    = 0.0
+        cam_tf.transform.rotation.y    = 0.0
+        cam_tf.transform.rotation.z    = sy
+        cam_tf.transform.rotation.w    = cy
+        self.tf_broadcaster.sendTransform(cam_tf)
 
         # Publish RGB image
         try:
