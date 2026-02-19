@@ -2,23 +2,32 @@
 """
 TidyBot2 Frontier Explorer
 
-Builds a 2D log-odds occupancy grid from the depth camera, then
-autonomously explores by repeating:
+Maintains a persistent 2-D log-odds occupancy grid that accumulates over
+the full exploration run.  The exploration loop repeats:
 
-  1. SCANNING   — rotates the base 360° in place while continuously
-                  updating the map from every depth frame
-  2. SELECTING  — finds frontier cells (FREE↔UNKNOWN boundary), clusters
-                  them, and navigates to the highest-scoring cluster
-                  (score = cluster_size / distance_to_robot)
-  3. NAVIGATING — drives to the chosen goal; on arrival (or timeout)
-                  returns to step 1 at the new position
+  1. SCANNING   — rotates the base 360° in place, integrating every depth
+                  frame into the map.
+  2. SELECTING  — clusters frontier cells (FREE↔UNKNOWN boundary) and picks
+                  the highest-scoring one (score = cluster_size / distance).
+  3. NAVIGATING — drives to the selected frontier, mapping along the way.
 
-The log-odds grid is key to correctness:
-  • Every depth ray clears FREE belief along its entire path, so a
-    noisy OCCUPIED reading can be overwritten by later free observations.
-  • Only points whose world-z falls in [MIN_OBSTACLE_Z, MAX_OBSTACLE_Z]
-    vote for OCCUPIED — the floor (z≈0) is excluded without needing a
-    full 3-D voxel representation.
+Key design choices
+──────────────────
+• Persistent map — the occupancy grid is NEVER cleared between scans.
+  Evidence accumulates correctly because the MuJoCo bridge co-publishes a
+  synchronised odom→base_link TF with each depth frame (same timestamp,
+  same sim state), eliminating TF timing lag.
+
+• Obstacle-only raytrace — free-space rays are traced ONLY for depth
+  returns that fall in the obstacle height band [MIN_OBSTACLE_Z,
+  MAX_OBSTACLE_Z].  Floor and ceiling returns are silently dropped.
+  This prevents a 3-D→2-D artefact where a floor point visible beside a
+  wall in 3-D produces a 2-D ray that crosses the wall's grid footprint
+  and erroneously marks it as free ("see-through" walls).
+
+• Early-exit raytrace — each free-space ray stops when it reaches a cell
+  already above LOG_ODDS_OCC_THRESH (≥ 2 confirmed hits).  Cells below the
+  threshold (single-frame noise) are still correctable by MISS updates.
 
 Publishes:
   /map               nav_msgs/OccupancyGrid   — standard RViz map
@@ -26,7 +35,7 @@ Publishes:
   /frontier_markers  visualization_msgs/MarkerArray
 
 Subscribes:
-  /camera/depth/image_raw    — depth frames
+  /camera/depth/image_raw    — depth frames (16UC1, mm)
   /camera/color/camera_info  — camera intrinsics
   /base/goal_reached         — Bool, fired when navigation completes
 
@@ -67,94 +76,97 @@ except ImportError:
 
 
 class ExploreState(Enum):
-    SCANNING   = 0   # rotating 360° in place, building the map
-    SELECTING  = 1   # choosing the best frontier to drive toward
-    NAVIGATING = 2   # driving to the selected frontier
-    COMPLETE   = 3   # no frontiers remain
+    SCANNING   = 0
+    SELECTING  = 1
+    NAVIGATING = 2
+    COMPLETE   = 3
 
 
 class FrontierExplorer(Node):
-    """Log-odds occupancy mapper with 360° scan + frontier-based navigation."""
 
     # ── Grid ─────────────────────────────────────────────────────────────────
-    GRID_RESOLUTION = 0.05   # m/cell
-    GRID_SIZE       = 300    # cells per axis  (15 m × 15 m)
-    GRID_ORIGIN_X   = -7.5   # world X at grid column 0 (m)
-    GRID_ORIGIN_Y   = -7.5   # world Y at grid row    0 (m)
+    GRID_RESOLUTION = 0.05   # m / cell
+    GRID_SIZE       = 300    # cells per axis  →  15 m × 15 m world
+    GRID_ORIGIN_X   = -7.5   # world X of grid column 0  (m)
+    GRID_ORIGIN_Y   = -7.5   # world Y of grid row    0  (m)
 
-    # ── Depth processing ─────────────────────────────────────────────────────
+    # ── Depth filtering ───────────────────────────────────────────────────────
     MIN_DEPTH_M     = 0.30   # ignore returns closer than this (robot body)
-    MAX_DEPTH_M     = 5.00   # ignore returns farther than this
-    DEPTH_SUBSAMPLE = 4      # process every Nth pixel
+    MAX_DEPTH_M     = 5.00   # ignore returns farther  than this
+    DEPTH_SUBSAMPLE = 4      # process every Nth pixel (speed vs. quality)
 
     # ── Height filter ─────────────────────────────────────────────────────────
-    # Only 3-D points whose odom-Z is in this band vote for OCCUPIED.
-    # Floor (z≈0) and overhead surfaces are excluded without a voxel grid.
-    MIN_OBSTACLE_Z = 0.10    # m — 10 cm clears floor noise
-    MAX_OBSTACLE_Z = 0.80    # m — ignore camera mounts / ceilings
+    # Only 3-D points in this Z band vote for OCCUPIED — floor and ceiling
+    # are excluded without requiring a full 3-D voxel representation.
+    MIN_OBSTACLE_Z = 0.10    # m — clears floor returns (z ≈ 0)
+    MAX_OBSTACLE_Z = 0.80    # m — ignores camera mount / ceilings
 
-    # ── Log-odds belief (Thrun, Burgard & Fox Ch. 9) ─────────────────────────
-    LOG_ODDS_HIT         =  0.85
-    LOG_ODDS_MISS        = -0.40
-    LOG_ODDS_MIN         = -3.00   # very confident FREE   (P ≈ 0.05)
-    LOG_ODDS_MAX         =  3.00   # very confident OCCUPIED (P ≈ 0.95)
-    LOG_ODDS_FREE_THRESH = -0.50   # below → publish  0 (FREE)
+    # ── Log-odds belief (Thrun, Burgard & Fox, Ch. 9) ────────────────────────
+    LOG_ODDS_HIT         =  0.85   # evidence of occupancy per observation
+    LOG_ODDS_MISS        = -0.40   # evidence of free space per ray cell
+    LOG_ODDS_MIN         = -3.00   # clamp floor  (P ≈ 0.05  very free)
+    LOG_ODDS_MAX         =  3.00   # clamp ceiling (P ≈ 0.95  very occupied)
+    LOG_ODDS_FREE_THRESH = -0.50   # below → publish   0 (FREE)
     LOG_ODDS_OCC_THRESH  =  1.50   # above → publish 100 (OCCUPIED)
-    # between the two   → publish -1 (UNKNOWN)
+    # Cells between the two thresholds → publish -1 (UNKNOWN / gray)
+    #
+    # OCC_THRESH = 1.50 means 2 independent hits (2 × 0.85 = 1.70) are
+    # required before a cell is considered a confirmed obstacle.  A single-
+    # frame noise spike (0.85) stays below the threshold and can be
+    # corrected by subsequent MISS updates.
 
     # ── Map publishing ────────────────────────────────────────────────────────
     MAP_PUBLISH_RATE = 2.0   # Hz
 
     # ── 360° scan ─────────────────────────────────────────────────────────────
-    SCAN_ANGULAR_VEL = 1.5   # rad/s — ~4 s per 360° in sim
-    SCAN_SETTLE_TIME = 1.0   # seconds to wait (motors settle) after stopping
+    SCAN_ANGULAR_VEL = 1.5   # rad/s  (~4 s per revolution)
+    SCAN_SETTLE_TIME = 1.0   # s — wait after stopping for vibration to die
 
     # ── Frontier selection ────────────────────────────────────────────────────
-    MIN_FRONTIER_SIZE   = 8    # cells — ignore tiny clusters
+    MIN_FRONTIER_SIZE   = 8    # cells — ignore tiny frontier clusters
     FRONTIER_NAV_OFFSET = 0.4  # m — goal set this far in front of centroid
 
     # ── Navigation ────────────────────────────────────────────────────────────
-    NAV_TIMEOUT       = 30.0   # s before giving up on a navigation goal
-    NO_FRONTIER_LIMIT = 3      # consecutive empty scans → COMPLETE
+    NAV_TIMEOUT       = 30.0  # s before giving up on a navigation goal
+    NO_FRONTIER_LIMIT = 3     # consecutive empty scans → declare COMPLETE
 
     # ─────────────────────────────────────────────────────────────────────────
 
     def __init__(self):
         super().__init__('frontier_explorer')
 
-        # Log-odds grid — float32, 0.0 = maximum uncertainty
+        # Persistent log-odds grid (never cleared between scans)
         self.log_odds = np.zeros(
             (self.GRID_SIZE, self.GRID_SIZE), dtype=np.float32)
 
-        # Camera data
-        self.latest_depth: np.ndarray | None = None
-        self.latest_depth_stamp = None   # ROS timestamp of the stored depth frame
-        self.camera_K:     np.ndarray | None = None
-        self.cv_bridge = CvBridge()
+        # Camera state
+        self.latest_depth       = None   # np.ndarray (H×W, uint16, mm)
+        self.latest_depth_stamp = None   # builtin_interfaces/Time
+        self.camera_K           = None   # 3×3 intrinsic matrix
+        self.cv_bridge          = CvBridge()
 
         # State machine
         self.state             = ExploreState.SCANNING
-        self.scan_accumulated  = 0.0    # radians rotated so far this scan
-        self.scan_last_heading = None   # previous heading sample (rad)
-        self.scan_settle_start = None   # time.time() when settle began
+        self.scan_accumulated  = 0.0
+        self.scan_last_heading = None
+        self.scan_settle_start = None
         self.nav_start_time    = None
         self.no_frontier_count = 0
         self.base_goal_reached = False
+        self.last_map_publish  = 0.0
 
-        self.last_map_publish = 0.0
-
-        # TF2
+        # TF
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # Subscribers
-        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
-        self.create_subscription(
-            Image,      '/camera/depth/image_raw',   self._depth_cb,        qos)
-        self.create_subscription(
-            CameraInfo, '/camera/color/camera_info', self._camera_info_cb,  qos)
-        self.create_subscription(
-            Bool,       '/base/goal_reached',        self._goal_reached_cb, 10)
+        # Subscriptions
+        be = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.create_subscription(Image,      '/camera/depth/image_raw',
+                                 self._depth_cb,       be)
+        self.create_subscription(CameraInfo, '/camera/color/camera_info',
+                                 self._camera_info_cb, be)
+        self.create_subscription(Bool, '/base/goal_reached',
+                                 self._goal_reached_cb, 10)
 
         # Publishers
         self.map_pub       = self.create_publisher(OccupancyGrid, '/map',              10)
@@ -164,33 +176,33 @@ class FrontierExplorer(Node):
         self.base_goal_pub = self.create_publisher(Pose2D,        '/base/target_pose', 10)
 
         self.get_logger().info('=' * 55)
-        self.get_logger().info('Frontier Explorer initialised')
+        self.get_logger().info('Frontier Explorer  (persistent map)')
         self.get_logger().info(
-            f'  Grid        : {self.GRID_SIZE}×{self.GRID_SIZE} '
+            f'  Grid   : {self.GRID_SIZE}×{self.GRID_SIZE} '
             f'@ {self.GRID_RESOLUTION} m/cell '
-            f'({self.GRID_SIZE * self.GRID_RESOLUTION:.0f} m²)')
+            f'({self.GRID_SIZE * self.GRID_RESOLUTION:.0f} m × '
+            f'{self.GRID_SIZE * self.GRID_RESOLUTION:.0f} m)')
         self.get_logger().info(
-            f'  Height band : {self.MIN_OBSTACLE_Z}–{self.MAX_OBSTACLE_Z} m '
+            f'  Height : {self.MIN_OBSTACLE_Z}–{self.MAX_OBSTACLE_Z} m '
             f'(floor excluded)')
         self.get_logger().info(
-            f'  Scan speed  : {self.SCAN_ANGULAR_VEL} rad/s '
+            f'  Scan   : {self.SCAN_ANGULAR_VEL} rad/s '
             f'(≈{2*np.pi/self.SCAN_ANGULAR_VEL:.0f} s per 360°)')
         self.get_logger().info('=' * 55)
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
     def _depth_cb(self, msg: Image):
+        """Store the latest depth frame and immediately integrate it."""
         try:
             depth = self.cv_bridge.imgmsg_to_cv2(msg, '16UC1')
         except Exception as e:
             self.get_logger().warn(f'Depth conversion failed: {e}')
             return
-        self.latest_depth = depth
+        self.latest_depth       = depth
         self.latest_depth_stamp = msg.header.stamp
-        # Integrate immediately while the callback is live — "latest" TF is
-        # within ~1 ms of capture here, eliminating smear and frame gaps.
         if self.camera_K is not None:
-            self.update_map()
+            self._integrate_depth()
 
     def _camera_info_cb(self, msg: CameraInfo):
         self.camera_K = np.array(msg.k).reshape(3, 3)
@@ -201,23 +213,23 @@ class FrontierExplorer(Node):
 
     # ── Grid helpers ──────────────────────────────────────────────────────────
 
-    def world_to_grid(self, wx: float, wy: float):
+    def world_to_grid(self, wx, wy):
         gx = int((wx - self.GRID_ORIGIN_X) / self.GRID_RESOLUTION)
         gy = int((wy - self.GRID_ORIGIN_Y) / self.GRID_RESOLUTION)
         return gx, gy
 
-    def grid_to_world(self, gx: int, gy: int):
+    def grid_to_world(self, gx, gy):
         wx = self.GRID_ORIGIN_X + (gx + 0.5) * self.GRID_RESOLUTION
         wy = self.GRID_ORIGIN_Y + (gy + 0.5) * self.GRID_RESOLUTION
         return wx, wy
 
-    def in_grid(self, gx: int, gy: int) -> bool:
+    def in_grid(self, gx, gy):
         return 0 <= gx < self.GRID_SIZE and 0 <= gy < self.GRID_SIZE
 
     # ── Robot pose ────────────────────────────────────────────────────────────
 
     def get_base_pose(self):
-        """Return (x, y, theta) of base_link in odom, or None on failure."""
+        """Return (x, y, theta) of base_link in odom, or None."""
         try:
             tf = self.tf_buffer.lookup_transform(
                 'odom', 'base_link',
@@ -232,31 +244,42 @@ class FrontierExplorer(Node):
         return t.x, t.y, np.arctan2(siny, cosy)
 
     def get_heading(self):
-        """Return current yaw of base_link in odom (radians), or None."""
-        pose = self.get_base_pose()
-        return pose[2] if pose is not None else None
+        p = self.get_base_pose()
+        return p[2] if p is not None else None
 
     # ── Mapping ───────────────────────────────────────────────────────────────
 
-    def update_map(self):
-        """Project the current depth frame into the log-odds occupancy grid.
+    def _integrate_depth(self):
+        """
+        Project the current depth frame into the persistent log-odds grid.
 
-        Uses the depth image's own header.stamp for the TF lookup.  The
-        MuJoCo bridge now broadcasts an odom→base_link TF with the EXACT
-        same timestamp as the depth image (captured inside the render lock),
-        so this lookup returns a transform that corresponds to the precise
-        sim state that was rendered — zero lag, zero smear.
+        Only depth returns whose reprojected world-Z falls in the obstacle
+        height band [MIN_OBSTACLE_Z, MAX_OBSTACLE_Z] are used:
+
+          • HIT  (+0.85) is added to the cell containing the 3-D point.
+          • A free-space ray is traced from the camera origin to that cell
+            (exclusive), applying MISS (−0.40) to every intermediate cell
+            and stopping early if a confirmed obstacle (log_odds ≥ 1.50)
+            is encountered.
+
+        Floor and ceiling returns are completely ignored.  This avoids the
+        3-D→2-D projection artefact where a floor ray visible beside a wall
+        in 3-D produces a 2-D line that crosses the wall's grid footprint
+        and would erroneously mark it as free space.
         """
         if self.latest_depth is None or self.camera_K is None:
             return
 
+        # ── 1. Look up camera pose in odom ───────────────────────────────────
+        # The MuJoCo bridge broadcasts a TF with the exact same timestamp as
+        # the depth image, so this stamped lookup has zero lag.
         try:
             stamp = rclpy.time.Time.from_msg(self.latest_depth_stamp)
             tf = self.tf_buffer.lookup_transform(
                 'odom', 'camera_depth_optical_frame',
                 stamp, timeout=Duration(seconds=0.1))
         except Exception:
-            # Fallback: use latest available TF if stamped lookup fails
+            # Fallback to latest if stamped lookup fails (e.g. on startup)
             try:
                 tf = self.tf_buffer.lookup_transform(
                     'odom', 'camera_depth_optical_frame',
@@ -264,17 +287,18 @@ class FrontierExplorer(Node):
             except Exception:
                 return
 
-        t = tf.transform.translation
-        q = tf.transform.rotation
+        t  = tf.transform.translation
+        q  = tf.transform.rotation
         cam_origin = np.array([t.x, t.y, t.z])
 
         qw, qx, qy, qz = q.w, q.x, q.y, q.z
         R = np.array([
-            [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw), 2*(qx*qz + qy*qw)],
-            [2*(qx*qy + qz*qw),     1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qx*qw)],
-            [2*(qx*qz - qy*qw),     2*(qy*qz + qx*qw), 1 - 2*(qx*qx + qy*qy)],
+            [1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw), 2*(qx*qz+qy*qw)],
+            [2*(qx*qy+qz*qw),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
+            [2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw),   1-2*(qx*qx+qy*qy)],
         ])
 
+        # ── 2. Back-project depth pixels to odom frame ───────────────────────
         fx = self.camera_K[0, 0];  fy = self.camera_K[1, 1]
         cx = self.camera_K[0, 2];  cy = self.camera_K[1, 2]
 
@@ -282,7 +306,6 @@ class FrontierExplorer(Node):
         h, w  = depth.shape
         step  = self.DEPTH_SUBSAMPLE
 
-        # Subsample pixels
         vs, us    = np.mgrid[0:h:step, 0:w:step]
         us        = us.ravel();  vs = vs.ravel()
         depths_mm = depth[vs, us].astype(np.float64)
@@ -290,60 +313,59 @@ class FrontierExplorer(Node):
         min_mm = self.MIN_DEPTH_M * 1000.0
         max_mm = self.MAX_DEPTH_M * 1000.0
         valid  = (depths_mm > min_mm) & (depths_mm < max_mm)
-        us, vs   = us[valid], vs[valid]
+        us     = us[valid];  vs     = vs[valid]
         depths_m = depths_mm[valid] / 1000.0
 
         if len(depths_m) == 0:
             return
 
-        # Back-project to odom frame
         x_cam = (us - cx) * depths_m / fx
         y_cam = (vs - cy) * depths_m / fy
         z_cam = depths_m
         pts_odom = (R @ np.stack([x_cam, y_cam, z_cam], axis=1).T).T + cam_origin
 
+        # ── 3. Compute grid coordinates ───────────────────────────────────────
         gxs = ((pts_odom[:, 0] - self.GRID_ORIGIN_X) / self.GRID_RESOLUTION).astype(int)
         gys = ((pts_odom[:, 1] - self.GRID_ORIGIN_Y) / self.GRID_RESOLUTION).astype(int)
-        in_bounds = ((gxs >= 0) & (gxs < self.GRID_SIZE) &
-                     (gys >= 0) & (gys < self.GRID_SIZE))
 
-        cam_gx, cam_gy = self.world_to_grid(cam_origin[0], cam_origin[1])
-
-        # ── Free-space raytrace for ALL valid returns ─────────────────────────
-        # Floor returns (outside the height band) still contribute free-space
-        # evidence along the ray — this is what prevents the area in front of
-        # the robot from staying UNKNOWN when the camera tilts downward.
-        ray_idx  = np.where(in_bounds)[0]
-        ray_step = max(1, len(ray_idx) // 500)
-        for i in ray_idx[::ray_step]:
-            self._raytrace_free(cam_gx, cam_gy, int(gxs[i]), int(gys[i]))
-
-        # ── OCCUPIED update — height-filtered points only ─────────────────────
+        # ── 4. Height-filter: keep only obstacle-band returns ─────────────────
         obs_mask = (
             (pts_odom[:, 2] > self.MIN_OBSTACLE_Z) &
             (pts_odom[:, 2] < self.MAX_OBSTACLE_Z) &
-            in_bounds
+            (gxs >= 0) & (gxs < self.GRID_SIZE) &
+            (gys >= 0) & (gys < self.GRID_SIZE)
         )
+
+        if not np.any(obs_mask):
+            return
+
+        # ── 5. Free-space raytrace for obstacle returns only ──────────────────
+        # Tracing only to obstacle-band endpoints means we never generate a
+        # ray that originates above a wall and terminates on the floor behind
+        # it — which would clear the wall's grid cells in 2-D even though
+        # the wall genuinely blocks that region.
+        cam_gx, cam_gy = self.world_to_grid(cam_origin[0], cam_origin[1])
+
+        obs_idx  = np.where(obs_mask)[0]
+        ray_step = max(1, len(obs_idx) // 500)   # cap at ~500 rays / frame
+        for i in obs_idx[::ray_step]:
+            self._raytrace_free(cam_gx, cam_gy, int(gxs[i]), int(gys[i]))
+
+        # ── 6. Mark obstacle cells with HIT ───────────────────────────────────
         np.add.at(self.log_odds, (gys[obs_mask], gxs[obs_mask]), self.LOG_ODDS_HIT)
         np.clip(self.log_odds, self.LOG_ODDS_MIN, self.LOG_ODDS_MAX, out=self.log_odds)
 
     def _raytrace_free(self, x0: int, y0: int, x1: int, y1: int):
-        """Bresenham's line: apply LOG_ODDS_MISS to every cell from (x0,y0)
-        up to (but not including) the endpoint (x1,y1).
+        """
+        Bresenham ray from (x0,y0) to (x1,y1) exclusive, applying
+        LOG_ODDS_MISS to each traversed cell.
 
-        The raytrace stops when it hits a cell whose log-odds are already at
-        or above LOG_ODDS_OCC_THRESH (currently 1.50 — requiring two
-        consistent hits to reach).  This prevents a 3-D→2-D projection
-        artefact: a depth point visible beside or below a wall in 3-D can
-        produce a 2-D ray that crosses the wall's grid footprint.  Stopping
-        at a well-established obstacle keeps the occluded cells UNKNOWN
-        rather than erroneously marking them FREE ("see-through" walls).
+        Stops early when a cell's log_odds ≥ LOG_ODDS_OCC_THRESH (i.e. the
+        cell has been confirmed by ≥ 2 independent hits).  This preserves
+        established obstacles from being eroded by later free-space rays
+        that cross their 2-D footprint due to projection geometry.
 
-        Because LOG_ODDS_OCC_THRESH is now 1.50 (vs the old 0.50), a
-        single-frame TF error only raises a cell to 0.85 — still below the
-        threshold — so those borderline cells are still correctable by
-        subsequent MISS updates.  Only cells that have been confirmed by two
-        or more independent observations trigger the early stop.
+        Cells below OCC_THRESH (< 2 hits) are still correctable.
         """
         dx = abs(x1 - x0);  sx = 1 if x0 < x1 else -1
         dy = abs(y1 - y0);  sy = 1 if y0 < y1 else -1
@@ -353,7 +375,7 @@ class FrontierExplorer(Node):
         while not (x == x1 and y == y1):
             if self.in_grid(x, y):
                 if self.log_odds[y, x] >= self.LOG_ODDS_OCC_THRESH:
-                    break   # confirmed obstacle — stop, don't clear behind it
+                    break   # confirmed obstacle — preserve it
                 self.log_odds[y, x] = max(
                     self.LOG_ODDS_MIN,
                     self.log_odds[y, x] + self.LOG_ODDS_MISS)
@@ -366,31 +388,27 @@ class FrontierExplorer(Node):
     # ── Frontier detection ────────────────────────────────────────────────────
 
     def find_frontiers(self):
-        """Identify frontier clusters and rank them by information gain.
+        """
+        Return frontier clusters sorted by score (size / distance).
 
-        A frontier cell is a FREE cell (log-odds ≤ FREE_THRESH) that has at
-        least one UNKNOWN neighbour (log-odds between the two thresholds).
-        Clusters are connected components of frontier cells (8-connected).
-
-        Returns:
-            List of (wx, wy, cluster_size, score) sorted by score descending.
-            score = cluster_size / distance_to_robot
+        A frontier cell is FREE (log_odds ≤ FREE_THRESH) and 4-adjacent to
+        at least one UNKNOWN cell (FREE_THRESH < log_odds < OCC_THRESH).
+        Connected components (8-connected) smaller than MIN_FRONTIER_SIZE
+        are discarded.
         """
         free_mask    = self.log_odds <= self.LOG_ODDS_FREE_THRESH
-        unknown_mask = ((self.log_odds > self.LOG_ODDS_FREE_THRESH) &
-                        (self.log_odds < self.LOG_ODDS_OCC_THRESH))
+        unknown_mask = ((self.log_odds >  self.LOG_ODDS_FREE_THRESH) &
+                        (self.log_odds <  self.LOG_ODDS_OCC_THRESH))
 
-        # Frontier = FREE cell adjacent (4-connected) to UNKNOWN
         frontier_mask = np.zeros_like(self.log_odds, dtype=bool)
         for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            shifted = np.roll(np.roll(unknown_mask, dy, axis=0), dx, axis=1)
-            frontier_mask |= (free_mask & shifted)
+            frontier_mask |= (free_mask &
+                              np.roll(np.roll(unknown_mask, dy, axis=0), dx, axis=1))
 
         fys, fxs = np.where(frontier_mask)
         if len(fxs) == 0:
             return []
 
-        # BFS clustering (8-connected so diagonal frontier strips merge)
         frontier_set = set(zip(fxs.tolist(), fys.tolist()))
         visited      = set()
         clusters     = []
@@ -423,11 +441,11 @@ class FrontierExplorer(Node):
 
         results = []
         for cluster in clusters:
-            mean_gx = np.mean([c[0] for c in cluster])
-            mean_gy = np.mean([c[1] for c in cluster])
-            wx, wy  = self.grid_to_world(int(mean_gx), int(mean_gy))
-            dist    = np.hypot(wx - bx, wy - by)
-            score   = len(cluster) / max(dist, 0.5)
+            mgx = np.mean([c[0] for c in cluster])
+            mgy = np.mean([c[1] for c in cluster])
+            wx, wy = self.grid_to_world(int(mgx), int(mgy))
+            dist   = np.hypot(wx - bx, wy - by)
+            score  = len(cluster) / max(dist, 0.5)
             results.append((wx, wy, len(cluster), score))
 
         results.sort(key=lambda r: r[3], reverse=True)
@@ -436,12 +454,10 @@ class FrontierExplorer(Node):
     # ── Publishing ────────────────────────────────────────────────────────────
 
     def publish_map(self):
-        """Threshold log-odds → ROS occupancy values and publish both topics."""
         grid = np.full((self.GRID_SIZE, self.GRID_SIZE), -1, dtype=np.int8)
         grid[self.log_odds <= self.LOG_ODDS_FREE_THRESH] = 0
         grid[self.log_odds >= self.LOG_ODDS_OCC_THRESH]  = 100
 
-        # OccupancyGrid
         msg = OccupancyGrid()
         msg.header.stamp              = self.get_clock().now().to_msg()
         msg.header.frame_id           = 'odom'
@@ -456,7 +472,7 @@ class FrontierExplorer(Node):
         msg.data = grid.ravel().tolist()
         self.map_pub.publish(msg)
 
-        # RGB debug image  (gray=unknown, white=free, black=occupied)
+        # RGB debug image: gray=unknown, white=free, black=occupied
         img = np.full((self.GRID_SIZE, self.GRID_SIZE, 3), 128, dtype=np.uint8)
         img[grid == 0]   = [255, 255, 255]
         img[grid == 100] = [  0,   0,   0]
@@ -466,7 +482,6 @@ class FrontierExplorer(Node):
         self.map_image_pub.publish(img_msg)
 
     def publish_frontiers(self, frontiers):
-        """Visualise frontier centroids as green cylinders in RViz."""
         ma = MarkerArray()
         for i, (wx, wy, size, score) in enumerate(frontiers):
             m = Marker()
@@ -487,19 +502,10 @@ class FrontierExplorer(Node):
             ma.markers.append(m)
         self.frontier_pub.publish(ma)
 
-    # ── State machine helpers ─────────────────────────────────────────────────
+    # ── State machine ─────────────────────────────────────────────────────────
 
     def _start_scan(self):
-        """Reset rotation state and enter SCANNING.
-
-        The log-odds grid is cleared each time so that map evidence
-        accumulated while the robot was stationary (e.g. during sensor
-        initialisation or navigation) does not pre-bias the fresh 360° scan.
-        Without this reset, cells near the starting pose accumulate very
-        high log-odds and take many MISS frames to clear, producing the
-        characteristic smear at the beginning of each scan.
-        """
-        self.log_odds[:] = 0.0          # clear stale evidence
+        """Reset rotation counters and enter SCANNING state."""
         self.scan_accumulated  = 0.0
         self.scan_last_heading = None
         self.scan_settle_start = None
@@ -507,65 +513,51 @@ class FrontierExplorer(Node):
         self.get_logger().info('[SCAN] Starting 360° rotation scan...')
 
     def _stop_base(self):
-        """Publish zero velocity to halt the base."""
         self.cmd_vel_pub.publish(Twist())
 
-    # ── States ────────────────────────────────────────────────────────────────
-
     def _state_scanning(self):
-        """Rotate 360° in place while the map update runs every loop tick."""
-
-        # ── Settle phase: motors stopped, waiting for vibration to die down ──
         if self.scan_settle_start is not None:
             if time.time() - self.scan_settle_start >= self.SCAN_SETTLE_TIME:
-                self.get_logger().info('[SCAN] Settled. Selecting frontier...')
+                self.get_logger().info('[SCAN] Settled — selecting frontier.')
                 self.state = ExploreState.SELECTING
-            return   # don't spin during settle
+            return
 
-        # ── Track accumulated rotation via TF heading ─────────────────────────
         heading = self.get_heading()
         if heading is None:
             return
 
         if self.scan_last_heading is not None:
-            delta = heading - self.scan_last_heading
-            # Wrap to [-π, π] to handle the ±π discontinuity cleanly
-            delta = (delta + np.pi) % (2 * np.pi) - np.pi
+            delta = (heading - self.scan_last_heading + np.pi) % (2*np.pi) - np.pi
             self.scan_accumulated += abs(delta)
 
         self.scan_last_heading = heading
 
         if self.scan_accumulated >= 2 * np.pi:
-            # Full revolution done — stop and settle
             self._stop_base()
             self.scan_settle_start = time.time()
             self.get_logger().info(
-                f'[SCAN] 360° complete '
+                f'[SCAN] 360° done '
                 f'({np.degrees(self.scan_accumulated):.0f}° accumulated). '
-                f'Settling for {self.SCAN_SETTLE_TIME} s...')
+                f'Settling {self.SCAN_SETTLE_TIME} s...')
         else:
-            # Keep rotating
             cmd = Twist()
             cmd.angular.z = self.SCAN_ANGULAR_VEL
             self.cmd_vel_pub.publish(cmd)
 
     def _state_selecting(self):
-        """Find the best frontier and send a navigation goal."""
         frontiers = self.find_frontiers()
         self.publish_frontiers(frontiers)
 
         if not frontiers:
             self.no_frontier_count += 1
             if self.no_frontier_count >= self.NO_FRONTIER_LIMIT:
-                self.get_logger().info(
-                    f'[SELECT] No frontiers after {self.NO_FRONTIER_LIMIT} '
-                    f'attempts — exploration complete!')
+                self.get_logger().info('[SELECT] Exploration complete.')
                 self.state = ExploreState.COMPLETE
             else:
                 self.get_logger().info(
                     f'[SELECT] No frontiers '
-                    f'(attempt {self.no_frontier_count}/{self.NO_FRONTIER_LIMIT})'
-                    f' — re-scanning.')
+                    f'({self.no_frontier_count}/{self.NO_FRONTIER_LIMIT}) '
+                    f'— re-scanning.')
                 self._start_scan()
             return
 
@@ -575,15 +567,13 @@ class FrontierExplorer(Node):
             f'[SELECT] Best frontier ({wx:.2f}, {wy:.2f}) '
             f'size={size} score={score:.1f}')
 
-        # Set goal slightly in front of the frontier centroid (toward the robot)
-        # so we stop in free space rather than inside an unknown region.
         base_pose = self.get_base_pose()
         if base_pose is None:
             self._start_scan()
             return
         bx, by, _ = base_pose
-        dx, dy    = wx - bx, wy - by
-        dist      = np.hypot(dx, dy)
+        dx, dy = wx - bx, wy - by
+        dist   = np.hypot(dx, dy)
 
         if dist > self.FRONTIER_NAV_OFFSET * 2:
             ratio  = (dist - self.FRONTIER_NAV_OFFSET) / dist
@@ -592,12 +582,11 @@ class FrontierExplorer(Node):
         else:
             goal_x, goal_y = wx, wy
 
-        # Face the frontier; subtract π/2 for the bridge's frame convention
         goal_theta = np.arctan2(dy, dx)
-        user_theta = goal_theta - np.pi / 2
+        user_theta = goal_theta - np.pi / 2   # bridge frame convention
 
         self.get_logger().info(
-            f'[SELECT] Navigating to ({goal_x:.2f}, {goal_y:.2f}) '
+            f'[SELECT] Goal ({goal_x:.2f}, {goal_y:.2f}) '
             f'heading={np.degrees(goal_theta):.0f}°')
 
         goal = Pose2D()
@@ -608,37 +597,29 @@ class FrontierExplorer(Node):
         self.state = ExploreState.NAVIGATING
 
     def _state_navigating(self):
-        """Wait for the base to reach the goal, then re-scan."""
         if self.base_goal_reached:
             self.get_logger().info('[NAV] Goal reached — starting scan.')
             self._start_scan()
             return
-
-        elapsed = time.time() - self.nav_start_time
-        if elapsed > self.NAV_TIMEOUT:
-            self.get_logger().warn(
-                f'[NAV] Timeout after {self.NAV_TIMEOUT:.0f} s — '
-                'scanning from current position.')
+        if time.time() - self.nav_start_time > self.NAV_TIMEOUT:
+            self.get_logger().warn('[NAV] Timeout — scanning from here.')
             self._start_scan()
 
     def _state_complete(self):
-        """Print exploration summary and keep the map alive in RViz."""
         self._stop_base()
         self.publish_map()
 
         free     = int(np.sum(self.log_odds <= self.LOG_ODDS_FREE_THRESH))
         occupied = int(np.sum(self.log_odds >= self.LOG_ODDS_OCC_THRESH))
         total    = self.GRID_SIZE ** 2
-        coverage = (free + occupied) / total * 100
 
         self.get_logger().info('=' * 55)
         self.get_logger().info('EXPLORATION COMPLETE')
-        self.get_logger().info(f'  Coverage : {coverage:.1f}%')
+        self.get_logger().info(f'  Coverage : {(free+occupied)/total*100:.1f}%')
         self.get_logger().info(f'  Free     : {free}')
         self.get_logger().info(f'  Occupied : {occupied}')
         self.get_logger().info(f'  Unknown  : {total - free - occupied}')
         self.get_logger().info('=' * 55)
-        self.get_logger().info('Map live — Ctrl+C to stop.')
 
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=1.0)
@@ -647,7 +628,6 @@ class FrontierExplorer(Node):
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run(self):
-        """Block until sensors are ready, then run the exploration loop."""
         self.get_logger().info('Waiting for depth data and TF...')
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.1)
@@ -666,14 +646,11 @@ class FrontierExplorer(Node):
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.05)
 
-            # Map updates are driven by _depth_cb — nothing to do here.
-
             now = time.time()
             if now - self.last_map_publish >= 1.0 / self.MAP_PUBLISH_RATE:
                 self.publish_map()
                 self.last_map_publish = now
 
-            # Advance state machine
             if   self.state == ExploreState.SCANNING:
                 self._state_scanning()
             elif self.state == ExploreState.SELECTING:
