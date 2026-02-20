@@ -71,6 +71,8 @@ parser.add_argument('--remove_plane', action='store_true', default=True,
                     help='Remove dominant plane (ground/table) via RANSAC')
 parser.add_argument('--no_remove_plane', action='store_true',
                     help='Disable ground plane removal')
+parser.add_argument('--align-rgb', action='store_true',
+                    help='Align RGB to depth frame using real D435 intrinsics (preserves depth)')
 args = parser.parse_args()
 if args.no_remove_plane:
     args.remove_plane = False
@@ -205,6 +207,31 @@ meta = scio.loadmat(os.path.join(args.data_dir, 'meta.mat'))
 
 intrinsic = meta['intrinsic_matrix']
 factor_depth = meta['factor_depth']
+
+# ── Align RGB to depth frame if using real D435 images ───────────────────
+if args.align_rgb:
+    step('2a — Align RGB to depth frame (real D435)')
+    align_dir = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        '..', 'utilities'))
+    if align_dir not in sys.path:
+        sys.path.insert(0, align_dir)
+    from align_rgb_to_depth import align_rgb as _align_rgb, D435_DEPTH_K
+
+    color_uint8 = (color * 255).astype(np.uint8)
+    color_aligned = _align_rgb(color_uint8, depth)
+    color = color_aligned.astype(np.float32) / 255.0
+    print(f'  Warped RGB to depth intrinsics (depth untouched)')
+
+    # Override intrinsic matrix to depth camera K since we now work
+    # entirely in the depth camera frame
+    dfx, dfy, dcx, dcy = D435_DEPTH_K
+    intrinsic = np.array([
+        [dfx, 0.0, dcx],
+        [0.0, dfy, dcy],
+        [0.0, 0.0, 1.0],
+    ])
+    print(f'  Overriding intrinsics to depth K:\n{intrinsic}')
 
 print(f'  color shape:          {color.shape}, dtype={color.dtype}')
 print(f'  depth shape:          {depth.shape}, dtype={depth.dtype}')
