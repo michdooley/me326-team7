@@ -96,7 +96,7 @@ class FrontierExplorer(Node):
     # ── Depth filtering ───────────────────────────────────────────────────────
     MIN_DEPTH_M       = 0.30   # ignore returns closer than this (robot body)
     MAX_DEPTH_M       = 5.00   # ignore returns farther  than this
-    DEPTH_SUBSAMPLE   = 4      # process every Nth pixel (speed vs. quality)
+    DEPTH_SUBSAMPLE   = 8      # process every Nth pixel (speed vs. quality)
     ROBOT_BODY_RADIUS = 0.60   # m — XY radius around camera to exclude self-hits
     FREE_TRACE_MAX_M  = 3.00   # m — max free-ray length for floor/ceiling returns
 
@@ -126,7 +126,7 @@ class FrontierExplorer(Node):
     MIN_HIT_COUNT     = 2               # distinct-angle hits to confirm obstacle
 
     # ── Map publishing ────────────────────────────────────────────────────────
-    MAP_PUBLISH_RATE = 2.0   # Hz
+    MAP_PUBLISH_RATE = 1.0   # Hz
 
     # ── 360° scan ─────────────────────────────────────────────────────────────
     SCAN_ANGULAR_VEL = 0.8   # rad/s  (~8 s per revolution, slower = less TF lag error)
@@ -134,7 +134,7 @@ class FrontierExplorer(Node):
 
     # ── Frontier selection ────────────────────────────────────────────────────
     MIN_FRONTIER_SIZE   = 8    # cells — ignore tiny frontier clusters
-    MIN_FRONTIER_DIST   = 1.5  # m — ignore frontiers closer than this to the robot
+    MIN_FRONTIER_DIST   = 1.0  # m — ignore frontiers closer than this to the robot
     ROBOT_CLEARANCE     = 0.45 # m — min clearance from obstacles for goals/centroids
     FRONTIER_NAV_OFFSET = 0.4  # m — goal set this far in front of centroid
 
@@ -433,7 +433,7 @@ class FrontierExplorer(Node):
 
         # ── 5a. Free-space raytrace: obstacle returns ─────────────────────────
         if len(obs_idx) > 0:
-            ray_step = max(1, len(obs_idx) // 500)
+            ray_step = max(1, len(obs_idx) // 200)
             for i in obs_idx[::ray_step]:
                 self._raytrace_free(cam_gx, cam_gy, int(gxs[i]), int(gys[i]))
 
@@ -442,7 +442,7 @@ class FrontierExplorer(Node):
         # return was seen (e.g. the robot faces an open corridor).  They do NOT
         # add any HIT, so they cannot create false obstacles.
         if len(floor_idx) > 0:
-            ray_step2 = max(1, len(floor_idx) // 300)
+            ray_step2 = max(1, len(floor_idx) // 100)
             for i in floor_idx[::ray_step2]:
                 self._raytrace_free(cam_gx, cam_gy, int(gxs[i]), int(gys[i]))
 
