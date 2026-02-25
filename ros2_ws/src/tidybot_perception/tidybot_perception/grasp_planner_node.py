@@ -69,8 +69,12 @@ import tf2_ros
 import tf2_geometry_msgs  # noqa: F401
 
 from geometry_msgs.msg import Pose, PoseStamped, PointStamped
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, PointCloud2, PointField
+from visualization_msgs.msg import Marker, MarkerArray
+from std_msgs.msg import ColorRGBA, Header
 from tidybot_msgs.srv import PlanGrasp, PlanToTarget
+import struct
+import math
 
 from .coord_converter import CoordConverter
 
@@ -92,6 +96,7 @@ class GraspPlannerNode(Node):
         self.declare_parameter('max_depth', 1.50)
         self.declare_parameter('remove_plane', True)
         self.declare_parameter('plane_distance_threshold', 0.01)
+        self.declare_parameter('sim', True)  # True = use sim depth intrinsics (fovy=57°)
 
         self.model_path = self.get_parameter('model_path').value
         self.approach_offset = self.get_parameter('approach_offset').value
@@ -103,6 +108,7 @@ class GraspPlannerNode(Node):
         self.max_depth = self.get_parameter('max_depth').value
         self.remove_plane = self.get_parameter('remove_plane').value
         self.plane_distance_threshold = self.get_parameter('plane_distance_threshold').value
+        self._sim = self.get_parameter('sim').value
 
         # ── TF2 ──────────────────────────────────────────────────────────
         self.tf_buffer = tf2_ros.Buffer()
@@ -125,6 +131,14 @@ class GraspPlannerNode(Node):
         self.camera_info_sub = self.create_subscription(
             CameraInfo, '/camera/color/camera_info', self._camera_info_cb, 10
         )
+
+        # ── RViz debug publishers ─────────────────────────────────────────
+        self._cloud_pub = self.create_publisher(
+            PointCloud2, '/grasp_debug/cloud', 10)
+        self._obj_marker_pub = self.create_publisher(
+            Marker, '/grasp_debug/object_marker', 10)
+        self._grasp_marker_pub = self.create_publisher(
+            MarkerArray, '/grasp_debug/grasp_markers', 10)
 
         # ── Service: /plan_grasp ──────────────────────────────────────────
         self.grasp_srv = self.create_service(
@@ -257,13 +271,25 @@ class GraspPlannerNode(Node):
         depth_m = depth_raw.astype(np.float32) / 1000.0
 
         ci = self._camera_info
-        fx, fy = ci.k[0], ci.k[4]
-        cx, cy = ci.k[2], ci.k[5]
+        h, w = depth_m.shape[:2]
+
+        if self._sim:
+            # Sim: depth camera has fovy=57°, different from RGB (fovy=42°)
+            depth_fovy_rad = math.radians(57.0)
+            fx = fy = float(h) / (2.0 * math.tan(depth_fovy_rad / 2.0))
+            cx, cy = float(w) / 2.0, float(h) / 2.0
+            self.get_logger().info(
+                f'Sim depth intrinsics: fx={fx:.1f}, fy={fy:.1f}, '
+                f'cx={cx:.1f}, cy={cy:.1f}  (fovy=57°, {w}x{h})')
+        else:
+            # Real D435: depth is hardware-aligned to RGB, so RGB intrinsics are correct
+            fx, fy = ci.k[0], ci.k[4]
+            cx, cy = ci.k[2], ci.k[5]
 
         # ── 3. Build full-scene point cloud ───────────────────────────────
         graspnet_cam = GraspNetCameraInfo(
-            width=float(depth_m.shape[1]),
-            height=float(depth_m.shape[0]),
+            width=float(w),
+            height=float(h),
             fx=fx, fy=fy, cx=cx, cy=cy,
             scale=1.0,  # depth_m is already in metres
         )
@@ -301,6 +327,10 @@ class GraspPlannerNode(Node):
             f'[{self.min_depth:.2f}, {self.max_depth:.2f}]m, '
             f'{len(cloud_masked)} in crop radius {self.crop_radius:.2f}m'
         )
+
+        # Publish debug cloud + object marker to RViz
+        self._publish_debug_cloud(cloud_masked, CoordConverter.CAMERA_OPTICAL_FRAME)
+        self._publish_object_marker(obj_in_camera)
 
         if len(cloud_masked) < 100:
             response.success = False
@@ -480,6 +510,10 @@ class GraspPlannerNode(Node):
         #             'debugging; consider running with a different crop_radius.'
         #         )
 
+        # ── Publish grasp markers to RViz ──────────────────────────────────
+        self._publish_grasp_markers(
+            grasp_pose_base, pre_grasp_pose_base, 'base_link')
+
         # ── 12. Fill response ──────────────────────────────────────────────
         response.success = True
         response.grasp_pose = grasp_pose_base
@@ -510,6 +544,66 @@ class GraspPlannerNode(Node):
         except Exception as exc:
             self.get_logger().error(f'TF transform to camera failed: {exc}')
             return None
+
+    def _publish_debug_cloud(self, cloud: np.ndarray, frame_id: str) -> None:
+        """Publish a (N,3) float32 point cloud as PointCloud2."""
+        cloud = cloud.astype(np.float32)
+        n = len(cloud)
+        msg = PointCloud2()
+        msg.header = Header(frame_id=frame_id, stamp=self.get_clock().now().to_msg())
+        msg.height = 1
+        msg.width = n
+        msg.fields = [
+            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+        ]
+        msg.is_bigendian = False
+        msg.point_step = 12
+        msg.row_step = 12 * n
+        msg.is_dense = True
+        msg.data = cloud.tobytes()
+        self._cloud_pub.publish(msg)
+
+    def _publish_object_marker(self, point: PointStamped) -> None:
+        """Publish a sphere marker at the object position."""
+        m = Marker()
+        m.header = point.header
+        m.ns = 'object'
+        m.id = 0
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+        m.pose.position = point.point
+        m.pose.orientation.w = 1.0
+        m.scale.x = m.scale.y = m.scale.z = 0.04
+        m.color = ColorRGBA(r=1.0, g=0.2, b=0.2, a=0.9)
+        m.lifetime.sec = 30
+        self._obj_marker_pub.publish(m)
+
+    def _publish_grasp_markers(
+        self, grasp_pose: Pose, pre_grasp_pose: Pose, frame_id: str
+    ) -> None:
+        """Publish arrow markers for grasp (green) and pre-grasp (blue)."""
+        now = self.get_clock().now().to_msg()
+        arr = MarkerArray()
+        for i, (pose, color, label) in enumerate([
+            (grasp_pose, ColorRGBA(r=0.0, g=0.8, b=0.0, a=0.9), 'grasp'),
+            (pre_grasp_pose, ColorRGBA(r=0.0, g=0.4, b=1.0, a=0.9), 'pre_grasp'),
+        ]):
+            m = Marker()
+            m.header = Header(frame_id=frame_id, stamp=now)
+            m.ns = label
+            m.id = i
+            m.type = Marker.ARROW
+            m.action = Marker.ADD
+            m.pose = pose
+            m.scale.x = 0.06  # arrow length
+            m.scale.y = 0.015  # shaft diameter
+            m.scale.z = 0.02  # head diameter
+            m.color = color
+            m.lifetime.sec = 30
+            arr.markers.append(m)
+        self._grasp_marker_pub.publish(arr)
 
     def _check_reachable(self, arm: str, pose: Pose) -> bool:
         """Call /plan_to_target with execute=False to test reachability."""

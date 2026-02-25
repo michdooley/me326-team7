@@ -30,6 +30,7 @@ Usage:
     # or: ros2 run tidybot_bringup grasp_demo.py --ros-args -p object:=orange
 """
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -43,7 +44,8 @@ import tf2_ros
 import tf2_geometry_msgs  # noqa: F401 — registers PoseStamped/Point TF support
 
 from geometry_msgs.msg import Pose, PointStamped
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, ColorRGBA, Header
+from visualization_msgs.msg import Marker
 from tidybot_msgs.msg import GripperCommand
 from tidybot_msgs.srv import PlanGrasp, PlanToTarget
 
@@ -53,8 +55,8 @@ from camera_scanner import CameraScanner, Detection
 # coord_converter is part of the tidybot_perception Python package
 from tidybot_perception.coord_converter import CoordConverter
 
-# RGB-to-depth alignment utility (lives in ../utilities/)
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'utilities'))
+# RGB-to-depth alignment utility — installed alongside this script in utilities/
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'utilities'))
 from align_rgb_to_depth import align_rgb, D435_DEPTH_K  # noqa: E402
 
 from ultralytics import YOLO  # noqa: E402
@@ -92,12 +94,14 @@ class GraspDemo(Node):
         self.declare_parameter('lift_height', 0.15)    # metres to lift after grasp
         self.declare_parameter('grasp_duration', 2.0)  # seconds per arm move
         self.declare_parameter('use_graspnet', True)   # False = fallback top-down
+        self.declare_parameter('sim', True)             # True = skip RGB-depth alignment
 
         self._object         = self.get_parameter('object').value
         self._arm            = self.get_parameter('arm').value
         self._lift_height    = self.get_parameter('lift_height').value
         self._grasp_duration = self.get_parameter('grasp_duration').value
         self._use_graspnet   = self.get_parameter('use_graspnet').value
+        self._sim            = self.get_parameter('sim').value
 
         # ── YOLO model (loaded once) ─────────────────────────────────
         self._yolo = YOLO('yolov8n.pt')
@@ -119,6 +123,10 @@ class GraspDemo(Node):
             GripperCommand, '/left_gripper/command', 10
         )
 
+        # ── RViz debug publisher ──────────────────────────────────────────
+        self._detection_marker_pub = self.create_publisher(
+            Marker, '/grasp_debug/detection', 10)
+
         # ── Camera scanner helper ────────────────────────────────────────
         self._scanner = CameraScanner(self)
 
@@ -128,6 +136,7 @@ class GraspDemo(Node):
         self.get_logger().info('=' * 55)
         self.get_logger().info(f'  Target object : {self._object}')
         self.get_logger().info(f'  Arm           : {self._arm}')
+        self.get_logger().info(f'  Sim mode      : {self._sim}')
         self.get_logger().info(f'  Use GraspNet  : {self._use_graspnet}')
         self.get_logger().info('')
 
@@ -290,14 +299,55 @@ class GraspDemo(Node):
             self.get_logger().error('Missing RGB/depth/camera_info after settling')
             return None
 
-        # Extract RGB intrinsics from camera_info
-        rgb_K = (ci.k[0], ci.k[4], ci.k[2], ci.k[5])  # (fx, fy, cx, cy)
+        import cv2 as _cv2
 
-        # Align RGB to depth frame so YOLO pixel coords map to depth pixels
-        aligned = align_rgb(rgb, depth, rgb_K=rgb_K, depth_K=D435_DEPTH_K)
+        if self._sim:
+            # Sim: skip alignment — RGB and depth share the same virtual camera
+            yolo_input = _cv2.cvtColor(rgb, _cv2.COLOR_RGB2BGR)
+        else:
+            # Real D435: align RGB into depth camera frame
+            rgb_K = (ci.k[0], ci.k[4], ci.k[2], ci.k[5])
+            aligned = align_rgb(rgb, depth, rgb_K=rgb_K, depth_K=D435_DEPTH_K)
+            yolo_input = _cv2.cvtColor(aligned, _cv2.COLOR_RGB2BGR)
 
-        # Run YOLO on the aligned image
-        results = self._yolo(aligned, conf=0.5, verbose=False)
+        # Save debug images + GraspNet-compatible capture to /tmp/grasp_capture/
+        _cv2.imwrite('/tmp/grasp_debug_yolo_input.png', yolo_input)
+        capture_dir = '/tmp/grasp_capture'
+        os.makedirs(capture_dir, exist_ok=True)
+        _cv2.imwrite(f'{capture_dir}/color.png', _cv2.cvtColor(rgb, _cv2.COLOR_RGB2BGR))
+        _cv2.imwrite(f'{capture_dir}/depth.png', depth)
+        # Workspace mask: all white (use full image)
+        _cv2.imwrite(f'{capture_dir}/workspace_mask.png',
+                     np.ones(depth.shape[:2], dtype=np.uint8) * 255)
+        # meta.mat with intrinsics + factor_depth
+        import scipy.io as _sio
+        K = np.array([[ci.k[0], ci.k[1], ci.k[2]],
+                      [ci.k[3], ci.k[4], ci.k[5]],
+                      [ci.k[6], ci.k[7], ci.k[8]]])
+        _sio.savemat(f'{capture_dir}/meta.mat', {
+            'intrinsic_matrix': K,
+            'factor_depth': np.array([[1000.0]]),  # depth is uint16 mm
+        })
+        self.get_logger().info(f'GraspNet capture saved to {capture_dir}/')
+
+        # Run YOLO
+        results = self._yolo(yolo_input, conf=0.25, verbose=False)
+
+        # Log ALL detections for debugging
+        all_dets = []
+        for r in results:
+            for box in r.boxes:
+                cls_id = int(box.cls[0])
+                cls_name = r.names[cls_id]
+                conf = float(box.conf[0])
+                all_dets.append(f'{cls_name}({cls_id}):{conf:.2f}')
+        self.get_logger().info(f'YOLO detections: {all_dets if all_dets else "NONE"}')
+
+        # Also save YOLO-annotated image
+        if results:
+            annotated = results[0].plot()
+            _cv2.imwrite('/tmp/grasp_debug_yolo.png', annotated)
+            self.get_logger().info('YOLO annotated image: /tmp/grasp_debug_yolo.png')
 
         # Find target object by COCO class name
         best_det = None
@@ -353,8 +403,16 @@ class GraspDemo(Node):
             return
 
         # ── 2. Back-project detection pixel → 3D point in camera frame ───
-        # Detection is in the depth-aligned frame, so use depth intrinsics
-        fx, fy, cx_px, cy_px = D435_DEPTH_K
+        ci = det.camera_info
+        if self._sim:
+            # Sim: YOLO ran on raw RGB, use camera_info (RGB) intrinsics
+            fx, fy    = ci.k[0], ci.k[4]
+            cx_px, cy_px = ci.k[2], ci.k[5]
+            cam_frame = 'camera_color_optical_frame'
+        else:
+            # Real: YOLO ran on depth-aligned image, use D435 depth intrinsics
+            fx, fy, cx_px, cy_px = D435_DEPTH_K
+            cam_frame = 'camera_depth_optical_frame'
 
         # Sample a small patch around centroid for a stable depth reading
         u, v  = det.pixel_cx, det.pixel_cy
@@ -375,18 +433,31 @@ class GraspDemo(Node):
             u, v, depth_m, fx, fy, cx_px, cy_px
         )
         self.get_logger().info(
-            f'Object in camera frame: '
-            f'({xyz_cam[0]:.3f}, {xyz_cam[1]:.3f}, {xyz_cam[2]:.3f}) m'
+            f'Object in {cam_frame}: '
+            f'({xyz_cam[0]:.3f}, {xyz_cam[1]:.3f}, {xyz_cam[2]:.3f}) m  '
+            f'[fx={fx:.1f}, fy={fy:.1f}]'
         )
 
-        # Build PointStamped in camera_depth_optical_frame
-        # (detection pixels are in depth-aligned space after align_rgb)
         obj_cam = PointStamped()
-        obj_cam.header.frame_id = 'camera_depth_optical_frame'
+        obj_cam.header.frame_id = cam_frame
         obj_cam.header.stamp    = self.get_clock().now().to_msg()
         obj_cam.point.x = float(xyz_cam[0])
         obj_cam.point.y = float(xyz_cam[1])
         obj_cam.point.z = float(xyz_cam[2])
+
+        # ── Publish detection marker to RViz ──────────────────────────────
+        m = Marker()
+        m.header = obj_cam.header
+        m.ns = 'detection'
+        m.id = 0
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+        m.pose.position = obj_cam.point
+        m.pose.orientation.w = 1.0
+        m.scale.x = m.scale.y = m.scale.z = 0.04
+        m.color = ColorRGBA(r=0.2, g=1.0, b=0.2, a=0.9)
+        m.lifetime.sec = 30
+        self._detection_marker_pub.publish(m)
 
         # ── 3. Plan grasp (GraspNet or fallback) ─────────────────────────
         graspnet_succeeded = False
