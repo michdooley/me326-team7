@@ -517,6 +517,14 @@ class MuJoCoBridgeNode(Node):
             if 'joint_th' in self.actuator_ids:
                 self.target_ctrl[self.actuator_ids['joint_th']] = self.base_th
 
+            # Adopt viewer GUI slider changes for pan/tilt (for sim debugging).
+            # If data.ctrl differs from what we last wrote, the GUI moved it.
+            for name in ('camera_pan', 'camera_tilt'):
+                if name in self.actuator_ids:
+                    idx = self.actuator_ids[name]
+                    if self.data.ctrl[idx] != self.target_ctrl[idx]:
+                        self.target_ctrl[idx] = self.data.ctrl[idx]
+
             # Apply control targets
             self.data.ctrl[:] = self.target_ctrl
 
