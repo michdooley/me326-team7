@@ -7,9 +7,12 @@ Orchestrates the full object retrieval task:
     VERIFY_GRASP → RETURN → DONE
 
 Uses NavigateToObject for search/approach, the external classifier node
-(/objbbox) for YOLO detections, and /plan_to_target for arm motion planning.
+(/objbbox) for YOLO detections, /plan_grasp (GraspNet) for 6-DOF grasp
+planning (with top-down fallback), and /plan_to_target for arm motion planning.
 
-Requires: ros2 run object_classification classifier
+Requires:
+    ros2 run object_classification classifier
+    ros2 run tidybot_perception grasp_planner_node  (optional, for GraspNet)
 
 VERIFY_GRASP sub-steps:
     1. PRESENT_ARM  — Move grasping arm to a pose visible to the camera
@@ -46,10 +49,10 @@ from enum import Enum, auto
 
 import tf2_ros
 
-from geometry_msgs.msg import Pose, Twist, Quaternion, Point
+from geometry_msgs.msg import Pose, Twist, Quaternion, Point, PointStamped
 from std_msgs.msg import Float64MultiArray
 from tidybot_msgs.msg import ArmCommand
-from tidybot_msgs.srv import PlanToTarget
+from tidybot_msgs.srv import PlanGrasp, PlanToTarget
 
 from sensor_msgs.msg import Image, CameraInfo
 from vision_msgs.msg import Detection2DArray
@@ -186,9 +189,11 @@ class Task1Retrieve(Node):
         self.pan_tilt_pub = self.create_publisher(
             Float64MultiArray, '/camera/pan_tilt_cmd', 10)
 
-        # ── Service client ──
+        # ── Service clients ──
         self.plan_to_target_client = self.create_client(
             PlanToTarget, '/plan_to_target')
+        self.plan_grasp_client = self.create_client(
+            PlanGrasp, '/plan_grasp')
 
         # ── State machine ──
         self.state = Task1State.LISTEN
@@ -206,6 +211,7 @@ class Task1Retrieve(Node):
 
         # ── Async service call tracking ──
         self.plan_future = None
+        self.plan_grasp_future = None   # async /plan_grasp call
         self.grasp_phase = 0            # sub-phase within PRE_GRASP/GRASP
         self.phase_start_time = 0.0
 
@@ -337,6 +343,73 @@ class Task1Retrieve(Node):
             return None
 
         return (centroid, base_pt)
+
+    def _detect_and_localize_camera(self, target_class):
+        """Detect an object and return its 3D position in camera frame.
+
+        Used by /plan_grasp which expects a PointStamped in camera frame.
+
+        Returns:
+            ((u, v), PointStamped_in_camera_frame), or None.
+        """
+        centroid = self._detect(target_class)
+        if centroid is None:
+            return None
+
+        depth = self.latest_depth
+        ci = self.camera_info
+        if depth is None or ci is None:
+            return None
+
+        u, v = centroid
+        r = 3
+        y_lo = max(0, v - r)
+        y_hi = min(depth.shape[0], v + r + 1)
+        x_lo = max(0, u - r)
+        x_hi = min(depth.shape[1], u + r + 1)
+        patch = depth[y_lo:y_hi, x_lo:x_hi]
+        valid = patch[(patch > 100) & (patch < 5000)]
+        if len(valid) == 0:
+            return None
+
+        depth_m = float(np.median(valid)) / 1000.0
+        fx, fy = ci.k[0], ci.k[4]
+        cx, cy = ci.k[2], ci.k[5]
+
+        xyz_cam = CoordConverter.depth_pixel_to_camera_point(
+            u, v, depth_m, fx, fy, cx, cy)
+
+        pt = PointStamped()
+        pt.header.frame_id = CoordConverter.CAMERA_OPTICAL_FRAME
+        pt.header.stamp = self.get_clock().now().to_msg()
+        pt.point.x = float(xyz_cam[0])
+        pt.point.y = float(xyz_cam[1])
+        pt.point.z = float(xyz_cam[2])
+
+        return (centroid, pt)
+
+    def _compute_topdown_grasp(self):
+        """Compute top-down grasp + pre-grasp poses from self.grasp_object_pos.
+
+        Fallback when GraspNet /plan_grasp is unavailable or fails.
+        Sets self.grasp_pose and self.pre_grasp_pose.
+        """
+        if self.grasp_object_pos is None:
+            self.get_logger().error('No object position for top-down fallback')
+            return
+        ox, oy, oz = self.grasp_object_pos
+        grasp_z = oz + GRASP_Z_OFFSET
+        pre_grasp_z = grasp_z + PRE_GRASP_Z_OFFSET
+        qw, qx, qy, qz = ORIENT_FINGERS_DOWN
+
+        self.pre_grasp_pose = create_pose(
+            ox, oy, pre_grasp_z, qw, qx, qy, qz)
+        self.grasp_pose = create_pose(
+            ox, oy, grasp_z, qw, qx, qy, qz)
+
+        self.get_logger().info(
+            f'Top-down grasp: pre_z={pre_grasp_z:.3f}, '
+            f'grasp_z={grasp_z:.3f}')
 
     def _send_plan_to_target(self, target_pose, label):
         """Send async /plan_to_target request. Sets self.plan_future."""
@@ -588,48 +661,98 @@ class Task1Retrieve(Node):
 
         # ==================== PLAN_GRASP ====================
         elif self.state == Task1State.PLAN_GRASP:
+            # Phase 0: Point camera at table and wait for fresh frames
             if not self.plan_grasp_camera_sent:
-                # Point camera down at the object for close-range detection
                 self._send_pan_tilt(0.0, CAMERA_TILT_GRASP)
                 self.plan_grasp_camera_sent = True
+                self.plan_grasp_future = None
+                self.grasp_phase = 0
                 return
 
             if elapsed < 2.0:
                 return  # camera settling + let detector get fresh frames
 
-            # Re-detect object for grasp planning via classifier
-            result = self._detect_and_localize(self.target_object)
-            if result is None:
-                if elapsed > 8.0:
-                    self.get_logger().error(
-                        'Could not re-detect object for grasp planning')
+            # Phase 0: Detect object and call /plan_grasp (or fallback)
+            if self.grasp_phase == 0:
+                # Get camera-frame point for GraspNet
+                cam_result = self._detect_and_localize_camera(
+                    self.target_object)
+                if cam_result is None:
+                    if elapsed > 8.0:
+                        self.get_logger().error(
+                            'Could not re-detect object for grasp planning')
+                        self.plan_grasp_camera_sent = False
+                        self.transition_to(Task1State.APPROACH)
+                    return
+
+                (u, v), cam_pt = cam_result
+
+                # Also get base_link point (for fallback + logging)
+                base_result = self._detect_and_localize(self.target_object)
+                if base_result is not None:
+                    _, base_pt = base_result
+                    ox = base_pt.point.x
+                    oy = base_pt.point.y
+                    oz = base_pt.point.z
+                    self.grasp_object_pos = (ox, oy, oz)
+                    self.get_logger().info(
+                        f'Object at base_link: '
+                        f'({ox:.3f}, {oy:.3f}, {oz:.3f})')
+
+                # Try GraspNet /plan_grasp if available
+                if self.plan_grasp_client.service_is_ready():
+                    self.get_logger().info(
+                        'Calling GraspNet /plan_grasp ...')
+                    req = PlanGrasp.Request()
+                    req.object_position = cam_pt
+                    req.object_class = self.target_object
+                    req.arm_name = self.active_arm
+                    self.plan_grasp_future = \
+                        self.plan_grasp_client.call_async(req)
+                    self.grasp_phase = 1
+                else:
+                    self.get_logger().info(
+                        '/plan_grasp not available — using top-down fallback')
+                    self._compute_topdown_grasp()
                     self.plan_grasp_camera_sent = False
-                    self.transition_to(Task1State.APPROACH)
-                return
+                    self.transition_to(Task1State.PRE_GRASP)
 
-            (u, v), base_pt = result
-            ox = base_pt.point.x
-            oy = base_pt.point.y
-            oz = base_pt.point.z
+            # Phase 1: Wait for /plan_grasp response
+            elif self.grasp_phase == 1:
+                if self.plan_grasp_future is None:
+                    return
+                if not self.plan_grasp_future.done():
+                    if elapsed > 30.0:
+                        self.get_logger().error(
+                            '/plan_grasp timed out — using top-down fallback')
+                        self._compute_topdown_grasp()
+                        self.plan_grasp_camera_sent = False
+                        self.transition_to(Task1State.PRE_GRASP)
+                    return
 
-            self.grasp_object_pos = (ox, oy, oz)
-            self.get_logger().info(
-                f'Object at base_link: ({ox:.3f}, {oy:.3f}, {oz:.3f})')
+                try:
+                    resp = self.plan_grasp_future.result()
+                except Exception as e:
+                    self.get_logger().error(
+                        f'/plan_grasp exception: {e} — using fallback')
+                    self._compute_topdown_grasp()
+                    self.plan_grasp_camera_sent = False
+                    self.transition_to(Task1State.PRE_GRASP)
+                    return
 
-            # Compute grasp and pre-grasp poses (top-down)
-            grasp_z = oz + GRASP_Z_OFFSET
-            pre_grasp_z = grasp_z + PRE_GRASP_Z_OFFSET
-            qw, qx, qy, qz = ORIENT_FINGERS_DOWN
+                if resp.success:
+                    self.get_logger().info(
+                        f'GraspNet succeeded: {resp.message}')
+                    self.grasp_pose = resp.grasp_pose
+                    self.pre_grasp_pose = resp.pre_grasp_pose
+                else:
+                    self.get_logger().warn(
+                        f'GraspNet failed ({resp.message}) '
+                        f'— using top-down fallback')
+                    self._compute_topdown_grasp()
 
-            self.pre_grasp_pose = create_pose(
-                ox, oy, pre_grasp_z, qw, qx, qy, qz)
-            self.grasp_pose = create_pose(
-                ox, oy, grasp_z, qw, qx, qy, qz)
-
-            self.get_logger().info(
-                f'Pre-grasp z={pre_grasp_z:.3f}, Grasp z={grasp_z:.3f}')
-            self.plan_grasp_camera_sent = False
-            self.transition_to(Task1State.PRE_GRASP)
+                self.plan_grasp_camera_sent = False
+                self.transition_to(Task1State.PRE_GRASP)
 
         # ==================== PRE_GRASP ====================
         elif self.state == Task1State.PRE_GRASP:

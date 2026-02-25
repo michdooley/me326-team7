@@ -44,8 +44,6 @@ install(PROGRAMS
   scripts/grasp_demo.py
   scripts/test_camera_interrupt.py
   scripts/grasp_execute.py
-  scripts/rgbd_grasp_demo.py
-  scripts/rgbd_grasp_demo_real.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
