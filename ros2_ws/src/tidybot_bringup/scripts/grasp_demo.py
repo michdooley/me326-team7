@@ -74,7 +74,7 @@ ORIENT_FINGERS_DOWN = (0.5, 0.5, 0.5, -0.5)   # (qw, qx, qy, qz)
 
 # Gripper position: 0.0 = fully open, 1.0 = fully closed
 GRIPPER_OPEN   = 0.0
-GRIPPER_CLOSED = 0.8   # 80% — tune to object size
+GRIPPER_CLOSED = 1.0   # 100% — fully closed for fruit
 
 
 class GraspDemo(Node):
@@ -116,12 +116,22 @@ class GraspDemo(Node):
         self._plan_to_target    = self.create_client(PlanToTarget, '/plan_to_target')
 
         # ── Gripper publishers ────────────────────────────────────────────
-        self._right_gripper_pub = self.create_publisher(
-            GripperCommand, '/right_gripper/command', 10
-        )
-        self._left_gripper_pub = self.create_publisher(
-            GripperCommand, '/left_gripper/command', 10
-        )
+        # MuJoCo bridge listens on /right_gripper/cmd (Float64MultiArray),
+        # real hardware listens on /right_gripper/command (GripperCommand).
+        if self._sim:
+            self._right_gripper_pub = self.create_publisher(
+                Float64MultiArray, '/right_gripper/cmd', 10
+            )
+            self._left_gripper_pub = self.create_publisher(
+                Float64MultiArray, '/left_gripper/cmd', 10
+            )
+        else:
+            self._right_gripper_pub = self.create_publisher(
+                GripperCommand, '/right_gripper/command', 10
+            )
+            self._left_gripper_pub = self.create_publisher(
+                GripperCommand, '/left_gripper/command', 10
+            )
 
         # ── RViz debug publisher ──────────────────────────────────────────
         self._detection_marker_pub = self.create_publisher(
@@ -197,15 +207,20 @@ class GraspDemo(Node):
     # ── Gripper ───────────────────────────────────────────────────────────────
 
     def _set_gripper(self, position: float, effort: float = 0.5) -> None:
-        msg = GripperCommand()
-        msg.position = position
-        msg.effort   = effort
         pub = (
             self._right_gripper_pub
             if self._arm == 'right'
             else self._left_gripper_pub
         )
+        if self._sim:
+            msg = Float64MultiArray()
+            msg.data = [position]
+        else:
+            msg = GripperCommand()
+            msg.position = position
+            msg.effort   = effort
         pub.publish(msg)
+        self.get_logger().info(f'Gripper → {position:.2f}')
         time.sleep(1.0)
 
     # ── Grasp execution sequence ──────────────────────────────────────────────
@@ -228,7 +243,7 @@ class GraspDemo(Node):
             return False
 
         self.get_logger().info('--- Step 4: Close gripper ---')
-        self._set_gripper(GRIPPER_CLOSED, effort=0.8)
+        self._set_gripper(GRIPPER_CLOSED, effort=1.0)
 
         self.get_logger().info('--- Step 5: Lift object ---')
         lift = Pose()

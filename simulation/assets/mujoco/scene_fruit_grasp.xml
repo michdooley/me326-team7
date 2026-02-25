@@ -32,21 +32,21 @@
     <body name="apple" pos="0.45 -0.10 0.04">
       <freejoint name="apple_joint"/>
       <geom name="apple_geom" type="mesh" mesh="apple_mesh" mass="0.2"
-        material="apple_mat" friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
+        material="apple_mat" friction="8.0 4.0 4.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
     </body>
 
     <!-- Orange: world (0.50, 0.00, 0.04) => base_link ~(0.00, -0.50, 0.04) -->
     <body name="orange" pos="0.50 0.00 0.04">
       <freejoint name="orange_joint"/>
       <geom name="orange_geom" type="mesh" mesh="orange_mesh" mass="0.18"
-        material="orange_mat" friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
+        material="orange_mat" friction="8.0 4.0 4.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
     </body>
 
     <!-- Banana: world (0.42, 0.08, 0.025) => base_link ~(0.08, -0.42, 0.025) -->
     <body name="banana" pos="0.42 0.08 0.025">
       <freejoint name="banana_joint"/>
       <geom name="banana_geom" type="mesh" mesh="banana_mesh" mass="0.12"
-        material="banana_mat" friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
+        material="banana_mat" friction="8.0 4.0 4.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
     </body>
   </worldbody>
 </mujoco>
