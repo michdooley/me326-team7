@@ -459,6 +459,38 @@ class GraspPlannerNode(Node):
             closest_idx = np.argmin(grasp_dists)
             gg = gg[closest_idx:closest_idx + 1]
 
+        # ── 7c. Filter grasps by approach angle (prefer top-down) ────
+        # Reject grasps whose approach vector is more than 45° from vertical.
+        max_angle_deg = 45.0
+        try:
+            tf_cam = self.tf_buffer.lookup_transform(
+                CoordConverter.CAMERA_OPTICAL_FRAME, 'base_link',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0))
+            q = tf_cam.transform.rotation
+            from scipy.spatial.transform import Rotation as ScipyR
+            R_cam_base = ScipyR.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
+            down_in_cam = R_cam_base @ np.array([0.0, 0.0, -1.0])
+            down_in_cam /= np.linalg.norm(down_in_cam)
+
+            approach_vecs = gg.rotation_matrices[:, :, 0]  # (N, 3)
+            dots = np.einsum('ij,j->i', approach_vecs, down_in_cam)
+            dots = np.clip(dots, -1.0, 1.0)
+            angles_deg = np.degrees(np.arccos(np.abs(dots)))
+            topdown_mask = angles_deg < max_angle_deg
+
+            self.get_logger().info(
+                f'Top-down filter ({max_angle_deg}°): '
+                f'{int(topdown_mask.sum())}/{len(gg)} grasps pass')
+
+            if topdown_mask.sum() > 0:
+                gg = gg[topdown_mask]
+            else:
+                self.get_logger().warn(
+                    'No grasps within top-down cone — keeping all')
+        except Exception as e:
+            self.get_logger().warn(f'Top-down filter skipped (TF error): {e}')
+
         best = gg[0]  # highest-score grasp in camera optical frame
         self.get_logger().info(
             f'Selected grasp: score={best.score:.3f}, '

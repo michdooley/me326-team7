@@ -500,25 +500,34 @@ class MotionPlannerNode(Node):
         response.orientation_error = ori_error
         response.joint_positions = solution.tolist()
 
-        # ── Feasibility checks DISABLED for debugging ──────────────────
+        # ── Feasibility checks ────────────────────────────────────────
         if not ik_success:
-            self.get_logger().warn(
-                f"IK did not converge (pos_err={pos_error:.4f}m, ori_err={ori_error:.4f}rad) "
-                "— proceeding anyway (checks disabled)")
+            response.success = False
+            response.message = (
+                f"IK did not converge: pos_err={pos_error:.4f}m, "
+                f"ori_err={ori_error:.4f}rad")
+            return response
 
         condition_number = self.compute_jacobian_condition(arm_name, solution)
         response.condition_number = condition_number
 
-        # if condition_number > request.max_condition_number:
-        #     ...singularity check disabled...
+        if condition_number > request.max_condition_number:
+            response.success = False
+            response.message = (
+                f"Near singularity: condition_number={condition_number:.1f} "
+                f"> max {request.max_condition_number:.1f}")
+            return response
 
         if arm_name == 'right':
             collision_free, min_dist = self.check_arm_collision(solution, other_arm_positions)
         else:
             collision_free, min_dist = self.check_arm_collision(other_arm_positions, solution)
 
-        # if not collision_free:
-        #     ...collision check disabled...
+        if not collision_free:
+            response.success = False
+            response.message = (
+                f"Inter-arm collision detected: min_dist={min_dist:.3f}m")
+            return response
 
         # Planning succeeded
         response.success = True
