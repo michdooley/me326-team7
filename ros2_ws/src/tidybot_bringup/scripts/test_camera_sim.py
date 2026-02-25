@@ -45,8 +45,8 @@ except ImportError:
 # tilt: negative=down, positive=up
 POSITIONS = [
     (0.0, 0.0, "center", True),        # Start: capture
-    (0.5, 0.0, "pan_right", False),    # Pan right
-    (0.5, -0.4, "right_down", True),   # Tilt down: capture
+    (0.0, 0.0, "pan_right", False),    # Pan right
+    (0.0, 0.8, "right_down", True),   # Tilt down: capture
 ]
 SETTLE_TIME = 0.5  # seconds
 

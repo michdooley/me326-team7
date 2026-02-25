@@ -33,12 +33,33 @@ Visualization Manager:
       Queue Size: 2
 
     - Class: rviz_default_plugins/Image
+      Name: YOLO Detections
+      Enabled: true
+      Topic:
+        Value: /camera/color/image_yolo
+      Transport Hint: raw
+      Queue Size: 2
+
+    - Class: rviz_default_plugins/Image
       Name: Depth Camera
       Enabled: true
       Topic:
         Value: /camera/depth/image_raw
       Transport Hint: raw
       Queue Size: 2
+
+    - Class: rviz_default_plugins/Map
+      Name: Occupancy Map
+      Enabled: true
+      Topic:
+        Value: /map
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+      Alpha: 0.7
+      Color Scheme: costmap
+      Draw Behind: true
+      Update Topic:
+        Value: ""
 
     - Class: rviz_default_plugins/Grid
       Name: Grid
@@ -65,18 +86,18 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 2.5
+      Distance: 12.0
       Focal Point:
         X: 0
-        Y: 0
-        Z: 0.5
+        Y: 3.0
+        Z: 0
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05
       Name: Current View
       Near Clip Distance: 0.01
-      Pitch: 0.5
-      Target Frame: base_link
-      Yaw: 0.8
+      Pitch: 1.2
+      Target Frame: odom
+      Yaw: 3.14
     Saved: ~
 
 Window Geometry:

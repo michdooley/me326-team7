@@ -103,6 +103,76 @@ class CoordConverter:
         )
         return tf2_geometry_msgs.do_transform_point(point_stamped, transform)
 
+    def pixel_to_base_link(
+        self,
+        u: int,
+        v: int,
+        depth_image: np.ndarray,
+        camera_info,
+        clock,
+        patch_radius: int = 5,
+        floor_z_min: float = 0.005,
+    ):
+        """
+        Back-project a pixel to a 3D PointStamped in base_link.
+
+        Samples a (2r+1)x(2r+1) depth patch around (u, v), takes the
+        median of valid depths, back-projects to camera optical frame,
+        then transforms to base_link via TF2.
+
+        Args:
+            u, v:          Pixel column and row.
+            depth_image:   16UC1 depth image (mm).
+            camera_info:   sensor_msgs/CameraInfo with intrinsics.
+            clock:         rclpy Clock for timestamp (node.get_clock()).
+            patch_radius:  Half-size of depth sampling patch (default 5 → 11x11).
+            floor_z_min:   Minimum z in base_link (metres). Points below
+                           are clamped up (default 0.005).
+
+        Returns:
+            PointStamped in base_link, or None on failure.
+        """
+        if depth_image is None or camera_info is None:
+            return None
+
+        r = patch_radius
+        y_lo = max(0, v - r)
+        y_hi = min(depth_image.shape[0], v + r + 1)
+        x_lo = max(0, u - r)
+        x_hi = min(depth_image.shape[1], u + r + 1)
+        patch = depth_image[y_lo:y_hi, x_lo:x_hi]
+        valid = patch[(patch > 100) & (patch < 5000)]  # 0.1m – 5m
+        if len(valid) == 0:
+            return None
+
+        depth_m = float(np.median(valid)) / 1000.0
+
+        fx = camera_info.k[0]
+        fy = camera_info.k[4]
+        cx = camera_info.k[2]
+        cy = camera_info.k[5]
+
+        xyz_cam = self.depth_pixel_to_camera_point(
+            u, v, depth_m, fx, fy, cx, cy)
+
+        pt = PointStamped()
+        pt.header.frame_id = self.CAMERA_OPTICAL_FRAME
+        pt.header.stamp = clock.now().to_msg()
+        pt.point.x = float(xyz_cam[0])
+        pt.point.y = float(xyz_cam[1])
+        pt.point.z = float(xyz_cam[2])
+
+        try:
+            base_pt = self.point_camera_to_base(pt)
+        except Exception:
+            return None
+
+        if base_pt.point.z < floor_z_min:
+            base_pt.point.z = floor_z_min
+
+        return base_pt
+
+
     @staticmethod
     def rotation_matrix_to_pose(R: np.ndarray, translation: np.ndarray) -> Pose:
         """
@@ -152,6 +222,7 @@ class CoordConverter:
         (R[:, 0]) is the approach vector — i.e., the direction the gripper travels
         *toward* the object.  The pre-grasp pose is offset *opposite* to that
         direction.
+
 
         Args:
             pose:         Grasp pose (position + quaternion, in any frame).
