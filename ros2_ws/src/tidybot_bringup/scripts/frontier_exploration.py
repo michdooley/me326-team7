@@ -141,13 +141,12 @@ class FrontierExplorer(Node):
     FRONTIER_NAV_OFFSET = 0.4  # m — goal set this far in front of centroid
 
     # ── Navigation (cmd_vel waypoint following) ─────────────────────────────
-    NAV_TIMEOUT        = 30.0  # s before giving up on a navigation goal
+    NAV_TIMEOUT        = 45.0  # s — ultimate safety fallback
     NO_FRONTIER_LIMIT  = 3     # consecutive empty scans → declare COMPLETE
     WAYPOINT_SPACING   = 20    # cells (~1.0 m) between A* waypoints
     WAYPOINT_TOLERANCE = 0.3   # m — distance to accept waypoint arrival
     NAV_LINEAR_SPEED   = 0.25  # m/s — forward speed during waypoint following
     OBSTACLE_THRESHOLD = 0.5   # m — depth distance to trigger avoidance
-    NAV_STUCK_TIME     = 15.0  # s — re-scan if no waypoint progress
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -188,7 +187,6 @@ class FrontierExplorer(Node):
         # Waypoint navigation state
         self.nav_waypoints     = []    # list of (gx, gy)
         self.nav_waypoint_idx  = 0
-        self.nav_last_progress = 0.0   # time of last waypoint advance
 
         # TF
         self.tf_buffer   = tf2_ros.Buffer()
@@ -625,6 +623,44 @@ class FrontierExplorer(Node):
         waypoints.append(path[-1])  # always include goal
         return waypoints
 
+    def _is_path_blocked(self):
+        """Check remaining waypoints against the inflated obstacle map.
+
+        Returns True if any waypoint sits on an inflated obstacle cell,
+        meaning the planned path is no longer safe to follow.
+        Uses self._inflated_occ computed during the last find_frontiers() call.
+        """
+        if not hasattr(self, '_inflated_occ'):
+            return False
+        for i in range(self.nav_waypoint_idx, len(self.nav_waypoints)):
+            gx, gy = self.nav_waypoints[i]
+            if self.in_grid(gx, gy) and self._inflated_occ[gy, gx]:
+                return True
+        return False
+
+    def _replan_from_here(self):
+        """Re-plan A* from current position to the final waypoint goal.
+
+        Returns True if a new path was found and waypoints were updated.
+        """
+        pose = self.get_base_pose()
+        if pose is None or len(self.nav_waypoints) == 0:
+            return False
+        bx, by, _ = pose
+        robot_gx, robot_gy = self.world_to_grid(bx, by)
+        goal_gx, goal_gy = self.nav_waypoints[-1]
+
+        path = self._plan_path(robot_gx, robot_gy, goal_gx, goal_gy)
+        if path is None:
+            return False
+
+        self.nav_waypoints = path
+        self.nav_waypoint_idx = 0
+        self.get_logger().info(
+            f'[NAV] Re-planned: {len(path)} waypoints from '
+            f'({bx:.2f},{by:.2f})')
+        return True
+
     # ── Depth obstacle avoidance ─────────────────────────────────────────────
 
     def _analyze_depth_obstacles(self):
@@ -1003,7 +1039,6 @@ class FrontierExplorer(Node):
             self.nav_waypoints    = path
             self.nav_waypoint_idx = 0
             self.nav_start_time   = time.time()
-            self.nav_last_progress = time.time()
             self.state = ExploreState.NAVIGATING
             return
 
@@ -1013,20 +1048,13 @@ class FrontierExplorer(Node):
         self._start_scan()
 
     def _state_navigating(self):
-        """Follow A* waypoints via cmd_vel with reactive depth obstacle avoidance."""
+        """Follow A* waypoints via cmd_vel with map-based re-planning."""
         now = time.time()
 
-        # ── Timeout ────────────────────────────────────────────────────
+        # ── Safety timeout ─────────────────────────────────────────────
         if now - self.nav_start_time > self.NAV_TIMEOUT:
             self._stop_base()
-            self.get_logger().warn('[NAV] Timeout — scanning from here.')
-            self._start_scan()
-            return
-
-        # ── Stuck detection ────────────────────────────────────────────
-        if now - self.nav_last_progress > self.NAV_STUCK_TIME:
-            self._stop_base()
-            self.get_logger().warn('[NAV] Stuck — no waypoint progress, re-scanning.')
+            self.get_logger().warn('[NAV] Timeout — re-scanning.')
             self._start_scan()
             return
 
@@ -1036,6 +1064,18 @@ class FrontierExplorer(Node):
             return
         bx, by, btheta = pose
         actual_heading = btheta - np.pi / 2  # MuJoCo → world heading
+
+        # ── Check if path is blocked on the mapped obstacles ───────────
+        if self._is_path_blocked():
+            self.get_logger().info('[NAV] Path blocked on map — re-planning...')
+            if self._replan_from_here():
+                return  # re-planned successfully, follow new path next tick
+            else:
+                self._stop_base()
+                self.get_logger().warn(
+                    '[NAV] Re-plan failed — re-scanning to update map.')
+                self._start_scan()
+                return
 
         # ── Current waypoint ───────────────────────────────────────────
         if self.nav_waypoint_idx >= len(self.nav_waypoints):
@@ -1052,13 +1092,11 @@ class FrontierExplorer(Node):
         # Advance waypoint if close enough
         if dist < self.WAYPOINT_TOLERANCE:
             self.nav_waypoint_idx += 1
-            self.nav_last_progress = now
             if self.nav_waypoint_idx >= len(self.nav_waypoints):
                 self._stop_base()
                 self.get_logger().info('[NAV] Goal reached — starting scan.')
                 self._start_scan()
                 return
-            # Re-read next waypoint
             wp_gx, wp_gy = self.nav_waypoints[self.nav_waypoint_idx]
             wp_wx, wp_wy = self.grid_to_world(wp_gx, wp_gy)
             dx, dy = wp_wx - bx, wp_wy - by
@@ -1085,16 +1123,16 @@ class FrontierExplorer(Node):
         if center_clear:
             # Path ahead clear — drive toward waypoint
             if abs(heading_error) > 0.4:
-                # Large heading error: rotate first
                 cmd.angular.z = float(np.clip(2.0 * heading_error, -1.0, 1.0))
             else:
                 cmd.linear.x = float(min(self.NAV_LINEAR_SPEED, dist * 0.5))
                 cmd.angular.z = float(np.clip(1.5 * heading_error, -0.8, 0.8))
         else:
-            # Center blocked — steer around obstacle
+            # Center blocked — depth sees obstacle the map may not have.
+            # Try re-planning around it using the mapped obstacles.
             self.get_logger().info(
-                f'[NAV] Obstacle! L={left_dist:.2f} C={center_dist:.2f} '
-                f'R={right_dist:.2f}')
+                f'[NAV] Depth obstacle: L={left_dist:.2f} C={center_dist:.2f} '
+                f'R={right_dist:.2f} — steering around')
             if left_dist > right_dist:
                 cmd.angular.z = 0.5
                 cmd.linear.x = 0.05
@@ -1102,7 +1140,6 @@ class FrontierExplorer(Node):
                 cmd.angular.z = -0.5
                 cmd.linear.x = 0.05
             else:
-                # All blocked — rotate in place
                 cmd.angular.z = 0.6
 
         # Safety: stop forward if very close to anything
