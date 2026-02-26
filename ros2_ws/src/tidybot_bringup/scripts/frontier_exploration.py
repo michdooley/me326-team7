@@ -9,7 +9,8 @@ the full exploration run.  The exploration loop repeats:
                   frame into the map.
   2. SELECTING  — clusters frontier cells (FREE↔UNKNOWN boundary) and picks
                   the highest-scoring one (score = nearby_unknown / distance).
-  3. NAVIGATING — drives to the selected frontier, mapping along the way.
+  3. NAVIGATING — follows A* waypoints to the selected frontier with
+                  depth-based reactive obstacle avoidance.
 
 Key design choices
 ──────────────────
@@ -32,18 +33,18 @@ Key design choices
   when it has been hit from ≥ 2 directions separated by ≥ MIN_HIT_ANGLE_SEP.
   This suppresses smear artefacts that are only seen from a single angle.
 
+• A* path planning — navigation goals are validated by computing an A* path
+  on the inflated occupancy grid.  Waypoints are extracted and followed via
+  cmd_vel with reactive depth-based obstacle avoidance.
+
 Publishes:
   /map               nav_msgs/OccupancyGrid   — grayscale confidence map
   /frontier_markers  visualization_msgs/MarkerArray
+  /cmd_vel           geometry_msgs/Twist       — base velocity commands
 
 Subscribes:
   /camera/depth/image_raw    — depth frames (16UC1, mm)
   /camera/depth/camera_info  — depth camera intrinsics (fovy=57°)
-  /base/goal_reached         — Bool, fired when navigation completes
-
-Commands:
-  /cmd_vel           geometry_msgs/Twist   — in-place rotation scans
-  /base/target_pose  geometry_msgs/Pose2D  — navigation goal
 
 Prerequisites:
     ros2 launch tidybot_bringup sim.launch.py scene:=scene_obstacles.xml
@@ -52,6 +53,7 @@ Usage:
     ros2 run tidybot_bringup frontier_exploration.py
 """
 
+import heapq
 import time
 from collections import deque
 from enum import Enum
@@ -63,10 +65,10 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
-from geometry_msgs.msg import Pose2D, Twist
+from geometry_msgs.msg import Twist
 from nav_msgs.msg import MapMetaData, OccupancyGrid
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Bool, ColorRGBA
+from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
@@ -138,9 +140,14 @@ class FrontierExplorer(Node):
     ROBOT_CLEARANCE     = 0.45 # m — min clearance from obstacles for goals/centroids
     FRONTIER_NAV_OFFSET = 0.4  # m — goal set this far in front of centroid
 
-    # ── Navigation ────────────────────────────────────────────────────────────
-    NAV_TIMEOUT       = 30.0  # s before giving up on a navigation goal
-    NO_FRONTIER_LIMIT = 3     # consecutive empty scans → declare COMPLETE
+    # ── Navigation (cmd_vel waypoint following) ─────────────────────────────
+    NAV_TIMEOUT        = 30.0  # s before giving up on a navigation goal
+    NO_FRONTIER_LIMIT  = 3     # consecutive empty scans → declare COMPLETE
+    WAYPOINT_SPACING   = 20    # cells (~1.0 m) between A* waypoints
+    WAYPOINT_TOLERANCE = 0.3   # m — distance to accept waypoint arrival
+    NAV_LINEAR_SPEED   = 0.25  # m/s — forward speed during waypoint following
+    OBSTACLE_THRESHOLD = 0.5   # m — depth distance to trigger avoidance
+    NAV_STUCK_TIME     = 5.0   # s — re-scan if no waypoint progress
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -176,8 +183,12 @@ class FrontierExplorer(Node):
         self.scan_settle_start = None
         self.nav_start_time    = None
         self.no_frontier_count = 0
-        self.base_goal_reached = False
         self.last_map_publish  = 0.0
+
+        # Waypoint navigation state
+        self.nav_waypoints     = []    # list of (gx, gy)
+        self.nav_waypoint_idx  = 0
+        self.nav_last_progress = 0.0   # time of last waypoint advance
 
         # TF
         self.tf_buffer   = tf2_ros.Buffer()
@@ -189,14 +200,10 @@ class FrontierExplorer(Node):
                                  self._depth_cb,       be)
         self.create_subscription(CameraInfo, '/camera/depth/camera_info',
                                  self._camera_info_cb, be)
-        self.create_subscription(Bool, '/base/goal_reached',
-                                 self._goal_reached_cb, 10)
-
         # Publishers
         self.map_pub      = self.create_publisher(OccupancyGrid, '/map',              10)
         self.frontier_pub = self.create_publisher(MarkerArray,   '/frontier_markers', 10)
-        self.cmd_vel_pub   = self.create_publisher(Twist,         '/cmd_vel',          10)
-        self.base_goal_pub = self.create_publisher(Pose2D,        '/base/target_pose', 10)
+        self.cmd_vel_pub  = self.create_publisher(Twist,         '/cmd_vel',          10)
 
         self.get_logger().info('=' * 55)
         self.get_logger().info('Frontier Explorer  (persistent map)')
@@ -237,10 +244,6 @@ class FrontierExplorer(Node):
 
     def _camera_info_cb(self, msg: CameraInfo):
         self.camera_K = np.array(msg.k).reshape(3, 3)
-
-    def _goal_reached_cb(self, msg: Bool):
-        if msg.data:
-            self.base_goal_reached = True
 
     # ── Grid helpers ──────────────────────────────────────────────────────────
 
@@ -532,6 +535,141 @@ class FrontierExplorer(Node):
             if e2 < dx:
                 err += dx;  y += sy
 
+    # ── Path planning ──────────────────────────────────────────────────────────
+
+    def _plan_path(self, start_gx, start_gy, goal_gx, goal_gy):
+        """A* on the inflated occupancy grid.
+
+        Returns a list of (gx, gy) waypoints subsampled every WAYPOINT_SPACING
+        cells, or None if no path exists.  The traversable mask is
+        free_mask & ~inflated_occ (robot-width-safe corridors).
+        """
+        free_mask = self.log_odds <= self.LOG_ODDS_FREE_THRESH
+        confirmed_occ = ((self.log_odds  >= self.LOG_ODDS_OCC_THRESH) &
+                         (self.hit_count >= self.MIN_HIT_COUNT))
+        r_clear = int(np.ceil(self.ROBOT_CLEARANCE / self.GRID_RESOLUTION))
+        ky_c, kx_c = np.ogrid[-r_clear:r_clear + 1, -r_clear:r_clear + 1]
+        clear_disc = (ky_c ** 2 + kx_c ** 2) <= r_clear ** 2
+        inflated = binary_dilation(confirmed_occ, structure=clear_disc)
+        traversable = free_mask & ~inflated
+
+        # Ensure start and goal are in-bounds
+        if not (self.in_grid(start_gx, start_gy) and
+                self.in_grid(goal_gx, goal_gy)):
+            return None
+
+        # If start is inside inflated zone (robot got pushed into obstacle
+        # proximity), relax to free_mask for the start cell only
+        if not traversable[start_gy, start_gx]:
+            if not free_mask[start_gy, start_gx]:
+                return None
+            traversable[start_gy, start_gx] = True
+
+        if not traversable[goal_gy, goal_gx]:
+            return None
+
+        SQRT2 = 1.414
+        DIRS = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+                (-1, -1, SQRT2), (-1, 1, SQRT2), (1, -1, SQRT2), (1, 1, SQRT2)]
+
+        def heuristic(gx, gy):
+            return np.hypot(gx - goal_gx, gy - goal_gy)
+
+        start = (start_gx, start_gy)
+        goal  = (goal_gx, goal_gy)
+
+        open_set = [(heuristic(*start), 0.0, start)]
+        g_cost   = {start: 0.0}
+        came_from = {}
+        expansions = 0
+        MAX_EXPANSIONS = 50000
+
+        while open_set and expansions < MAX_EXPANSIONS:
+            _, g, (cx, cy) = heapq.heappop(open_set)
+            expansions += 1
+
+            if (cx, cy) == goal:
+                # Reconstruct path
+                path = [(cx, cy)]
+                while (cx, cy) in came_from:
+                    cx, cy = came_from[(cx, cy)]
+                    path.append((cx, cy))
+                path.reverse()
+                return self._subsample_path(path)
+
+            if g > g_cost.get((cx, cy), float('inf')):
+                continue
+
+            for dx, dy, cost in DIRS:
+                nx, ny = cx + dx, cy + dy
+                if not (0 <= nx < self.GRID_SIZE and 0 <= ny < self.GRID_SIZE):
+                    continue
+                if not traversable[ny, nx]:
+                    continue
+                ng = g + cost
+                if ng < g_cost.get((nx, ny), float('inf')):
+                    g_cost[(nx, ny)] = ng
+                    came_from[(nx, ny)] = (cx, cy)
+                    heapq.heappush(open_set, (ng + heuristic(nx, ny), ng, (nx, ny)))
+
+        return None  # no path found within expansion budget
+
+    def _subsample_path(self, path):
+        """Extract waypoints every WAYPOINT_SPACING cells from a full A* path."""
+        if len(path) <= 2:
+            return path
+        waypoints = [path[0]]
+        for i in range(self.WAYPOINT_SPACING, len(path) - 1, self.WAYPOINT_SPACING):
+            waypoints.append(path[i])
+        waypoints.append(path[-1])  # always include goal
+        return waypoints
+
+    # ── Depth obstacle avoidance ─────────────────────────────────────────────
+
+    def _analyze_depth_obstacles(self):
+        """Analyze depth image for obstacles in left/center/right sectors.
+
+        Returns (clearance, distances) where each is (left, center, right).
+        clearance[i] is True if the sector is clear of obstacles.
+        distances[i] is the 10th-percentile depth in metres.
+        """
+        depth = self.latest_depth
+        if depth is None:
+            return (True, True, True), (999.0, 999.0, 999.0)
+
+        h, w = depth.shape
+        # Ignore top 30% (ceiling) and bottom 20% (ground)
+        v_start = int(h * 0.3)
+        v_end   = int(h * 0.8)
+
+        left_region   = depth[v_start:v_end, 0:w // 3]
+        center_region = depth[v_start:v_end, w // 3:2 * w // 3]
+        right_region  = depth[v_start:v_end, 2 * w // 3:w]
+
+        def sector_min_dist(region):
+            valid = region[region > 0].astype(np.float64)
+            if len(valid) == 0:
+                return 999.0
+            return float(np.percentile(valid, 10)) / 1000.0  # mm → m
+
+        left_dist   = sector_min_dist(left_region)
+        center_dist = sector_min_dist(center_region)
+        right_dist  = sector_min_dist(right_region)
+
+        threshold = self.OBSTACLE_THRESHOLD
+        clearance = (left_dist > threshold,
+                     center_dist > threshold,
+                     right_dist > threshold)
+        return clearance, (left_dist, center_dist, right_dist)
+
+    @staticmethod
+    def _normalize_angle(angle):
+        while angle > np.pi:
+            angle -= 2 * np.pi
+        while angle < -np.pi:
+            angle += 2 * np.pi
+        return angle
+
     # ── Frontier detection ────────────────────────────────────────────────────
 
     def find_frontiers(self):
@@ -615,20 +753,22 @@ class FrontierExplorer(Node):
         bx, by, _ = base_pose
         robot_gx, robot_gy = self.world_to_grid(bx, by)
 
-        # ── Reachability: connected-component labeling of confirmed free cells ──
-        # Flood-fills through cells that are confirmed free (log_odds ≤ FREE_THRESH).
-        # Inflation is NOT applied here — it would block frontier cells that sit
-        # just a few cells from confirmed obstacles (the smeared/unconfirmed strip
-        # between free and occupied is often < 0.45 m).  Inflation is still enforced
-        # later in centroid snapping and goal walk-back to keep the final nav goal
-        # at a safe distance from walls.
-        traversable = free_mask
+        # ── Reachability: connected-component labeling on inflated-free cells ──
+        # Flood-fills through cells that are confirmed free AND outside the
+        # inflated obstacle zone — i.e. corridors wide enough for the robot.
+        # Frontier cells often sit inside the inflated zone (they border unknown
+        # space near obstacles), so we dilate the reachable set by clear_disc:
+        # a frontier is "reachable" if the robot can get within ROBOT_CLEARANCE
+        # of it via a robot-safe path.
+        traversable = free_mask & ~self._inflated_occ
         _labeled, _ = ndimage_label(traversable, structure=np.ones((3, 3), dtype=bool))
         if (self.in_grid(robot_gx, robot_gy) and
                 _labeled[robot_gy, robot_gx] > 0):
             reachable = (_labeled == _labeled[robot_gy, robot_gx])
+            reachable_near = binary_dilation(reachable, structure=clear_disc)
         else:
-            reachable = None  # robot not yet on confirmed-free cell; skip filter
+            reachable = None
+            reachable_near = None
 
         # Pre-build a boolean disc mask of radius MAX_DEPTH_M in grid cells.
         # Reused for every cluster so we only allocate it once.
@@ -654,13 +794,12 @@ class FrontierExplorer(Node):
                 n_dist += 1
                 continue
 
-            # ── 2. Reachability: at least one cluster cell reachable ───────
-            # Frontier cells are FREE by definition, so they appear in the
-            # traversable mask unless they also fall in the inflated obstacle
-            # zone.  Checking any cell (not just the centroid) avoids false
-            # rejections when the centroid lands on an UNKNOWN cell.
-            if reachable is not None:
-                if not np.any(reachable[cys, cxs]):
+            # ── 2. Reachability: robot can get within ROBOT_CLEARANCE ─────
+            # reachable_near is the inflated-safe reachable set dilated by
+            # clear_disc, so a frontier cell passes if there's a robot-safe
+            # path that gets within ROBOT_CLEARANCE of it.
+            if reachable_near is not None:
+                if not np.any(reachable_near[cys, cxs]):
                     n_reach += 1
                     continue
 
@@ -840,56 +979,30 @@ class FrontierExplorer(Node):
             self._start_scan()
             return
         bx, by, _ = base_pose
+        robot_gx, robot_gy = self.world_to_grid(bx, by)
 
-        # Try each frontier in score order until we find a navigable goal.
-        # The centroid was already validated as clear-of-inflated-obstacles in
-        # find_frontiers() (centroid snapping, step 3).  If the offset goal
-        # lands in the inflated zone, fall back to the centroid directly.
+        # Try each frontier in score order until we find one with a valid A* path.
         for wx, wy, size, score in frontiers:
-            dx, dy = wx - bx, wy - by
-            dist   = np.hypot(dx, dy)
-
             self.get_logger().info(
                 f'[SELECT] Trying frontier ({wx:.2f}, {wy:.2f}) '
                 f'cluster={size} score={score:.0f}')
 
-            # Compute offset goal (FRONTIER_NAV_OFFSET closer to robot)
-            if dist > self.FRONTIER_NAV_OFFSET * 2:
-                ratio  = (dist - self.FRONTIER_NAV_OFFSET) / dist
-                goal_x = bx + dx * ratio
-                goal_y = by + dy * ratio
-            else:
-                goal_x, goal_y = wx, wy
+            goal_gx, goal_gy = self.world_to_grid(wx, wy)
+            path = self._plan_path(robot_gx, robot_gy, goal_gx, goal_gy)
 
-            # Validate against inflated obstacle mask
-            if hasattr(self, '_inflated_occ'):
-                gx_g = int((goal_x - self.GRID_ORIGIN_X) / self.GRID_RESOLUTION)
-                gy_g = int((goal_y - self.GRID_ORIGIN_Y) / self.GRID_RESOLUTION)
-
-                if self.in_grid(gx_g, gy_g) and self._inflated_occ[gy_g, gx_g]:
-                    # Offset goal blocked — fall back to centroid directly
-                    goal_x, goal_y = wx, wy
-                    gx_g = int((goal_x - self.GRID_ORIGIN_X) / self.GRID_RESOLUTION)
-                    gy_g = int((goal_y - self.GRID_ORIGIN_Y) / self.GRID_RESOLUTION)
-
-                    if self.in_grid(gx_g, gy_g) and self._inflated_occ[gy_g, gx_g]:
-                        # Centroid also blocked — try next frontier
-                        self.get_logger().info(
-                            f'[SELECT] Skipping — goal in obstacle zone.')
-                        continue
-
-            goal_theta = np.arctan2(dy, dx)
-            user_theta = goal_theta - np.pi / 2   # bridge frame convention
+            if path is None:
+                self.get_logger().info(
+                    f'[SELECT] No A* path to ({wx:.2f}, {wy:.2f}) — skipping.')
+                continue
 
             self.get_logger().info(
-                f'[SELECT] Goal ({goal_x:.2f}, {goal_y:.2f}) '
-                f'heading={np.degrees(goal_theta):.0f}°')
+                f'[SELECT] A* path found: {len(path)} waypoints to '
+                f'({wx:.2f}, {wy:.2f})')
 
-            goal = Pose2D()
-            goal.x = goal_x;  goal.y = goal_y;  goal.theta = user_theta
-            self.base_goal_reached = False
-            self.base_goal_pub.publish(goal)
-            self.nav_start_time = time.time()
+            self.nav_waypoints    = path
+            self.nav_waypoint_idx = 0
+            self.nav_start_time   = time.time()
+            self.nav_last_progress = time.time()
             self.state = ExploreState.NAVIGATING
             return
 
@@ -899,13 +1012,95 @@ class FrontierExplorer(Node):
         self._start_scan()
 
     def _state_navigating(self):
-        if self.base_goal_reached:
-            self.get_logger().info('[NAV] Goal reached — starting scan.')
-            self._start_scan()
-            return
-        if time.time() - self.nav_start_time > self.NAV_TIMEOUT:
+        """Follow A* waypoints via cmd_vel with reactive depth obstacle avoidance."""
+        now = time.time()
+
+        # ── Timeout ────────────────────────────────────────────────────
+        if now - self.nav_start_time > self.NAV_TIMEOUT:
+            self._stop_base()
             self.get_logger().warn('[NAV] Timeout — scanning from here.')
             self._start_scan()
+            return
+
+        # ── Stuck detection ────────────────────────────────────────────
+        if now - self.nav_last_progress > self.NAV_STUCK_TIME:
+            self._stop_base()
+            self.get_logger().warn('[NAV] Stuck — no waypoint progress, re-scanning.')
+            self._start_scan()
+            return
+
+        # ── Get current pose ───────────────────────────────────────────
+        pose = self.get_base_pose()
+        if pose is None:
+            return
+        bx, by, btheta = pose
+        actual_heading = btheta - np.pi / 2  # MuJoCo → world heading
+
+        # ── Current waypoint ───────────────────────────────────────────
+        if self.nav_waypoint_idx >= len(self.nav_waypoints):
+            self._stop_base()
+            self.get_logger().info('[NAV] All waypoints reached — starting scan.')
+            self._start_scan()
+            return
+
+        wp_gx, wp_gy = self.nav_waypoints[self.nav_waypoint_idx]
+        wp_wx, wp_wy = self.grid_to_world(wp_gx, wp_gy)
+        dx, dy = wp_wx - bx, wp_wy - by
+        dist = np.hypot(dx, dy)
+
+        # Advance waypoint if close enough
+        if dist < self.WAYPOINT_TOLERANCE:
+            self.nav_waypoint_idx += 1
+            self.nav_last_progress = now
+            if self.nav_waypoint_idx >= len(self.nav_waypoints):
+                self._stop_base()
+                self.get_logger().info('[NAV] Goal reached — starting scan.')
+                self._start_scan()
+                return
+            # Re-read next waypoint
+            wp_gx, wp_gy = self.nav_waypoints[self.nav_waypoint_idx]
+            wp_wx, wp_wy = self.grid_to_world(wp_gx, wp_gy)
+            dx, dy = wp_wx - bx, wp_wy - by
+            dist = np.hypot(dx, dy)
+
+        desired_heading = np.arctan2(dy, dx)
+        heading_error = self._normalize_angle(desired_heading - actual_heading)
+
+        # ── Depth obstacle avoidance ───────────────────────────────────
+        clearance, distances = self._analyze_depth_obstacles()
+        left_clear, center_clear, right_clear = clearance
+        left_dist, center_dist, right_dist = distances
+
+        cmd = Twist()
+
+        if center_clear:
+            # Path ahead clear — drive toward waypoint
+            if abs(heading_error) > 0.4:
+                # Large heading error: rotate first
+                cmd.angular.z = float(np.clip(2.0 * heading_error, -1.0, 1.0))
+            else:
+                cmd.linear.x = float(min(self.NAV_LINEAR_SPEED, dist * 0.5))
+                cmd.angular.z = float(np.clip(1.5 * heading_error, -0.8, 0.8))
+        else:
+            # Center blocked — steer around obstacle
+            self.get_logger().info(
+                f'[NAV] Obstacle! L={left_dist:.2f} C={center_dist:.2f} '
+                f'R={right_dist:.2f}')
+            if left_dist > right_dist:
+                cmd.angular.z = 0.5
+                cmd.linear.x = 0.05
+            elif right_dist > left_dist:
+                cmd.angular.z = -0.5
+                cmd.linear.x = 0.05
+            else:
+                # All blocked — rotate in place
+                cmd.angular.z = 0.6
+
+        # Safety: stop forward if very close to anything
+        if min(left_dist, center_dist, right_dist) < 0.25:
+            cmd.linear.x = 0.0
+
+        self.cmd_vel_pub.publish(cmd)
 
     def _state_complete(self):
         self._stop_base()
