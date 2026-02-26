@@ -1113,38 +1113,38 @@ class FrontierExplorer(Node):
                 f'dist={dist:.2f} hdg_err={np.degrees(heading_error):.0f}° '
                 f'pos=({bx:.2f},{by:.2f})')
 
-        # ── Depth obstacle avoidance ───────────────────────────────────
-        clearance, distances = self._analyze_depth_obstacles()
-        left_clear, center_clear, right_clear = clearance
-        left_dist, center_dist, right_dist = distances
-
         cmd = Twist()
 
-        if center_clear:
-            # Path ahead clear — drive toward waypoint
-            if abs(heading_error) > 0.4:
-                cmd.angular.z = float(np.clip(2.0 * heading_error, -1.0, 1.0))
-            else:
+        if abs(heading_error) > 0.6:
+            # ── Large heading error: rotate in place ──────────────────
+            # No forward motion → no collision risk → skip depth avoidance.
+            # This prevents obstacle avoidance from fighting the needed turn.
+            cmd.angular.z = float(np.clip(2.0 * heading_error, -1.0, 1.0))
+        else:
+            # ── Heading roughly aligned: drive forward with avoidance ─
+            clearance, distances = self._analyze_depth_obstacles()
+            left_clear, center_clear, right_clear = clearance
+            left_dist, center_dist, right_dist = distances
+
+            if center_clear:
                 cmd.linear.x = float(min(self.NAV_LINEAR_SPEED, dist * 0.5))
                 cmd.angular.z = float(np.clip(1.5 * heading_error, -0.8, 0.8))
-        else:
-            # Center blocked — depth sees obstacle the map may not have.
-            # Try re-planning around it using the mapped obstacles.
-            self.get_logger().info(
-                f'[NAV] Depth obstacle: L={left_dist:.2f} C={center_dist:.2f} '
-                f'R={right_dist:.2f} — steering around')
-            if left_dist > right_dist:
-                cmd.angular.z = 0.5
-                cmd.linear.x = 0.05
-            elif right_dist > left_dist:
-                cmd.angular.z = -0.5
-                cmd.linear.x = 0.05
             else:
-                cmd.angular.z = 0.6
+                self.get_logger().info(
+                    f'[NAV] Depth obstacle: L={left_dist:.2f} C={center_dist:.2f} '
+                    f'R={right_dist:.2f} — steering around')
+                if left_dist > right_dist:
+                    cmd.angular.z = 0.5
+                    cmd.linear.x = 0.05
+                elif right_dist > left_dist:
+                    cmd.angular.z = -0.5
+                    cmd.linear.x = 0.05
+                else:
+                    cmd.angular.z = 0.6
 
-        # Safety: stop forward if very close to anything
-        if min(left_dist, center_dist, right_dist) < 0.25:
-            cmd.linear.x = 0.0
+            # Safety: stop forward if very close to anything
+            if min(left_dist, center_dist, right_dist) < 0.25:
+                cmd.linear.x = 0.0
 
         self.cmd_vel_pub.publish(cmd)
 
