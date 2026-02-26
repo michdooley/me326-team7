@@ -58,12 +58,6 @@
 
     <!-- Row 2: mid field -->
 
-    <!-- Cylinder - mid right -->
-    <body name="obstacle_cylinder_1" pos="2.0 -0.5 0.2">
-      <geom name="obstacle_cylinder_1_geom" type="cylinder" size="0.18 0.2" material="obstacle_material"
-        mass="10.0" friction="2.0 1.0 1.0"/>
-    </body>
-
     <!-- Tall box - mid left -->
     <body name="obstacle_tall_box_2" pos="1.9 0.6 0.25">
       <geom name="obstacle_tall_box_2_geom" type="box" size="0.15 0.15 0.25" material="obstacle_material"
@@ -71,12 +65,6 @@
     </body>
 
     <!-- Row 3: far field -->
-
-    <!-- Wide flat box - far right -->
-    <body name="obstacle_wide_flat_2" pos="2.8 -0.7 0.08">
-      <geom name="obstacle_wide_flat_2_geom" type="box" size="0.30 0.15 0.08" material="obstacle_material"
-        mass="10.0" friction="2.0 1.0 1.0"/>
-    </body>
 
     <!-- Cylinder - far left -->
     <body name="obstacle_cylinder_2" pos="2.7 0.5 0.2">
@@ -108,8 +96,8 @@
         friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
     </body>
 
-    <!-- Yellow cube - between mid and far rows, left side -->
-    <body name="yellow_block" pos="2.35 0.55 0.025">
+    <!-- Yellow cube - left of tall box mid left -->
+    <body name="yellow_block" pos="1.9 1.1 0.025">
       <freejoint name="yellow_block_joint"/>
       <geom name="yellow_block_geom" type="box" size="0.025 0.025 0.025" mass="0.1" material="yellow_cube"
         friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
@@ -133,7 +121,7 @@
         0.5 -0.15 0.025 1 0 0 0
         1.1 0.0 0.025 1 0 0 0
         1.95 0.05 0.025 1 0 0 0
-        2.35 0.55 0.025 1 0 0 0
+        1.9 1.1 0.025 1 0 0 0
         2.75 -0.1 0.025 1 0 0 0"
       ctrl="0 0 1.5708 0 0 0 0 0 0 0 0 0.037 0.037 0 0 0 0 0 0 0.037 0.037"/>
   </keyframe>
