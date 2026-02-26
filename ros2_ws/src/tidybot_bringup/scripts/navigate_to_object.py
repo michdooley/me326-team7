@@ -78,7 +78,7 @@ CENTER_GAIN = 0.002            # angular.z = -gain * pixel_error
 # Approach
 APPROACH_SPEED = 0.15          # m/s — slow forward
 APPROACH_HEADING_GAIN = 0.002  # gentle heading correction from pixel error
-GRASP_DISTANCE = 0.50          # meters — stop when object this close
+GRASP_DISTANCE = 0.30          # meters — stop when object this close
 OBJECT_LOST_TIMEOUT = 3.0      # seconds before giving up on lost object
 DEPTH_EMERGENCY_STOP = 0.25    # meters — hard stop if depth center this close
 DEPTH_SLOW_ZONE = 0.50         # meters — slow down when depth center this close
