@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-Interactive nav using goal pose in RViz
+Navigation task with obstacle-aware behaviors.
 
 Usage:
-    ros2 run tidybot_bringup task_navigate_to_position.py
+    ros2 run tidybot_bringup task_navigate_with_avoidance.py
+    ros2 run tidybot_bringup task_navigate_with_avoidance.py --ros-args -p navigation_mode:=rviz_goal
+    ros2 run tidybot_bringup task_navigate_with_avoidance.py --ros-args -p navigation_mode:=reactive_forward
 
-Press 'G' or find the 2D Goal Pose button to set goal pose
+Modes:
+    - seek_red_cylinder (default): search for and approach a red cylinder.
+    - rviz_goal: navigate to a clicked 2D Nav Goal in RViz.
+    - reactive_forward: drive forward and turn when blocked.
 """
 
 import rclpy
@@ -51,9 +56,10 @@ class NavigationTaskNode(Node):
     DETECTION_LOG_INTERVAL = 1.0
     STOP_DISTANCE_M = 0.55
     CRITICAL_STOP_DISTANCE_M = 0.35
-    FORWARD_REGION_X_MIN_FRAC = 0.25
-    FORWARD_REGION_X_MAX_FRAC = 0.75
-    FORWARD_REGION_Y_MIN_FRAC = 0.20
+    # Front-only blocking region: narrower center lane and lower image area.
+    FORWARD_REGION_X_MIN_FRAC = 0.35
+    FORWARD_REGION_X_MAX_FRAC = 0.65
+    FORWARD_REGION_Y_MIN_FRAC = 0.40
     MIN_BLOCKING_AREA_FRAC = 0.01
     STOP_LOG_INTERVAL = 1.0
     DEFAULT_NAVIGATION_MODE = 'seek_red_cylinder'
@@ -73,7 +79,7 @@ class NavigationTaskNode(Node):
     APPROACH_CLEAR_FRAMES = 4
     APPROACH_AVOID_TURNS_BEFORE_NUDGE = 1
     APPROACH_AVOID_NUDGE_STEP_M = 0.28
-    APPROACH_BLOCK_MAX_DISTANCE_M = 1.40
+    APPROACH_BLOCK_MAX_DISTANCE_M = 0.55
     APPROACH_BLOCK_LOG_INTERVAL = 1.0
     APPROACH_BLOCK_CORRIDOR_X_MIN_FRAC = 0.25
     APPROACH_BLOCK_CORRIDOR_X_MAX_FRAC = 0.75
@@ -1145,67 +1151,17 @@ class NavigationTaskNode(Node):
 
     def _is_approach_path_blocked(self, target_distance_m, target_visible) -> bool:
         """
-        Less-strict obstacle check for approach mode.
-        Detects obstacles in a broad forward corridor, even if they don't satisfy generic blocker heuristics.
+        Simple approach-mode blocker check.
+        Only avoid when a near obstacle is directly in front of the robot.
         """
-        # Primary check: raw depth corridor in front of robot (robust to contour failures).
-        if self.latest_depth_mm is not None and self.latest_depth_valid is not None:
-            depth_h, depth_w = self.latest_depth_shape
-            x1 = int(depth_w * self.approach_block_corridor_x_min_frac)
-            x2 = int(depth_w * self.approach_block_corridor_x_max_frac)
-            y1 = int(depth_h * self.approach_block_corridor_y_min_frac)
-            y2 = depth_h
-            if x2 > x1 and y2 > y1:
-                roi_depth = self.latest_depth_mm[y1:y2, x1:x2]
-                roi_valid = self.latest_depth_valid[y1:y2, x1:x2]
-                if np.count_nonzero(roi_valid) >= self.approach_block_min_valid_pixels:
-                    corridor_distance_m = float(
-                        np.percentile(roi_depth[roi_valid], self.approach_block_corridor_percentile) / 1000.0
-                    )
-                    if corridor_distance_m <= self.approach_block_max_distance_m:
-                        # If target is visible but depth is uncertain, only emergency-stop for very close obstacles.
-                        if target_visible and target_distance_m is None:
-                            return corridor_distance_m <= self.CRITICAL_STOP_DISTANCE_M
-                        if (
-                            target_distance_m is None
-                            or corridor_distance_m < (target_distance_m - self.approach_obstacle_target_margin_m)
-                        ):
-                            now = self.get_clock().now()
-                            dt = (now - self.last_approach_block_log_time).nanoseconds / 1e9
-                            if dt >= self.APPROACH_BLOCK_LOG_INTERVAL:
-                                self.get_logger().info(
-                                    f'APPROACH path blocked (corridor): obstacle={corridor_distance_m:.2f}m '
-                                    f'target={target_distance_m if target_distance_m is not None else float("nan"):.2f}m'
-                                )
-                                self.last_approach_block_log_time = now
-                            return True
-
-        # Fallback: existing contour-based obstacle check.
-        if self.obstacle_bbox_depth is None or self.obstacle_distance_m is None:
-            return False
-        if self.latest_depth_shape is None:
-            return False
-        if self.obstacle_distance_m > self.approach_block_max_distance_m:
+        if not self.is_obstacle_blocking():
             return False
 
-        if target_visible and target_distance_m is None:
-            return self.obstacle_distance_m <= self.CRITICAL_STOP_DISTANCE_M
-
-        depth_h, depth_w = self.latest_depth_shape
-        x, y, w, h = self.obstacle_bbox_depth
-        x2 = x + w
-        y2 = y + h
-
-        # Broad center corridor tuned for approach behavior.
-        lane_x1 = int(depth_w * 0.15)
-        lane_x2 = int(depth_w * 0.85)
-        lane_y1 = int(depth_h * 0.30)
-        overlaps_corridor = (x2 > lane_x1) and (x < lane_x2) and (y2 > lane_y1)
-        if not overlaps_corridor:
+        if self.obstacle_distance_m is None or self.obstacle_distance_m > self.approach_block_max_distance_m:
             return False
 
-        # If we know target range, only consider clearly-closer occluders as blockers.
-        if target_distance_m is not None:
+        # If we know target range, do not avoid when obstacle depth likely belongs to the target.
+        if target_visible and target_distance_m is not None:
             if self.obstacle_distance_m >= target_distance_m - self.approach_obstacle_target_margin_m:
                 return False
 
@@ -1213,7 +1169,7 @@ class NavigationTaskNode(Node):
         dt = (now - self.last_approach_block_log_time).nanoseconds / 1e9
         if dt >= self.APPROACH_BLOCK_LOG_INTERVAL:
             self.get_logger().info(
-                f'APPROACH path blocked: obstacle={self.obstacle_distance_m:.2f}m '
+                f'APPROACH path blocked (front): obstacle={self.obstacle_distance_m:.2f}m '
                 f'target={target_distance_m if target_distance_m is not None else float("nan"):.2f}m'
             )
             self.last_approach_block_log_time = now
