@@ -627,24 +627,33 @@ class FrontierExplorer(Node):
         waypoints.append(path[-1])  # always include goal
         return waypoints
 
-    def _is_path_blocked(self):
-        """Check remaining waypoints against the inflated obstacle map.
+    def _compute_inflated(self, clearance_m=None):
+        """Compute an inflated obstacle mask for the given clearance."""
+        if clearance_m is None:
+            clearance_m = self.ROBOT_CLEARANCE
+        confirmed_occ = ((self.log_odds  >= self.LOG_ODDS_OCC_THRESH) &
+                         (self.hit_count >= self.MIN_HIT_COUNT))
+        if clearance_m > 0:
+            r = int(np.ceil(clearance_m / self.GRID_RESOLUTION))
+            ky, kx = np.ogrid[-r:r + 1, -r:r + 1]
+            disc = (ky ** 2 + kx ** 2) <= r ** 2
+            return binary_dilation(confirmed_occ, structure=disc)
+        return confirmed_occ
 
-        Returns True if any waypoint sits on an inflated obstacle cell,
-        meaning the planned path is no longer safe to follow.
-        Uses self._inflated_occ computed during the last find_frontiers() call.
-        """
-        if not hasattr(self, '_inflated_occ'):
-            return False
+    def _is_path_blocked(self):
+        """Check remaining waypoints against obstacles at the nav clearance."""
+        nav_clear = getattr(self, 'nav_clearance', None)
+        inflated = self._compute_inflated(nav_clear)
         for i in range(self.nav_waypoint_idx, len(self.nav_waypoints)):
             gx, gy = self.nav_waypoints[i]
-            if self.in_grid(gx, gy) and self._inflated_occ[gy, gx]:
+            if self.in_grid(gx, gy) and inflated[gy, gx]:
                 return True
         return False
 
     def _replan_from_here(self):
         """Re-plan A* from current position to the final waypoint goal.
 
+        Uses the same clearance that produced the original path.
         Returns True if a new path was found and waypoints were updated.
         """
         pose = self.get_base_pose()
@@ -654,7 +663,9 @@ class FrontierExplorer(Node):
         robot_gx, robot_gy = self.world_to_grid(bx, by)
         goal_gx, goal_gy = self.nav_waypoints[-1]
 
-        path = self._plan_path(robot_gx, robot_gy, goal_gx, goal_gy)
+        nav_clear = getattr(self, 'nav_clearance', None)
+        path = self._plan_path(robot_gx, robot_gy, goal_gx, goal_gy,
+                               clearance_m=nav_clear)
         if path is None:
             return False
 
@@ -1040,6 +1051,7 @@ class FrontierExplorer(Node):
                 self.nav_waypoints    = path
                 self.nav_waypoint_idx = 0
                 self.nav_start_time   = time.time()
+                self.nav_clearance    = clearance  # for re-plan consistency
                 self.state = ExploreState.NAVIGATING
                 return
 
