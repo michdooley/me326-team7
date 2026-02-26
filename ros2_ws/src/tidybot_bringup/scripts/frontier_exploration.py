@@ -131,7 +131,7 @@ class FrontierExplorer(Node):
     MAP_PUBLISH_RATE = 1.0   # Hz
 
     # ── 360° scan ─────────────────────────────────────────────────────────────
-    SCAN_ANGULAR_VEL = 0.8   # rad/s  (~8 s per revolution, slower = less TF lag error)
+    SCAN_ANGULAR_VEL = 1.5   # rad/s  (~4 s per revolution, bridge max is 1.5)
     SCAN_SETTLE_TIME = 1.0   # s — wait after stopping for vibration to die
 
     # ── Frontier selection ────────────────────────────────────────────────────
