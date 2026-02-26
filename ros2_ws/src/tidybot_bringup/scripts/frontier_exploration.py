@@ -141,7 +141,7 @@ class FrontierExplorer(Node):
     FRONTIER_NAV_OFFSET = 0.4  # m — goal set this far in front of centroid
 
     # ── Navigation (cmd_vel waypoint following) ─────────────────────────────
-    NAV_TIMEOUT        = 45.0  # s — ultimate safety fallback
+    NAV_TIMEOUT        = 30.0  # s per waypoint — resets on each waypoint advance
     NO_FRONTIER_LIMIT  = 3     # consecutive empty scans → declare COMPLETE
     WAYPOINT_SPACING   = 20    # cells (~1.0 m) between A* waypoints
     WAYPOINT_TOLERANCE = 0.3   # m — distance to accept waypoint arrival
@@ -1092,6 +1092,7 @@ class FrontierExplorer(Node):
         # Advance waypoint if close enough
         if dist < self.WAYPOINT_TOLERANCE:
             self.nav_waypoint_idx += 1
+            self.nav_start_time = time.time()  # reset per-waypoint timeout
             if self.nav_waypoint_idx >= len(self.nav_waypoints):
                 self._stop_base()
                 self.get_logger().info('[NAV] Goal reached — starting scan.')
