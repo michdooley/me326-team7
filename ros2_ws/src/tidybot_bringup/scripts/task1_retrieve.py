@@ -51,7 +51,7 @@ from std_msgs.msg import Float64MultiArray
 from tidybot_msgs.msg import ArmCommand
 from tidybot_msgs.srv import PlanToTarget
 
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, JointState
 from vision_msgs.msg import Detection2DArray
 from cv_bridge import CvBridge
 from rclpy.qos import QoSProfile, ReliabilityPolicy
@@ -99,6 +99,7 @@ class Task1State(Enum):
     PLAN_GRASP   = auto()  # Detect object, compute grasp poses
     PRE_GRASP    = auto()  # Move arm to approach pose via /plan_to_target
     GRASP        = auto()  # Execute grasp + close gripper
+    IK_NUDGE     = auto()  # Rotate slightly after IK failures, then re-plan
     VERIFY_GRASP = auto()  # Visual verification of grasp success
     RETURN       = auto()  # Navigate back to start position
     DONE         = auto()
@@ -123,6 +124,15 @@ GRASP_Z_OFFSET = 0.00         # offset from detected surface top
 GRASP_MOVE_DURATION = 2.0     # seconds for arm motions
 GRIPPER_SETTLE_TIME = 1.0     # seconds to let gripper close/open
 CAMERA_TILT_GRASP = 0.5       # camera tilt to look at table for detection
+CAMERA_POSITION_TOL = 0.05    # radians — camera "at target" threshold
+CAMERA_SETTLE_TIME = 0.5      # seconds to wait after camera reaches target
+
+# ── IK retry ─────────────────────────────────────────────────────
+IK_MAX_RETRIES = 3             # re-detect + re-plan up to this many times
+IK_MAX_NUDGES = 2              # rotate slightly and retry this many times
+IK_NUDGE_ANGLE = 0.15          # radians (~8°) to rotate on each nudge
+IK_NUDGE_SPEED = 0.3           # rad/s rotation speed during nudge
+IK_NUDGE_DURATION = 0.5        # seconds to rotate during nudge
 
 # ── Verification ──────────────────────────────────────────────────────
 MAX_GRASP_RETRIES = 3
@@ -174,6 +184,9 @@ class Task1Retrieve(Node):
             Image, '/camera/depth/image_raw', self._depth_cb, qos_be)
         self.create_subscription(
             CameraInfo, '/camera/color/camera_info', self._info_cb, 10)
+        self.joint_states = {}
+        self.create_subscription(
+            JointState, '/joint_states', self._joint_state_cb, 10)
 
         # ── Publishers ──
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
@@ -215,6 +228,16 @@ class Task1Retrieve(Node):
         self.verify_arm_cmd_sent = False
         self.verify_camera_cmd_sent = False
         self.verify_detect_result = None
+
+        # ── Camera pan/tilt tracking (closed-loop) ──
+        self.camera_target_pan = None
+        self.camera_target_tilt = None
+        self.camera_reached_time = None
+
+        # ── IK retry tracking ──
+        self.ik_retry_count = 0        # retries within current nudge
+        self.ik_nudge_count = 0        # how many nudge rotations done
+        self.ik_nudge_phase = 0        # 0=rotating, 1=done
 
         # ── Camera tilt sent flag for PLAN_GRASP ──
         self.plan_grasp_camera_sent = False
@@ -274,11 +297,49 @@ class Task1Retrieve(Node):
         else:
             self.left_arm_pub.publish(cmd)
 
+    def _joint_state_cb(self, msg):
+        for i, name in enumerate(msg.name):
+            self.joint_states[name] = msg.position[i] if i < len(msg.position) else 0.0
+
     def _send_pan_tilt(self, pan, tilt):
-        """Publish a camera pan/tilt command."""
+        """Send camera pan/tilt command and start tracking target."""
+        self.camera_target_pan = float(pan)
+        self.camera_target_tilt = float(tilt)
+        self.camera_reached_time = None
         msg = Float64MultiArray()
-        msg.data = [float(pan), float(tilt)]
+        msg.data = [self.camera_target_pan, self.camera_target_tilt]
         self.pan_tilt_pub.publish(msg)
+
+    def _camera_settled(self):
+        """Check if camera has reached target and settled.
+
+        Keeps re-publishing the command until joint states confirm arrival,
+        then waits CAMERA_SETTLE_TIME.
+        """
+        if self.camera_target_pan is None:
+            return True
+
+        msg = Float64MultiArray()
+        msg.data = [self.camera_target_pan, self.camera_target_tilt]
+        self.pan_tilt_pub.publish(msg)
+
+        current_pan = self.joint_states.get('camera_pan', None)
+        current_tilt = self.joint_states.get('camera_tilt', None)
+        if current_pan is None or current_tilt is None:
+            return False
+
+        at_target = (abs(current_pan - self.camera_target_pan) < CAMERA_POSITION_TOL
+                     and abs(current_tilt - self.camera_target_tilt) < CAMERA_POSITION_TOL)
+
+        if at_target:
+            if self.camera_reached_time is None:
+                self.camera_reached_time = time.time()
+            if time.time() - self.camera_reached_time >= CAMERA_SETTLE_TIME:
+                return True
+        else:
+            self.camera_reached_time = None
+
+        return False
 
     def _get_gripper_pub(self):
         """Get the gripper publisher for the active arm."""
@@ -339,7 +400,18 @@ class Task1Retrieve(Node):
         return (centroid, base_pt)
 
     def _send_plan_to_target(self, target_pose, label):
-        """Send async /plan_to_target request. Sets self.plan_future."""
+        """Send async /plan_to_target request. Sets self.plan_future.
+
+        Returns True if the request was sent, False if service unavailable.
+        """
+        if not self.plan_to_target_client.service_is_ready():
+            self.get_logger().warn(
+                f'  [{label}] /plan_to_target service not available! '
+                f'Is motion_planner_node running?',
+                throttle_duration_sec=2.0)
+            self.plan_future = None
+            return False
+
         req = PlanToTarget.Request()
         req.arm_name = self.active_arm
         req.target_pose = target_pose
@@ -354,6 +426,7 @@ class Task1Retrieve(Node):
             f'{target_pose.position.y:.3f}, '
             f'{target_pose.position.z:.3f})')
         self.plan_future = self.plan_to_target_client.call_async(req)
+        return True
 
     def _analyze_depth_obstacles(self):
         """Analyze depth image for obstacles in left/center/right sectors.
@@ -483,10 +556,10 @@ class Task1Retrieve(Node):
                 self.get_logger().info('  [verify] Aiming camera at gripper...')
                 self._send_pan_tilt(VERIFY_CAMERA_PAN, VERIFY_CAMERA_TILT)
                 self.verify_camera_cmd_sent = True
-                self.state_start_time = time.time()
                 return
 
-            if elapsed >= VERIFY_CAMERA_SETTLE_TIME:
+            # Wait for camera to reach target and settle (closed-loop)
+            if self._camera_settled():
                 self.verify_sub_state = VerifySubState.DETECT
                 self.state_start_time = time.time()
 
@@ -531,6 +604,41 @@ class Task1Retrieve(Node):
                 self._send_arm_cmd(ARM_HOME, 2.0)
                 self.transition_to(Task1State.APPROACH)
 
+    # ── IK failure retry logic ────────────────────────────────────────
+
+    def _handle_ik_failure(self, label):
+        """Handle IK failure with retry + nudge logic.
+
+        Up to IK_MAX_RETRIES re-detections per nudge position.
+        Up to IK_MAX_NUDGES small rotations before giving up.
+        """
+        self.ik_retry_count += 1
+        self.get_logger().warn(
+            f'  [{label}] IK retry {self.ik_retry_count}/{IK_MAX_RETRIES} '
+            f'(nudge {self.ik_nudge_count}/{IK_MAX_NUDGES})')
+
+        # Send arm home before retrying
+        self._send_arm_cmd(ARM_HOME, 1.5)
+
+        if self.ik_retry_count < IK_MAX_RETRIES:
+            # Re-detect and re-plan from the same position
+            self.plan_grasp_camera_sent = False
+            self.transition_to(Task1State.PLAN_GRASP)
+        elif self.ik_nudge_count < IK_MAX_NUDGES:
+            # Exhausted retries at this position — nudge and try again
+            self.ik_retry_count = 0
+            self.ik_nudge_count += 1
+            self.ik_nudge_phase = 0
+            self.get_logger().info(
+                f'  [{label}] Nudging robot (nudge {self.ik_nudge_count}/'
+                f'{IK_MAX_NUDGES})...')
+            self.transition_to(Task1State.IK_NUDGE)
+        else:
+            self.get_logger().error(
+                f'  [{label}] IK failed after {IK_MAX_NUDGES} nudges — '
+                f'giving up')
+            self.transition_to(Task1State.ERROR)
+
     # ═══════════════════════════════════════════════════════════════════
     # Main control loop
     # ═══════════════════════════════════════════════════════════════════
@@ -574,6 +682,9 @@ class Task1Retrieve(Node):
                 self._stop_base()
                 # Disable nav_node driving so it doesn't conflict
                 self.nav_node.nav_state = self.nav_node.nav_state  # stay POSITIONED
+                # Reset IK retry counters for fresh grasp attempt
+                self.ik_retry_count = 0
+                self.ik_nudge_count = 0
                 self.transition_to(Task1State.PLAN_GRASP)
 
         # ==================== APPROACH (retry entry) ====================
@@ -594,8 +705,9 @@ class Task1Retrieve(Node):
                 self.plan_grasp_camera_sent = True
                 return
 
-            if elapsed < 2.0:
-                return  # camera settling + let detector get fresh frames
+            # Wait for camera to reach target and settle (closed-loop)
+            if not self._camera_settled():
+                return
 
             # Re-detect object for grasp planning via classifier
             result = self._detect_and_localize(self.target_object)
@@ -643,9 +755,15 @@ class Task1Retrieve(Node):
             if self.grasp_phase == 0:
                 # Phase 0: Wait for gripper to open, then send plan
                 if elapsed > 0.5:
-                    self._send_plan_to_target(
-                        self.pre_grasp_pose, 'pre-grasp')
-                    self.grasp_phase = 1
+                    if self._send_plan_to_target(
+                            self.pre_grasp_pose, 'pre-grasp'):
+                        self.grasp_phase = 1
+                        self.phase_start_time = time.time()
+                    elif elapsed > 15.0:
+                        self.get_logger().error(
+                            '[pre-grasp] /plan_to_target service never became '
+                            'available. Launch sim with use_motion_planner:=true')
+                        self.transition_to(Task1State.ERROR)
 
             elif self.grasp_phase == 1:
                 # Phase 1: Wait for /plan_to_target response
@@ -666,12 +784,12 @@ class Task1Retrieve(Node):
                         self.phase_start_time = time.time()
                     else:
                         msg = result.message if result else 'No response'
-                        self.get_logger().error(
+                        self.get_logger().warn(
                             f'  [pre-grasp] FAILED: {msg}')
-                        self.transition_to(Task1State.ERROR)
-                elif elapsed > 20.0:
+                        self._handle_ik_failure('pre-grasp')
+                elif time.time() - self.phase_start_time > 30.0:
                     self.get_logger().error('[pre-grasp] Timed out')
-                    self.transition_to(Task1State.ERROR)
+                    self._handle_ik_failure('pre-grasp')
 
             elif self.grasp_phase == 2:
                 # Phase 2: Wait for arm motion to finish
@@ -688,8 +806,13 @@ class Task1Retrieve(Node):
 
             if self.grasp_phase == 0:
                 # Phase 0: Send plan_to_target for grasp pose
-                self._send_plan_to_target(self.grasp_pose, 'grasp')
-                self.grasp_phase = 1
+                if self._send_plan_to_target(self.grasp_pose, 'grasp'):
+                    self.grasp_phase = 1
+                    self.phase_start_time = time.time()
+                elif elapsed > 15.0:
+                    self.get_logger().error(
+                        '[grasp] /plan_to_target service not available')
+                    self.transition_to(Task1State.ERROR)
 
             elif self.grasp_phase == 1:
                 # Phase 1: Wait for response
@@ -710,11 +833,11 @@ class Task1Retrieve(Node):
                         self.phase_start_time = time.time()
                     else:
                         msg = result.message if result else 'No response'
-                        self.get_logger().error(f'  [grasp] FAILED: {msg}')
-                        self.transition_to(Task1State.ERROR)
-                elif elapsed > 20.0:
+                        self.get_logger().warn(f'  [grasp] FAILED: {msg}')
+                        self._handle_ik_failure('grasp')
+                elif time.time() - self.phase_start_time > 30.0:
                     self.get_logger().error('[grasp] Timed out')
-                    self.transition_to(Task1State.ERROR)
+                    self._handle_ik_failure('grasp')
 
             elif self.grasp_phase == 2:
                 # Phase 2: Wait for arm motion, then close gripper
@@ -729,6 +852,33 @@ class Task1Retrieve(Node):
                 # Phase 3: Wait for gripper to close, then verify
                 if time.time() - self.phase_start_time >= GRIPPER_SETTLE_TIME:
                     self.transition_to(Task1State.VERIFY_GRASP)
+
+        # ==================== IK_NUDGE ====================
+        elif self.state == Task1State.IK_NUDGE:
+            # Rotate slightly to change the approach angle for IK
+            if elapsed < 1.5:
+                # Wait for arm to go home first
+                self._stop_base()
+                return
+
+            if self.ik_nudge_phase == 0:
+                # Rotate for IK_NUDGE_DURATION
+                if elapsed < 1.5 + IK_NUDGE_DURATION:
+                    twist = Twist()
+                    twist.angular.z = IK_NUDGE_SPEED
+                    self.cmd_vel_pub.publish(twist)
+                else:
+                    self._stop_base()
+                    self.ik_nudge_phase = 1
+                    self.phase_start_time = time.time()
+
+            elif self.ik_nudge_phase == 1:
+                # Brief settle after rotation
+                if time.time() - self.phase_start_time > 0.5:
+                    self.get_logger().info(
+                        f'  [nudge] Rotation complete — re-planning grasp')
+                    self.plan_grasp_camera_sent = False
+                    self.transition_to(Task1State.PLAN_GRASP)
 
         # ==================== VERIFY_GRASP ====================
         elif self.state == Task1State.VERIFY_GRASP:

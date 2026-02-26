@@ -2,18 +2,19 @@
 """
 Navigate to Object Module
 
-Searches for a target object (e.g., 'banana', 'apple') by scanning the environment,
-explores with frontier-based navigation and obstacle avoidance using a depth-based
-occupancy grid, and positions the robot within grasping range.
+Searches for a target object (e.g., 'banana', 'apple') by rotating 360 degrees
+in discrete 30-degree steps, checking YOLO detections at each stop. Once the
+object is found, centers it in the camera view, then approaches until within
+grasp distance.
 
 Uses YOLO detections from the external classifier node (object_classification/classifier.py)
-via the /objbbox topic, rather than running its own YOLO model internally.
+via the /objbbox topic.
 
-Internal sub-states: INIT → SCAN → EXPLORE → APPROACH → ALIGN → POSITIONED
+Internal sub-states: INIT → SCAN_ROTATE → SCAN_CHECK → CENTER → APPROACH → POSITIONED
 
 Subscribes:
     /objbbox (vision_msgs/Detection2DArray) - YOLO detections from classifier node
-    /camera/depth/image_raw (Image) - depth for obstacle avoidance + 3D localization
+    /camera/depth/image_raw (Image) - depth for 3D localization
     /camera/color/camera_info (CameraInfo) - intrinsics
 
 Publishes:
@@ -38,19 +39,15 @@ from rclpy.duration import Duration
 import numpy as np
 import time
 from enum import Enum, auto
-from collections import deque
-from scipy.ndimage import binary_dilation
 
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Float64MultiArray
-from nav_msgs.msg import OccupancyGrid, MapMetaData
 
 import tf2_ros
 
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, JointState
 from vision_msgs.msg import Detection2DArray
 from cv_bridge import CvBridge
-from geometry_msgs.msg import PointStamped
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from tidybot_perception.coord_converter import CoordConverter
@@ -60,41 +57,37 @@ from tidybot_perception.coord_converter import CoordConverter
 # Configuration
 # ═══════════════════════════════════════════════════════════════════════
 
-# Scanning
-SCAN_ROTATION_SPEED = 3.0      # rad/s while scanning  (bridge limit: 1.5)
+# Camera
 CAMERA_TILT_NAV = 0.3          # slight downward tilt for navigation
+CAMERA_POSITION_TOL = 0.05     # radians — camera "at target" threshold
+CAMERA_SETTLE_TIME = 0.5       # seconds to wait after camera reaches target
 
-# Exploration
-EXPLORE_SPEED = 6.00           # m/s while exploring  (bridge limit: 0.5)
-EXPLORE_SCAN_INTERVAL = 8.0    # seconds between scans during exploration
-EXPLORE_SCAN_DISTANCE = 3.0    # meters between scans during exploration
-MAX_EXPLORE_SCANS = 15         # give up after this many full scans with no detection
+# Scanning (discrete 30° steps)
+SCAN_STEP_DEG = 30             # degrees per scan stop
+SCAN_STEPS = 12                # 360 / 30
+SCAN_ROTATE_SPEED = 0.5        # rad/s — moderate rotation speed
+SCAN_HEADING_TOL = np.radians(3)   # ~3° — close enough to target heading
+SCAN_SETTLE_TIME = 0.5         # seconds to wait at each stop before checking
+SCAN_CHECK_DURATION = 1.0      # seconds to check for detections at each stop
+
+# Centering
+CENTER_PIXEL_TOL = 20          # pixels from image center — "centered"
+CENTER_MAX_ANGULAR = 0.15      # rad/s — slow turning to avoid overshoot
+CENTER_GAIN = 0.002            # angular.z = -gain * pixel_error
 
 # Approach
-APPROACH_SPEED = 0.30          # m/s while approaching
-GRASP_DISTANCE = 0.40          # meters — stop this far from object
-OBJECT_LOST_TIMEOUT = 5.0      # seconds before giving up on lost object
+APPROACH_SPEED = 0.15          # m/s — slow forward
+APPROACH_HEADING_GAIN = 0.002  # gentle heading correction from pixel error
+GRASP_DISTANCE = 0.50          # meters — stop when object this close
+OBJECT_LOST_TIMEOUT = 3.0      # seconds before giving up on lost object
+DEPTH_EMERGENCY_STOP = 0.25    # meters — hard stop if depth center this close
+DEPTH_SLOW_ZONE = 0.50         # meters — slow down when depth center this close
 
-# Align
-ALIGN_PIXEL_TOLERANCE = 25     # pixels from image center
-ALIGN_DISTANCE_TOLERANCE = 0.05  # meters from GRASP_DISTANCE
-
-# Obstacle avoidance
-OBSTACLE_THRESHOLD = 0.5       # meters — trigger avoidance
-EMERGENCY_STOP_DISTANCE = 0.25 # meters — hard stop
-
-# ═══════════════════════════════════════════════════════════════════════
-# Occupancy Grid  (matches arena: X [-5.0, 5.0], Y [-1.5, 10.5])
-# ═══════════════════════════════════════════════════════════════════════
-GRID_RESOLUTION = 0.05         # meters per cell
-GRID_SIZE = 300                # cells per side (300 * 0.05 = 15m — covers 10x12m arena with margin)
-GRID_ORIGIN_X = -7.5           # bottom-left corner in odom (meters)
-GRID_ORIGIN_Y = -3.0
-MAX_DEPTH_RANGE = 5.0          # meters — ignore depth beyond this
-DEPTH_SUBSAMPLE = 4            # process every Nth pixel for speed
-MIN_FRONTIER_SIZE = 10         # minimum cells in a frontier cluster
-FRONTIER_NAV_OFFSET = 0.3      # navigate slightly in front of frontier (meters)
-OBSTACLE_INFLATION_RADIUS = 6  # cells to inflate around obstacles (6 * 0.05m = 0.30m buffer)
+# Dynamic camera tilt during approach
+APPROACH_TILT_GAIN = 0.003     # tilt adjustment per pixel of vertical error
+APPROACH_TILT_MIN = 0.2        # minimum tilt during approach (slight down)
+APPROACH_TILT_MAX = 1.0        # maximum tilt (steep down for close objects)
+IMAGE_CENTER_V = 240           # vertical center of 480px image
 
 # YOLO COCO class name → string ID (must match classifier.py output)
 YOLO_CLASS_IDS = {'person': '0', 'banana': '46', 'apple': '47', 'orange': '49'}
@@ -106,241 +99,12 @@ FLOOR_Z_MIN = 0.005            # metres — clamp z above floor
 
 class NavState(Enum):
     """Internal navigation sub-states."""
-    INIT       = auto()
-    SCAN       = auto()
-    EXPLORE    = auto()
-    APPROACH   = auto()
-    ALIGN      = auto()
-    POSITIONED = auto()
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Simple Occupancy Grid
-# ═══════════════════════════════════════════════════════════════════════
-
-class SimpleOccupancyGrid:
-    """2D occupancy grid built from depth images for frontier exploration."""
-
-    UNKNOWN = -1
-    FREE = 0
-    OCCUPIED = 100
-
-    def __init__(self):
-        self.grid = np.full((GRID_SIZE, GRID_SIZE), self.UNKNOWN, dtype=np.int8)
-
-    def world_to_grid(self, wx, wy):
-        gx = int((wx - GRID_ORIGIN_X) / GRID_RESOLUTION)
-        gy = int((wy - GRID_ORIGIN_Y) / GRID_RESOLUTION)
-        return gx, gy
-
-    def grid_to_world(self, gx, gy):
-        wx = GRID_ORIGIN_X + (gx + 0.5) * GRID_RESOLUTION
-        wy = GRID_ORIGIN_Y + (gy + 0.5) * GRID_RESOLUTION
-        return wx, wy
-
-    def in_bounds(self, gx, gy):
-        return 0 <= gx < GRID_SIZE and 0 <= gy < GRID_SIZE
-
-    def update_from_depth(self, depth_image, camera_K, R_cam_to_odom, t_cam_to_odom):
-        """Project depth image into odom frame and update grid.
-
-        Args:
-            depth_image: 16UC1 depth in mm (480x640)
-            camera_K: 3x3 intrinsic matrix
-            R_cam_to_odom: 3x3 rotation from camera optical frame to odom
-            t_cam_to_odom: (3,) translation from camera optical frame to odom
-        """
-        h, w = depth_image.shape
-        step = DEPTH_SUBSAMPLE
-
-        fx, fy = camera_K[0, 0], camera_K[1, 1]
-        cx, cy = camera_K[0, 2], camera_K[1, 2]
-
-        # Camera origin in grid
-        cam_gx, cam_gy = self.world_to_grid(t_cam_to_odom[0], t_cam_to_odom[1])
-
-        # Vectorized depth projection (subsampled)
-        vs, us = np.mgrid[0:h:step, 0:w:step]
-        us = us.ravel()
-        vs = vs.ravel()
-        depths_mm = depth_image[vs, us].astype(np.float64)
-
-        valid = (depths_mm > 0) & (depths_mm < MAX_DEPTH_RANGE * 1000)
-        us = us[valid]
-        vs = vs[valid]
-        depths_m = depths_mm[valid] / 1000.0
-
-        if len(depths_m) == 0:
-            return
-
-        # Project to camera optical frame
-        x_cam = (us - cx) * depths_m / fx
-        y_cam = (vs - cy) * depths_m / fy
-        z_cam = depths_m
-
-        # Transform to odom frame
-        points_cam = np.stack([x_cam, y_cam, z_cam], axis=1)
-        points_odom = (R_cam_to_odom @ points_cam.T).T + t_cam_to_odom
-
-        # Convert to grid coordinates
-        gxs = ((points_odom[:, 0] - GRID_ORIGIN_X) / GRID_RESOLUTION).astype(int)
-        gys = ((points_odom[:, 1] - GRID_ORIGIN_Y) / GRID_RESOLUTION).astype(int)
-
-        # Filter: obstacle height range (above floor, below ceiling)
-        ground_mask = (points_odom[:, 2] > -0.05) & (points_odom[:, 2] < 0.8)
-        in_bounds = (gxs >= 0) & (gxs < GRID_SIZE) & (gys >= 0) & (gys < GRID_SIZE)
-        valid_mask = ground_mask & in_bounds
-
-        # Mark occupied cells
-        occ_gxs = gxs[valid_mask]
-        occ_gys = gys[valid_mask]
-        self.grid[occ_gys, occ_gxs] = self.OCCUPIED
-
-        # Raytrace free space (subsample for performance)
-        ray_step = max(1, len(occ_gxs) // 500)
-        for i in range(0, len(occ_gxs), ray_step):
-            self._raytrace_free(cam_gx, cam_gy, occ_gxs[i], occ_gys[i])
-
-        # Mark cells near camera as free
-        if self.in_bounds(cam_gx, cam_gy):
-            for dy in range(-3, 4):
-                for dx in range(-3, 4):
-                    nx, ny = cam_gx + dx, cam_gy + dy
-                    if self.in_bounds(nx, ny) and self.grid[ny, nx] == self.UNKNOWN:
-                        self.grid[ny, nx] = self.FREE
-
-    def _raytrace_free(self, x0, y0, x1, y1):
-        """Bresenham's line: mark cells as FREE from (x0,y0) to just before (x1,y1)."""
-        dx = abs(x1 - x0)
-        dy = abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx - dy
-        x, y = x0, y0
-
-        while True:
-            if x == x1 and y == y1:
-                break
-            if self.in_bounds(x, y) and self.grid[y, x] != self.OCCUPIED:
-                self.grid[y, x] = self.FREE
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x += sx
-            if e2 < dx:
-                err += dx
-                y += sy
-
-    def get_inflated_grid(self):
-        """Return a copy of the grid with obstacles inflated by OBSTACLE_INFLATION_RADIUS cells.
-
-        Inflated cells are marked as OCCUPIED so the robot keeps a buffer zone.
-        """
-        if OBSTACLE_INFLATION_RADIUS <= 0:
-            return self.grid.copy()
-
-        inflated = self.grid.copy()
-        occupied_mask = self.grid == self.OCCUPIED
-
-        # Create circular structuring element for natural-looking inflation
-        r = OBSTACLE_INFLATION_RADIUS
-        y, x = np.ogrid[-r:r + 1, -r:r + 1]
-        struct = (x * x + y * y) <= r * r
-
-        dilated = binary_dilation(occupied_mask, structure=struct)
-
-        # Only inflate into non-occupied cells (don't overwrite existing FREE→OCCUPIED
-        # where the raw grid says FREE, but do mark them OCCUPIED in the inflated copy)
-        inflated[dilated] = self.OCCUPIED
-
-        return inflated
-
-    def find_best_frontier(self, robot_x, robot_y, robot_heading):
-        """Find the best frontier to explore.
-
-        Args:
-            robot_x, robot_y: Robot position in odom frame.
-            robot_heading: Robot heading (actual world heading, not MuJoCo theta).
-
-        Returns:
-            (goal_x, goal_y) in odom frame, or None if no frontiers.
-        """
-        # Use inflated grid so frontiers stay outside buffer zones
-        inflated = self.get_inflated_grid()
-
-        # Find frontier cells: FREE cells (in inflated grid) adjacent to UNKNOWN
-        free_mask = inflated == self.FREE
-        unknown_mask = inflated == self.UNKNOWN
-        frontier_mask = np.zeros_like(inflated, dtype=bool)
-
-        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            shifted = np.roll(np.roll(unknown_mask, dy, axis=0), dx, axis=1)
-            frontier_mask |= (free_mask & shifted)
-
-        frontier_ys, frontier_xs = np.where(frontier_mask)
-        if len(frontier_xs) == 0:
-            return None
-
-        # Cluster via BFS
-        visited = set()
-        clusters = []
-        frontier_set = set(zip(frontier_xs.tolist(), frontier_ys.tolist()))
-
-        for fx, fy in frontier_set:
-            if (fx, fy) in visited:
-                continue
-            cluster = []
-            queue = deque([(fx, fy)])
-            visited.add((fx, fy))
-            while queue:
-                cx, cy = queue.popleft()
-                cluster.append((cx, cy))
-                for ddx, ddy in [(-1, 0), (1, 0), (0, -1), (0, 1),
-                                 (-1, -1), (-1, 1), (1, -1), (1, 1)]:
-                    nx, ny = cx + ddx, cy + ddy
-                    if (nx, ny) in frontier_set and (nx, ny) not in visited:
-                        visited.add((nx, ny))
-                        queue.append((nx, ny))
-
-            if len(cluster) >= MIN_FRONTIER_SIZE:
-                clusters.append(cluster)
-
-        if not clusters:
-            return None
-
-        # Score clusters: prefer large ones nearby, bias toward heading
-        best_score = -1
-        best_goal = None
-
-        for cluster in clusters:
-            xs = [c[0] for c in cluster]
-            ys = [c[1] for c in cluster]
-            mean_gx = np.mean(xs)
-            mean_gy = np.mean(ys)
-            wx, wy = self.grid_to_world(int(mean_gx), int(mean_gy))
-
-            dx = wx - robot_x
-            dy = wy - robot_y
-            dist = np.sqrt(dx**2 + dy**2)
-            if dist < 0.3:
-                continue  # too close
-
-            # Heading bonus: prefer frontiers in the direction we're facing
-            angle_to_frontier = np.arctan2(dy, dx)
-            angle_diff = abs(_normalize_angle(angle_to_frontier - robot_heading))
-            heading_bonus = 1.0 + 0.5 * (1.0 - angle_diff / np.pi)
-
-            score = (len(cluster) * heading_bonus) / max(dist, 0.5)
-            if score > best_score:
-                best_score = score
-                # Navigate to a point offset back toward the robot
-                if dist > FRONTIER_NAV_OFFSET * 2:
-                    ratio = (dist - FRONTIER_NAV_OFFSET) / dist
-                    best_goal = (robot_x + dx * ratio, robot_y + dy * ratio)
-                else:
-                    best_goal = (wx, wy)
-
-        return best_goal
+    INIT         = auto()
+    SCAN_ROTATE  = auto()
+    SCAN_CHECK   = auto()
+    CENTER       = auto()
+    APPROACH     = auto()
+    POSITIONED   = auto()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -362,8 +126,8 @@ def _normalize_angle(angle):
 
 class NavigateToObject(Node):
     """
-    Navigate to a target object using external YOLO classifier detections,
-    frontier exploration, and reactive obstacle avoidance.
+    Navigate to a target object using external YOLO classifier detections.
+    Scans in 30-degree increments, centers the object, then approaches.
 
     Requires the classifier node to be running for /objbbox detections.
     Can be run standalone or used by the state machine.
@@ -392,38 +156,34 @@ class NavigateToObject(Node):
             Image, '/camera/depth/image_raw', self._depth_cb, qos_be)
         self.create_subscription(
             CameraInfo, '/camera/color/camera_info', self._info_cb, 10)
+        self.joint_states = {}
+        self.create_subscription(
+            JointState, '/joint_states', self._joint_state_cb, 10)
 
         # ── Publishers ──
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.pan_tilt_pub = self.create_publisher(
             Float64MultiArray, '/camera/pan_tilt_cmd', 10)
-        self.map_pub = self.create_publisher(OccupancyGrid, '/map', 10)
-
-        # ── Occupancy grid ──
-        self.occ_grid = SimpleOccupancyGrid()
 
         # ── State machine ──
         self.nav_state = NavState.INIT
         self.state_start_time = time.time()
 
         # Scan tracking
-        self.prev_yaw = None
-        self.total_rotated = 0.0
-        self.scan_count = 0
+        self.scan_start_yaw = None       # yaw when scan began
+        self.scan_step_index = 0         # 0..11 (which 30° step)
+        self.scan_target_yaw = None      # target heading for current step
+        self.scan_check_start = None     # time when SCAN_CHECK began
 
-        # Explore tracking
-        self.explore_start_time = 0.0
-        self.explore_start_pos = None
-        self.explore_goal = None
+        # Camera pan/tilt tracking
+        self.camera_target_pan = None
+        self.camera_target_tilt = None
+        self.camera_reached_time = None  # time when camera first reached target
 
-        # Approach/align tracking
+        # Approach/center tracking
         self.target_base_pt = None       # PointStamped in base_link
         self.last_detection_time = 0.0
-
-        # Map publishing
-        self.last_map_publish_time = 0.0
-        MAP_PUBLISH_RATE = 2.0  # Hz
-        self.map_publish_interval = 1.0 / MAP_PUBLISH_RATE
+        self.approach_tilt = CAMERA_TILT_NAV  # current tilt during approach
 
         # ── Control loop at 10Hz ──
         self.timer = self.create_timer(0.1, self.control_loop)
@@ -452,12 +212,16 @@ class NavigateToObject(Node):
         """Reset the full state machine."""
         self.nav_state = NavState.INIT
         self.state_start_time = time.time()
-        self.occ_grid = SimpleOccupancyGrid()
-        self.prev_yaw = None
-        self.total_rotated = 0.0
-        self.scan_count = 0
-        self.explore_goal = None
+        self.scan_start_yaw = None
+        self.scan_step_index = 0
+        self.scan_target_yaw = None
+        self.scan_check_start = None
         self.target_base_pt = None
+        self.last_detection_time = 0.0
+        self.camera_target_pan = None
+        self.camera_target_tilt = None
+        self.camera_reached_time = None
+        self.approach_tilt = CAMERA_TILT_NAV
         self._stop_base()
 
     # ═══════════════════════════════════════════════════════════════════
@@ -493,42 +257,56 @@ class NavigateToObject(Node):
             return None
         return pose[2]
 
-    def _get_camera_transform(self):
-        """Get rotation matrix and translation for camera→odom transform.
-
-        Returns (R, t) or (None, None) on failure.
-        """
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                'odom', 'camera_depth_optical_frame',
-                rclpy.time.Time(), timeout=Duration(seconds=0.5))
-        except (tf2_ros.LookupException,
-                tf2_ros.ConnectivityException,
-                tf2_ros.ExtrapolationException):
-            return None, None
-
-        t = transform.transform.translation
-        q = transform.transform.rotation
-        cam_origin = np.array([t.x, t.y, t.z])
-
-        qw, qx, qy, qz = q.w, q.x, q.y, q.z
-        R = np.array([
-            [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw), 2*(qx*qz + qy*qw)],
-            [2*(qx*qy + qz*qw), 1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qx*qw)],
-            [2*(qx*qz - qy*qw), 2*(qy*qz + qx*qw), 1 - 2*(qx*qx + qy*qy)],
-        ])
-
-        return R, cam_origin
-
     def _stop_base(self):
         """Publish zero velocity."""
         self.cmd_vel_pub.publish(Twist())
 
+    def _joint_state_cb(self, msg):
+        for i, name in enumerate(msg.name):
+            self.joint_states[name] = msg.position[i] if i < len(msg.position) else 0.0
+
     def _send_pan_tilt(self, pan, tilt):
-        """Send camera pan/tilt command."""
+        """Send camera pan/tilt command and start tracking target."""
+        self.camera_target_pan = float(pan)
+        self.camera_target_tilt = float(tilt)
+        self.camera_reached_time = None
         msg = Float64MultiArray()
-        msg.data = [float(pan), float(tilt)]
+        msg.data = [self.camera_target_pan, self.camera_target_tilt]
         self.pan_tilt_pub.publish(msg)
+
+    def _camera_settled(self):
+        """Check if camera has reached target and settled.
+
+        Keeps re-publishing the pan/tilt command until the joint states
+        confirm arrival, then waits CAMERA_SETTLE_TIME.
+
+        Returns True when the camera is at target AND has settled.
+        """
+        if self.camera_target_pan is None:
+            return True  # no command pending
+
+        # Keep publishing until confirmed
+        msg = Float64MultiArray()
+        msg.data = [self.camera_target_pan, self.camera_target_tilt]
+        self.pan_tilt_pub.publish(msg)
+
+        current_pan = self.joint_states.get('camera_pan', None)
+        current_tilt = self.joint_states.get('camera_tilt', None)
+        if current_pan is None or current_tilt is None:
+            return False
+
+        at_target = (abs(current_pan - self.camera_target_pan) < CAMERA_POSITION_TOL
+                     and abs(current_tilt - self.camera_target_tilt) < CAMERA_POSITION_TOL)
+
+        if at_target:
+            if self.camera_reached_time is None:
+                self.camera_reached_time = time.time()
+            if time.time() - self.camera_reached_time >= CAMERA_SETTLE_TIME:
+                return True
+        else:
+            self.camera_reached_time = None
+
+        return False
 
     # ── Classifier subscription callbacks ──
 
@@ -589,134 +367,6 @@ class NavigateToObject(Node):
 
         return (centroid, base_pt)
 
-    def _analyze_depth_obstacles(self):
-        """Analyze depth image for obstacles in left/center/right sectors.
-
-        Returns:
-            (clearance, distances) where each is (left, center, right).
-            clearance: tuple of bools (True = clear).
-            distances: tuple of floats (meters to nearest obstacle).
-        """
-        depth = self.latest_depth
-        if depth is None:
-            return (True, True, True), (999.0, 999.0, 999.0)
-
-        h, w = depth.shape
-
-        # Vertical band: ignore top 30% (sky/ceiling) and bottom 20% (floor)
-        v_start = int(h * 0.3)
-        v_end = int(h * 0.8)
-
-        left_region = depth[v_start:v_end, 0:w // 3]
-        center_region = depth[v_start:v_end, w // 3:2 * w // 3]
-        right_region = depth[v_start:v_end, 2 * w // 3:w]
-
-        def sector_min_dist(region):
-            valid = region[region > 0].astype(np.float64)
-            if len(valid) == 0:
-                return 999.0
-            return np.percentile(valid, 10) / 1000.0  # mm → meters
-
-        left_dist = sector_min_dist(left_region)
-        center_dist = sector_min_dist(center_region)
-        right_dist = sector_min_dist(right_region)
-
-        clearance = (
-            left_dist > OBSTACLE_THRESHOLD,
-            center_dist > OBSTACLE_THRESHOLD,
-            right_dist > OBSTACLE_THRESHOLD,
-        )
-        return clearance, (left_dist, center_dist, right_dist)
-
-    def _drive_toward_goal_with_avoidance(self, goal_x, goal_y, speed=EXPLORE_SPEED):
-        """Drive toward an odom-frame goal with reactive obstacle avoidance.
-
-        Args:
-            goal_x, goal_y: Target position in odom frame.
-            speed: Maximum forward speed.
-        """
-        pose = self._get_base_pose_in_odom()
-        if pose is None:
-            return
-
-        cx, cy, ctheta = pose
-        actual_heading = ctheta - np.pi / 2
-
-        dx = goal_x - cx
-        dy = goal_y - cy
-        distance = np.sqrt(dx**2 + dy**2)
-        desired_heading = np.arctan2(dy, dx)
-        heading_error = _normalize_angle(desired_heading - actual_heading)
-
-        clearance, distances = self._analyze_depth_obstacles()
-        left_clear, center_clear, right_clear = clearance
-        left_dist, center_dist, right_dist = distances
-
-        twist = Twist()
-
-        if center_clear:
-            if abs(heading_error) > 0.4:
-                # Large heading error: rotate first
-                twist.angular.z = np.clip(2.0 * heading_error, -1.0, 1.0)
-            else:
-                # Drive forward with heading correction
-                twist.linear.x = min(speed, distance * 0.5)
-                twist.angular.z = np.clip(1.5 * heading_error, -0.8, 0.8)
-        else:
-            # Center blocked — steer toward clearer side
-            if left_dist > right_dist:
-                twist.angular.z = 0.5
-                twist.linear.x = 0.05
-            elif right_dist > left_dist:
-                twist.angular.z = -0.5
-                twist.linear.x = 0.05
-            else:
-                # All blocked — rotate in place
-                twist.angular.z = 0.6
-
-        # Emergency stop if very close to anything
-        if min(left_dist, center_dist, right_dist) < EMERGENCY_STOP_DISTANCE:
-            twist.linear.x = 0.0
-
-        self.cmd_vel_pub.publish(twist)
-
-    def _update_occupancy_grid(self):
-        """Update the occupancy grid from the latest depth image."""
-        depth = self.latest_depth
-        if depth is None or self.camera_info is None:
-            return
-
-        R, t = self._get_camera_transform()
-        if R is None:
-            return
-
-        camera_K = np.array(self.camera_info.k).reshape(3, 3)
-        self.occ_grid.update_from_depth(depth, camera_K, R, t)
-
-    def _publish_map(self):
-        """Publish the occupancy grid to /map for RViz visualization."""
-        now = time.time()
-        if now - self.last_map_publish_time < self.map_publish_interval:
-            return
-        self.last_map_publish_time = now
-
-        msg = OccupancyGrid()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'odom'
-
-        msg.info = MapMetaData()
-        msg.info.resolution = GRID_RESOLUTION
-        msg.info.width = GRID_SIZE
-        msg.info.height = GRID_SIZE
-        msg.info.origin.position.x = float(GRID_ORIGIN_X)
-        msg.info.origin.position.y = float(GRID_ORIGIN_Y)
-        msg.info.origin.position.z = 0.0
-        msg.info.origin.orientation.w = 1.0
-
-        # Publish inflated grid so buffer zones are visible in RViz
-        msg.data = self.occ_grid.get_inflated_grid().ravel().tolist()
-        self.map_pub.publish(msg)
-
     def _transition_to(self, new_state):
         """Transition to a new state with logging."""
         old = self.nav_state.name
@@ -729,7 +379,7 @@ class NavigateToObject(Node):
     # ═══════════════════════════════════════════════════════════════════
 
     def _handle_init(self):
-        """Wait for sensor data and TF to be available."""
+        """Wait for sensor data, TF, and camera tilt to be ready."""
         if (self.latest_detections is None
                 or self.latest_depth is None
                 or self.camera_info is None):
@@ -742,259 +392,240 @@ class NavigateToObject(Node):
         except Exception:
             return
 
-        # Set camera to forward with slight downward tilt
-        self._send_pan_tilt(0.0, CAMERA_TILT_NAV)
-
-        # Initialize scan tracking
-        self.prev_yaw = self._get_current_yaw()
-        self.total_rotated = 0.0
-        self.scan_count = 0
-
-        self._transition_to(NavState.SCAN)
-
-    def _handle_scan(self):
-        """Rotate 360° in place scanning for the target color."""
-        # Check for target on every tick
-        detection = self._detect_and_localize(self.target_object)
-        if detection is not None:
-            pixel, base_pt = detection
-            self.target_base_pt = base_pt
-            self.last_detection_time = time.time()
-            self._stop_base()
-            self.get_logger().info(
-                f'[SCAN] Detected {self.target_object} at pixel {pixel}, '
-                f'base_link=({base_pt.point.x:.2f}, {base_pt.point.y:.2f}, '
-                f'{base_pt.point.z:.2f})')
-            self._transition_to(NavState.APPROACH)
+        # Set camera to forward with slight downward tilt (closed-loop)
+        if self.camera_target_pan is None:
+            self._send_pan_tilt(0.0, CAMERA_TILT_NAV)
             return
 
-        # Rotate in place
+        # Wait for camera to reach target and settle
+        if not self._camera_settled():
+            return
+
+        # Record starting yaw for computing 30° increments
+        yaw = self._get_current_yaw()
+        if yaw is None:
+            return
+        self.scan_start_yaw = yaw
+        self.scan_step_index = 0
+        # First target = current heading (check current heading first)
+        self.scan_target_yaw = yaw
+        self.scan_check_start = None
+
+        # Check current heading first before rotating
+        self._transition_to(NavState.SCAN_CHECK)
+
+    def _handle_scan_rotate(self):
+        """Rotate toward the next 30° heading mark."""
+        if self.scan_target_yaw is None:
+            return
+
+        yaw = self._get_current_yaw()
+        if yaw is None:
+            return
+
+        heading_error = _normalize_angle(self.scan_target_yaw - yaw)
+
+        if abs(heading_error) < SCAN_HEADING_TOL:
+            # Reached target heading — stop and check
+            self._stop_base()
+            self.scan_check_start = None
+            self._transition_to(NavState.SCAN_CHECK)
+            return
+
+        # Rotate toward target
         twist = Twist()
-        twist.angular.z = SCAN_ROTATION_SPEED
+        twist.angular.z = np.clip(
+            SCAN_ROTATE_SPEED * np.sign(heading_error),
+            -SCAN_ROTATE_SPEED, SCAN_ROTATE_SPEED)
         self.cmd_vel_pub.publish(twist)
 
-        # Track rotation via yaw
-        current_yaw = self._get_current_yaw()
-        if current_yaw is not None and self.prev_yaw is not None:
-            delta = _normalize_angle(current_yaw - self.prev_yaw)
-            self.total_rotated += abs(delta)
-        self.prev_yaw = current_yaw
+    def _handle_scan_check(self):
+        """Stopped at a scan position. Wait for settle, then check YOLO."""
+        self._stop_base()
 
-        # Check if full 360° rotation is complete
-        if self.total_rotated >= 2.0 * np.pi:
-            self._stop_base()
-            self.scan_count += 1
-            self.get_logger().info(
-                f'[SCAN] Full rotation #{self.scan_count}, no {self.target_object} found')
+        now = time.time()
+        if self.scan_check_start is None:
+            self.scan_check_start = now
 
-            if self.scan_count >= MAX_EXPLORE_SCANS:
-                self.get_logger().warn(
-                    f'[SCAN] Gave up after {self.scan_count} scans')
-                self._stop_base()
-                return
+        elapsed = now - self.scan_check_start
 
-            # Reset scan tracking and transition to explore
-            self.total_rotated = 0.0
-            self.prev_yaw = self._get_current_yaw()
-            self.explore_start_time = time.time()
-            pose = self._get_base_pose_in_odom()
-            self.explore_start_pos = (pose[0], pose[1]) if pose else None
-            self.explore_goal = None
-            self._transition_to(NavState.EXPLORE)
+        # Wait for camera to settle
+        if elapsed < SCAN_SETTLE_TIME:
+            return
 
-    def _handle_explore(self):
-        """Explore the environment, building an occupancy grid and looking for the target."""
-        # Always update the map
-        self._update_occupancy_grid()
-
-        # Check for target continuously while exploring
+        # Check for target detection
         detection = self._detect(self.target_object)
         if detection is not None:
-            full = self._detect_and_localize(self.target_object)
-            if full is not None:
-                pixel, base_pt = full
-                self.target_base_pt = base_pt
-                self.last_detection_time = time.time()
-                self._stop_base()
-                self.get_logger().info(
-                    f'[EXPLORE] Found {self.target_object} while exploring!')
-                self._transition_to(NavState.APPROACH)
-                return
-
-        # Check if it's time to stop and do a full scan
-        elapsed = time.time() - self.explore_start_time
-        dist_traveled = 0.0
-        if self.explore_start_pos is not None:
-            pose = self._get_base_pose_in_odom()
-            if pose is not None:
-                dx = pose[0] - self.explore_start_pos[0]
-                dy = pose[1] - self.explore_start_pos[1]
-                dist_traveled = np.sqrt(dx**2 + dy**2)
-
-        if elapsed > EXPLORE_SCAN_INTERVAL or dist_traveled > EXPLORE_SCAN_DISTANCE:
-            self._stop_base()
-            self.total_rotated = 0.0
-            self.prev_yaw = self._get_current_yaw()
-            self._send_pan_tilt(0.0, CAMERA_TILT_NAV)
-            self._transition_to(NavState.SCAN)
-            return
-
-        # Pick an exploration goal if we don't have one (or reached it)
-        if self.explore_goal is not None:
-            pose = self._get_base_pose_in_odom()
-            if pose is not None:
-                dx = self.explore_goal[0] - pose[0]
-                dy = self.explore_goal[1] - pose[1]
-                if np.sqrt(dx**2 + dy**2) < 0.3:
-                    self.explore_goal = None  # reached goal, pick new one
-
-        if self.explore_goal is None:
-            pose = self._get_base_pose_in_odom()
-            if pose is None:
-                return
-            rx, ry, rtheta = pose
-            actual_heading = rtheta - np.pi / 2
-
-            goal = self.occ_grid.find_best_frontier(rx, ry, actual_heading)
-            if goal is not None:
-                self.explore_goal = goal
-                self.get_logger().info(
-                    f'[EXPLORE] New frontier goal: ({goal[0]:.2f}, {goal[1]:.2f})')
-            else:
-                # No frontiers found — pick a random direction
-                angle = actual_heading + np.random.uniform(-np.pi / 2, np.pi / 2)
-                dist = 2.0
-                self.explore_goal = (rx + dist * np.cos(angle),
-                                     ry + dist * np.sin(angle))
-                self.get_logger().info(
-                    f'[EXPLORE] No frontiers, random goal: '
-                    f'({self.explore_goal[0]:.2f}, {self.explore_goal[1]:.2f})')
-
-        # Drive toward exploration goal with obstacle avoidance
-        self._drive_toward_goal_with_avoidance(
-            self.explore_goal[0], self.explore_goal[1], speed=EXPLORE_SPEED)
-
-    def _handle_approach(self):
-        """Drive toward the detected object while avoiding obstacles."""
-        # Re-detect on every tick for live tracking
-        detection = self._detect_and_localize(self.target_object)
-        if detection is not None:
-            pixel, base_pt = detection
-            self.target_base_pt = base_pt
-            self.last_detection_time = time.time()
-
-        # Check if we've lost the object
-        if self.target_base_pt is None or \
-                time.time() - self.last_detection_time > OBJECT_LOST_TIMEOUT:
-            self._stop_base()
-            self.get_logger().warn('[APPROACH] Lost object, returning to SCAN')
-            self.total_rotated = 0.0
-            self.prev_yaw = self._get_current_yaw()
-            self._transition_to(NavState.SCAN)
-            return
-
-        # Object position in base_link: +X=left, -Y=forward
-        obj_x = self.target_base_pt.point.x
-        obj_y = self.target_base_pt.point.y
-        distance = np.sqrt(obj_x**2 + obj_y**2)
-
-        # Heading error: angle from forward (-Y) to object
-        heading_error = np.arctan2(obj_x, -obj_y)
-
-        # Close enough to align
-        if distance < GRASP_DISTANCE + 0.05:
-            self._stop_base()
-            self._transition_to(NavState.ALIGN)
-            return
-
-        # Drive toward with obstacle avoidance
-        clearance, distances = self._analyze_depth_obstacles()
-        left_clear, center_clear, right_clear = clearance
-        left_dist, center_dist, right_dist = distances
-
-        twist = Twist()
-
-        # Allow driving even if center depth is "blocked" when the obstacle
-        # IS the target object (object is closer than threshold)
-        center_is_target = (center_dist > distance * 0.7)
-
-        if center_clear or center_is_target:
-            speed = min(APPROACH_SPEED, (distance - GRASP_DISTANCE) * 0.5)
-            twist.linear.x = max(0.05, speed)
-            twist.angular.z = np.clip(1.5 * heading_error, -0.8, 0.8)
-        else:
-            # Real obstacle in the way — steer around it
+            u, v = detection
             self.get_logger().info(
-                f'[APPROACH] Obstacle! L={left_dist:.2f} C={center_dist:.2f} '
-                f'R={right_dist:.2f}')
-            if left_dist > right_dist:
-                twist.angular.z = 0.5
-                twist.linear.x = 0.05
-            elif right_dist > left_dist:
-                twist.angular.z = -0.5
-                twist.linear.x = 0.05
-            else:
-                twist.angular.z = 0.6
+                f'[SCAN] Detected {self.target_object} at pixel ({u}, {v}) '
+                f'on step {self.scan_step_index}/{SCAN_STEPS}')
+            self._transition_to(NavState.CENTER)
+            return
 
-        # Emergency stop
-        if min(left_dist, center_dist, right_dist) < EMERGENCY_STOP_DISTANCE:
-            twist.linear.x = 0.0
+        # Still checking — wait for check duration
+        if elapsed < SCAN_SETTLE_TIME + SCAN_CHECK_DURATION:
+            return
 
-        self.cmd_vel_pub.publish(twist)
+        # No detection at this stop — advance to next step
+        self.scan_step_index += 1
 
-    def _handle_align(self):
-        """Fine-tune position: center the object in view and adjust distance."""
-        # Detect pixel position
+        if self.scan_step_index >= SCAN_STEPS:
+            self.get_logger().warn(
+                f'[SCAN] Full 360° scan complete — {self.target_object} not found')
+            # Stay in SCAN_CHECK so task1_retrieve can handle failure
+            return
+
+        # Compute next target heading
+        step_rad = np.radians(SCAN_STEP_DEG)
+        self.scan_target_yaw = _normalize_angle(
+            self.scan_start_yaw + self.scan_step_index * step_rad)
+        self.scan_check_start = None
+
+        self.get_logger().info(
+            f'[SCAN] Step {self.scan_step_index}/{SCAN_STEPS} — '
+            f'rotating to {np.degrees(_normalize_angle(self.scan_target_yaw)):.0f}°')
+        self._transition_to(NavState.SCAN_ROTATE)
+
+    def _handle_center(self):
+        """Slowly rotate to center the detected object in the camera view."""
         pixel = self._detect(self.target_object)
         if pixel is None:
-            # Lost during alignment — go back to approach
-            self.get_logger().warn('[ALIGN] Lost object, returning to APPROACH')
-            self._transition_to(NavState.APPROACH)
+            # Lost object while centering — go back to scanning
+            if time.time() - self.state_start_time > OBJECT_LOST_TIMEOUT:
+                self.get_logger().warn('[CENTER] Lost object, returning to scan')
+                self._stop_base()
+                self.scan_check_start = None
+                self._transition_to(NavState.SCAN_CHECK)
             return
 
         u, v = pixel
         image_center_u = 320  # 640 / 2
-
-        # Pixel error: positive = object is to the right in the image
-        # Camera optical: +X = right. To center object, turn right (negative angular.z)
         pixel_error = u - image_center_u
-        angular_correction = -0.003 * pixel_error
 
-        # Get 3D position for distance check
-        full = self._detect_and_localize(self.target_object)
-        if full is not None:
-            _, base_pt = full
+        if abs(pixel_error) < CENTER_PIXEL_TOL:
+            # Centered — transition to approach
+            self._stop_base()
+            self.last_detection_time = time.time()
+            self.get_logger().info(
+                f'[CENTER] Object centered (pixel_err={pixel_error})')
+            self._transition_to(NavState.APPROACH)
+            return
+
+        # Slow angular correction
+        angular_z = -CENTER_GAIN * pixel_error
+        angular_z = np.clip(angular_z, -CENTER_MAX_ANGULAR, CENTER_MAX_ANGULAR)
+
+        twist = Twist()
+        twist.angular.z = angular_z
+        self.cmd_vel_pub.publish(twist)
+
+    def _get_center_depth_m(self):
+        """Get the median depth (metres) in a small center patch of the depth image.
+
+        Returns float distance in metres, or None if unavailable.
+        """
+        if self.latest_depth is None:
+            return None
+        h, w = self.latest_depth.shape
+        cy, cx = h // 2, w // 2
+        r = 15  # 31x31 patch
+        patch = self.latest_depth[max(0, cy - r):cy + r + 1,
+                                  max(0, cx - r):cx + r + 1]
+        valid = patch[(patch > 100) & (patch < 10000)]  # 0.1m – 10m
+        if len(valid) == 0:
+            return None
+        return float(np.median(valid)) / 1000.0
+
+    def _handle_approach(self):
+        """Drive forward slowly, re-detecting each tick for distance tracking.
+
+        Dynamically tilts the camera down to keep the object in view as the
+        robot gets closer. Stops completely when within GRASP_DISTANCE.
+        """
+        # ── Depth safety check (independent of YOLO) ──
+        center_depth = self._get_center_depth_m()
+        if center_depth is not None and center_depth < DEPTH_EMERGENCY_STOP:
+            self._stop_base()
+            self.get_logger().info(
+                f'[APPROACH] Depth emergency stop! center_depth={center_depth:.2f}m')
+            if self.target_base_pt is not None:
+                self._transition_to(NavState.POSITIONED)
+            return
+
+        # ── Re-detect for live tracking ──
+        detection = self._detect_and_localize(self.target_object)
+        if detection is not None:
+            pixel, base_pt = detection
             self.target_base_pt = base_pt
             self.last_detection_time = time.time()
 
+            u, v = pixel
+
+            # Object position in base_link: +X=left, -Y=forward
             distance = np.sqrt(base_pt.point.x**2 + base_pt.point.y**2)
 
-            linear_correction = 0.0
-            if distance > GRASP_DISTANCE + ALIGN_DISTANCE_TOLERANCE:
-                linear_correction = 0.05
-            elif distance < GRASP_DISTANCE - ALIGN_DISTANCE_TOLERANCE:
-                linear_correction = -0.05
+            self.get_logger().info(
+                f'[APPROACH] dist={distance:.2f}m  pixel=({u},{v})  '
+                f'tilt={self.approach_tilt:.2f}rad  depth={center_depth}',
+                throttle_duration_sec=1.0)
 
-            centered = abs(pixel_error) < ALIGN_PIXEL_TOLERANCE
-            at_distance = abs(distance - GRASP_DISTANCE) < ALIGN_DISTANCE_TOLERANCE
-
-            if centered and at_distance:
+            # Close enough — STOP completely (don't adjust camera)
+            if distance < GRASP_DISTANCE:
                 self._stop_base()
                 self.get_logger().info(
-                    f'[ALIGN] Positioned! dist={distance:.3f}m, '
-                    f'pixel_err={pixel_error}')
+                    f'[APPROACH] Positioned! dist={distance:.3f}m — stopping.')
                 self._transition_to(NavState.POSITIONED)
                 return
 
+            # ── Dynamic camera tilt: keep object centered vertically ──
+            # Only adjust while still driving (not when close enough to stop)
+            v_error = v - IMAGE_CENTER_V  # positive = object below center
+            tilt_adjust = APPROACH_TILT_GAIN * v_error
+            self.approach_tilt = np.clip(
+                self.approach_tilt + tilt_adjust,
+                APPROACH_TILT_MIN, APPROACH_TILT_MAX)
+            self._send_pan_tilt(0.0, self.approach_tilt)
+
+            # Drive forward with gentle heading correction
+            image_center_u = 320
+            pixel_error = u - image_center_u
+            angular_z = -APPROACH_HEADING_GAIN * pixel_error
+
+            # Scale speed based on distance — slower as we get closer
+            speed = min(APPROACH_SPEED, (distance - GRASP_DISTANCE) * 0.5)
+
+            # Also scale down if raw depth shows something close
+            if center_depth is not None and center_depth < DEPTH_SLOW_ZONE:
+                depth_speed = (center_depth - DEPTH_EMERGENCY_STOP) * 0.5
+                speed = min(speed, max(0.02, depth_speed))
+
+            speed = max(0.02, speed)  # minimal creep
+
             twist = Twist()
-            twist.linear.x = linear_correction
-            twist.angular.z = np.clip(angular_correction, -0.3, 0.3)
+            twist.linear.x = speed
+            twist.angular.z = np.clip(angular_z, -CENTER_MAX_ANGULAR, CENTER_MAX_ANGULAR)
             self.cmd_vel_pub.publish(twist)
         else:
-            # Have pixel but depth failed — just do angular correction
-            twist = Twist()
-            twist.angular.z = np.clip(angular_correction, -0.3, 0.3)
-            self.cmd_vel_pub.publish(twist)
+            # No detection — stop immediately, don't coast blind
+            self._stop_base()
+
+            # Tilt camera down more to try to re-acquire the object
+            if self.approach_tilt < APPROACH_TILT_MAX:
+                self.approach_tilt = min(
+                    self.approach_tilt + 0.05, APPROACH_TILT_MAX)
+                self._send_pan_tilt(0.0, self.approach_tilt)
+
+            if time.time() - self.last_detection_time > OBJECT_LOST_TIMEOUT:
+                self.get_logger().warn('[APPROACH] Lost object, returning to scan')
+                self.approach_tilt = CAMERA_TILT_NAV  # reset tilt
+                yaw = self._get_current_yaw()
+                if yaw is not None:
+                    self.scan_start_yaw = yaw
+                self.scan_step_index = 0
+                self.scan_target_yaw = self.scan_start_yaw
+                self.scan_check_start = None
+                self._transition_to(NavState.SCAN_CHECK)
 
     def _handle_positioned(self):
         """Stay stopped — we're in position."""
@@ -1009,19 +640,16 @@ class NavigateToObject(Node):
         if not self.target_object:
             return
 
-        # Publish map to RViz at 2Hz
-        self._publish_map()
-
         if self.nav_state == NavState.INIT:
             self._handle_init()
-        elif self.nav_state == NavState.SCAN:
-            self._handle_scan()
-        elif self.nav_state == NavState.EXPLORE:
-            self._handle_explore()
+        elif self.nav_state == NavState.SCAN_ROTATE:
+            self._handle_scan_rotate()
+        elif self.nav_state == NavState.SCAN_CHECK:
+            self._handle_scan_check()
+        elif self.nav_state == NavState.CENTER:
+            self._handle_center()
         elif self.nav_state == NavState.APPROACH:
             self._handle_approach()
-        elif self.nav_state == NavState.ALIGN:
-            self._handle_align()
         elif self.nav_state == NavState.POSITIONED:
             self._handle_positioned()
 

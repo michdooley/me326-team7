@@ -24,7 +24,7 @@ class ObjectClassifier(Node):
 
     def listener_callback(self, msg):
         frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-        results = self.model(frame, classes=[0, 46, 47], conf=0.5, verbose=False)
+        results = self.model(frame, classes=[0, 46, 47, 48, 45, 44, 49], conf=0.01, verbose=False)
 
         # Initialize the array message
         detection_array = Detection2DArray()
