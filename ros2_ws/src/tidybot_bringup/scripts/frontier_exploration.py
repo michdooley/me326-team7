@@ -66,7 +66,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Pose2D, Twist
 from nav_msgs.msg import MapMetaData, OccupancyGrid
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Bool, ColorRGBA
+from std_msgs.msg import Bool, ColorRGBA, Float64MultiArray
 from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
@@ -75,6 +75,12 @@ try:
     from cv_bridge import CvBridge
 except ImportError:
     print("ERROR: cv_bridge is required.")
+    raise
+
+try:
+    import cv2
+except ImportError:
+    print("ERROR: opencv-python is required.")
     raise
 
 
@@ -142,6 +148,17 @@ class FrontierExplorer(Node):
     NAV_TIMEOUT       = 30.0  # s before giving up on a navigation goal
     NO_FRONTIER_LIMIT = 3     # consecutive empty scans → declare COMPLETE
 
+    # ── Red block search (runs in parallel with frontier exploration) ────────
+    RED_MIN_CONTOUR_AREA       = 50.0   # px
+    RED_DETECT_PERIOD          = 0.20   # s
+    RED_TARGET_STALE_TIMEOUT   = 2.0    # s
+    RED_TARGET_UPDATE_MIN_DIST = 0.20   # m
+    RED_TARGET_NAV_OFFSET      = 0.55   # m stand-off from block center
+    RED_TARGET_REACHED_DIST    = 0.70   # m consider "at block" when inside this
+    SCAN_TILT_WHEN_EXPLORING   = 0.35   # rad, look slightly down to generate free-space rays
+    TARGET_TILT_WHEN_SEEN      = 0.65   # rad, hardcoded downward tilt
+    TARGET_TILT_CMD_PERIOD     = 0.50   # s, avoid spamming pan/tilt commands
+
     # ─────────────────────────────────────────────────────────────────────────
 
     def __init__(self):
@@ -164,6 +181,8 @@ class FrontierExplorer(Node):
             (self.GRID_SIZE, self.GRID_SIZE), np.nan, dtype=np.float32)
 
         # Camera state
+        self.latest_rgb         = None   # np.ndarray (H×W×3, rgb8)
+        self.latest_rgb_stamp   = None   # builtin_interfaces/Time
         self.latest_depth       = None   # np.ndarray (H×W, uint16, mm)
         self.latest_depth_stamp = None   # builtin_interfaces/Time
         self.camera_K           = None   # 3×3 intrinsic matrix
@@ -178,6 +197,13 @@ class FrontierExplorer(Node):
         self.no_frontier_count = 0
         self.base_goal_reached = False
         self.last_map_publish  = 0.0
+        self.current_nav_goal_kind = None  # 'frontier' | 'red_block' | None
+
+        # Red block tracking (continuously updated)
+        self.red_block_target_xy = None
+        self.red_block_last_seen = 0.0
+        self.last_red_detect_try = 0.0
+        self.last_target_tilt_cmd_time = 0.0
 
         # TF
         self.tf_buffer   = tf2_ros.Buffer()
@@ -187,6 +213,8 @@ class FrontierExplorer(Node):
         be = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(Image,      '/camera/depth/image_raw',
                                  self._depth_cb,       be)
+        self.create_subscription(Image,      '/camera/color/image_raw',
+                                 self._rgb_cb,         be)
         self.create_subscription(CameraInfo, '/camera/depth/camera_info',
                                  self._camera_info_cb, be)
         self.create_subscription(Bool, '/base/goal_reached',
@@ -197,6 +225,8 @@ class FrontierExplorer(Node):
         self.frontier_pub = self.create_publisher(MarkerArray,   '/frontier_markers', 10)
         self.cmd_vel_pub   = self.create_publisher(Twist,         '/cmd_vel',          10)
         self.base_goal_pub = self.create_publisher(Pose2D,        '/base/target_pose', 10)
+        self.pan_tilt_pub  = self.create_publisher(Float64MultiArray,
+                                                   '/camera/pan_tilt_cmd', 10)
 
         self.get_logger().info('=' * 55)
         self.get_logger().info('Frontier Explorer  (persistent map)')
@@ -227,12 +257,36 @@ class FrontierExplorer(Node):
         if self.camera_K is not None:
             self._integrate_depth()
 
+    def _rgb_cb(self, msg: Image):
+        try:
+            rgb = self.cv_bridge.imgmsg_to_cv2(msg, 'rgb8')
+        except Exception as e:
+            self.get_logger().warn(f'RGB conversion failed: {e}')
+            return
+        self.latest_rgb = rgb
+        self.latest_rgb_stamp = msg.header.stamp
+
     def _camera_info_cb(self, msg: CameraInfo):
         self.camera_K = np.array(msg.k).reshape(3, 3)
 
     def _goal_reached_cb(self, msg: Bool):
         if msg.data:
             self.base_goal_reached = True
+
+    def _set_camera_tilt(self, tilt_rad: float, force: bool = False):
+        """Command camera pan/tilt (pan fixed at 0 for exploration)."""
+        now = time.time()
+        if (not force and
+                now - self.last_target_tilt_cmd_time < self.TARGET_TILT_CMD_PERIOD):
+            return
+        msg = Float64MultiArray()
+        msg.data = [0.0, float(tilt_rad)]
+        self.pan_tilt_pub.publish(msg)
+        self.last_target_tilt_cmd_time = now
+
+    def _tilt_camera_down_for_target(self):
+        """Hardcode camera tilt down when target is seen so it stays in frame."""
+        self._set_camera_tilt(self.TARGET_TILT_WHEN_SEEN)
 
     # ── Grid helpers ──────────────────────────────────────────────────────────
 
@@ -269,6 +323,16 @@ class FrontierExplorer(Node):
     def get_heading(self):
         p = self.get_base_pose()
         return p[2] if p is not None else None
+
+    @staticmethod
+    def _quat_to_rot(q):
+        """Quaternion ROS msg -> 3x3 rotation matrix (frame -> parent)."""
+        qw, qx, qy, qz = q.w, q.x, q.y, q.z
+        return np.array([
+            [1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw), 2*(qx*qz+qy*qw)],
+            [2*(qx*qy+qz*qw),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
+            [2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw),   1-2*(qx*qx+qy*qy)],
+        ])
 
     # ── Mapping ───────────────────────────────────────────────────────────────
 
@@ -329,17 +393,8 @@ class FrontierExplorer(Node):
         except Exception:
             return
 
-        def _q2m(q):
-            """Quaternion ROS msg → 3×3 rotation matrix (frame → parent)."""
-            qw, qx, qy, qz = q.w, q.x, q.y, q.z
-            return np.array([
-                [1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw), 2*(qx*qz+qy*qw)],
-                [2*(qx*qy+qz*qw),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
-                [2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw),   1-2*(qx*qx+qy*qy)],
-            ])
-
-        R_ob = _q2m(tf_ob.transform.rotation)
-        R_bc = _q2m(tf_bc.transform.rotation)
+        R_ob = self._quat_to_rot(tf_ob.transform.rotation)
+        R_bc = self._quat_to_rot(tf_bc.transform.rotation)
         to   = tf_ob.transform.translation
         tc   = tf_bc.transform.translation
 
@@ -525,6 +580,185 @@ class FrontierExplorer(Node):
                 err += dx;  y += sy
 
     # ── Frontier detection ────────────────────────────────────────────────────
+
+    def _detect_red_block_pixel(self):
+        """Return (cx, cy, area_px) for the largest green blob in latest RGB frame."""
+        if self.latest_rgb is None:
+            return None
+
+        bgr = cv2.cvtColor(self.latest_rgb, cv2.COLOR_RGB2BGR)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+        # Green HSV range (tune if your scene lighting differs)
+        lower_green = np.array([35, 40, 30], dtype=np.uint8)
+        upper_green = np.array([95, 255, 255], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower_green, upper_green)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        largest = max(contours, key=cv2.contourArea)
+        area = float(cv2.contourArea(largest))
+        if area < self.RED_MIN_CONTOUR_AREA:
+            return None
+
+        M = cv2.moments(largest)
+        if M['m00'] == 0:
+            return None
+
+        cx = int(M['m10'] / M['m00'])
+        cy = int(M['m01'] / M['m00'])
+        return cx, cy, area
+
+    def _red_block_pixel_to_odom(self, cx, cy):
+        """Project a red-block pixel to odom using current depth + color TF."""
+        if self.latest_depth is None or self.camera_K is None:
+            return None
+
+        h, w = self.latest_depth.shape
+        if not (0 <= cx < w and 0 <= cy < h):
+            return None
+
+        depth_mm = float(self.latest_depth[cy, cx])
+        if depth_mm <= 0.0 or depth_mm > self.MAX_DEPTH_M * 1000.0:
+            return None
+        depth_m = depth_mm / 1000.0
+
+        fx = float(self.camera_K[0, 0])
+        fy = float(self.camera_K[1, 1])
+        px = float(self.camera_K[0, 2])
+        py = float(self.camera_K[1, 2])
+        x_cam = (cx - px) * depth_m / fx
+        y_cam = (cy - py) * depth_m / fy
+        z_cam = depth_m
+
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                'odom', 'camera_color_optical_frame',
+                rclpy.time.Time(), timeout=Duration(seconds=0.1))
+        except Exception:
+            return None
+
+        R = self._quat_to_rot(tf.transform.rotation)
+        t = tf.transform.translation
+        cam_origin = np.array([t.x, t.y, t.z], dtype=np.float64)
+        point_odom = R @ np.array([x_cam, y_cam, z_cam], dtype=np.float64) + cam_origin
+
+        # Block should be near the floor; reject obvious false detections.
+        if point_odom[2] < -0.3 or point_odom[2] > 1.0:
+            return None
+        return point_odom
+
+    def _update_red_block_target(self):
+        """Continuously search for red block and maintain latest odom target."""
+        now = time.time()
+        if now - self.last_red_detect_try < self.RED_DETECT_PERIOD:
+            return
+        self.last_red_detect_try = now
+
+        detection = self._detect_red_block_pixel()
+        if detection is None:
+            if (self.red_block_target_xy is not None and
+                    now - self.red_block_last_seen > self.RED_TARGET_STALE_TIMEOUT):
+                self.get_logger().info('[RED] Lost target (stale) — resuming frontier-only.')
+                self.red_block_target_xy = None
+            return
+
+        cx, cy, area = detection
+        self._tilt_camera_down_for_target()
+        point_odom = self._red_block_pixel_to_odom(cx, cy)
+        if point_odom is None:
+            return
+
+        new_xy = np.array([float(point_odom[0]), float(point_odom[1])], dtype=np.float64)
+        changed = True
+        if self.red_block_target_xy is not None:
+            changed = np.linalg.norm(new_xy - self.red_block_target_xy) >= self.RED_TARGET_UPDATE_MIN_DIST
+
+        self.red_block_target_xy = new_xy
+        self.red_block_last_seen = now
+        if changed:
+            self.get_logger().info(
+                f'[RED] Detected target at ({new_xy[0]:.2f}, {new_xy[1]:.2f}) '
+                f'area={area:.0f}px')
+
+    def _distance_to_red_block(self):
+        if self.red_block_target_xy is None:
+            return None
+        base_pose = self.get_base_pose()
+        if base_pose is None:
+            return None
+        return float(np.hypot(self.red_block_target_xy[0] - base_pose[0],
+                              self.red_block_target_xy[1] - base_pose[1]))
+
+    def _compute_red_block_goal(self):
+        """Return (goal_x, goal_y, goal_theta) that approaches the red block."""
+        if self.red_block_target_xy is None:
+            return None
+        base_pose = self.get_base_pose()
+        if base_pose is None:
+            return None
+
+        bx, by, _ = base_pose
+        tx, ty = float(self.red_block_target_xy[0]), float(self.red_block_target_xy[1])
+        dx, dy = tx - bx, ty - by
+        dist = float(np.hypot(dx, dy))
+        if dist < 1e-6:
+            return None
+
+        if dist > self.RED_TARGET_NAV_OFFSET:
+            ratio = (dist - self.RED_TARGET_NAV_OFFSET) / dist
+            goal_x = bx + dx * ratio
+            goal_y = by + dy * ratio
+        else:
+            goal_x, goal_y = bx, by
+
+        goal_theta = np.arctan2(dy, dx)
+        return goal_x, goal_y, goal_theta
+
+    def _publish_nav_goal(self, goal_x, goal_y, goal_theta, kind, description):
+        """Publish /base/target_pose and enter NAVIGATING."""
+        user_theta = goal_theta - np.pi / 2  # bridge frame convention
+
+        self.get_logger().info(
+            f'[{kind.upper()}] Goal ({goal_x:.2f}, {goal_y:.2f}) '
+            f'heading={np.degrees(goal_theta):.0f}° {description}')
+
+        goal = Pose2D()
+        goal.x = float(goal_x)
+        goal.y = float(goal_y)
+        goal.theta = float(user_theta)
+        self.base_goal_reached = False
+        self.base_goal_pub.publish(goal)
+        self.nav_start_time = time.time()
+        self.current_nav_goal_kind = kind
+        self.state = ExploreState.NAVIGATING
+
+    def _maybe_preempt_with_red_block(self):
+        """If red block is known, interrupt scan/frontier nav and pursue it."""
+        if self.red_block_target_xy is None:
+            return False
+
+        dist = self._distance_to_red_block()
+        if dist is not None and dist <= self.RED_TARGET_REACHED_DIST:
+            self.get_logger().info('[RED] Reached red block target region.')
+            self.state = ExploreState.COMPLETE
+            return True
+
+        # Avoid re-sending the same goal continuously if already pursuing red.
+        if self.state == ExploreState.NAVIGATING and self.current_nav_goal_kind == 'red_block':
+            return False
+
+        red_goal = self._compute_red_block_goal()
+        if red_goal is None:
+            return False
+
+        if self.state == ExploreState.SCANNING:
+            self._stop_base()
+            self.scan_settle_start = None
+
+        self._publish_nav_goal(*red_goal, kind='red_block', description='(red block priority)')
+        return True
 
     def find_frontiers(self):
         """
@@ -736,6 +970,10 @@ class FrontierExplorer(Node):
         self.scan_accumulated  = 0.0
         self.scan_last_heading = None
         self.scan_settle_start = None
+        self.current_nav_goal_kind = None
+        # In sparse scenes, looking slightly downward helps build free-space map
+        # from floor returns so frontier rings form even without nearby obstacles.
+        self._set_camera_tilt(self.SCAN_TILT_WHEN_EXPLORING, force=True)
         self.state = ExploreState.SCANNING
         self.get_logger().info('[SCAN] Starting 360° rotation scan...')
 
@@ -743,6 +981,9 @@ class FrontierExplorer(Node):
         self.cmd_vel_pub.publish(Twist())
 
     def _state_scanning(self):
+        if self._maybe_preempt_with_red_block():
+            return
+
         if self.scan_settle_start is not None:
             if time.time() - self.scan_settle_start >= self.SCAN_SETTLE_TIME:
                 self.get_logger().info('[SCAN] Settled — selecting frontier.')
@@ -772,6 +1013,17 @@ class FrontierExplorer(Node):
             self.cmd_vel_pub.publish(cmd)
 
     def _state_selecting(self):
+        if self.red_block_target_xy is not None:
+            red_goal = self._compute_red_block_goal()
+            if red_goal is not None:
+                self.get_logger().info(
+                    f'[SELECT] Red block target available '
+                    f'({self.red_block_target_xy[0]:.2f}, {self.red_block_target_xy[1]:.2f}) — '
+                    f'prioritizing over frontier.')
+                self._publish_nav_goal(*red_goal, kind='red_block',
+                                       description='(priority over frontier)')
+                return
+
         frontiers = self.find_frontiers()
         self.publish_frontiers(frontiers)
 
@@ -843,21 +1095,27 @@ class FrontierExplorer(Node):
         self.get_logger().info(
             f'[SELECT] Goal ({goal_x:.2f}, {goal_y:.2f}) '
             f'heading={np.degrees(goal_theta):.0f}°')
-
-        goal = Pose2D()
-        goal.x = goal_x;  goal.y = goal_y;  goal.theta = user_theta
-        self.base_goal_reached = False
-        self.base_goal_pub.publish(goal)
-        self.nav_start_time = time.time()
-        self.state = ExploreState.NAVIGATING
+        self._publish_nav_goal(goal_x, goal_y, goal_theta, kind='frontier',
+                               description='(frontier exploration)')
 
     def _state_navigating(self):
+        if self.current_nav_goal_kind != 'red_block' and self._maybe_preempt_with_red_block():
+            return
+
         if self.base_goal_reached:
-            self.get_logger().info('[NAV] Goal reached — starting scan.')
-            self._start_scan()
+            if self.current_nav_goal_kind == 'red_block':
+                self.get_logger().info('[NAV] Red block goal reached — stopping exploration.')
+                self.state = ExploreState.COMPLETE
+            else:
+                self.get_logger().info('[NAV] Goal reached — starting scan.')
+                self._start_scan()
             return
         if time.time() - self.nav_start_time > self.NAV_TIMEOUT:
-            self.get_logger().warn('[NAV] Timeout — scanning from here.')
+            if self.current_nav_goal_kind == 'red_block':
+                self.get_logger().warn('[NAV] Red block timeout — clearing target and resuming scan.')
+                self.red_block_target_xy = None
+            else:
+                self.get_logger().warn('[NAV] Timeout — scanning from here.')
             self._start_scan()
 
     def _state_complete(self):
@@ -902,6 +1160,7 @@ class FrontierExplorer(Node):
 
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.05)
+            self._update_red_block_target()
 
             now = time.time()
             if now - self.last_map_publish >= 1.0 / self.MAP_PUBLISH_RATE:
