@@ -216,7 +216,15 @@ class FrontierExplorer(Node):
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
     def _depth_cb(self, msg: Image):
-        """Store the latest depth frame and immediately integrate it."""
+        """Store the latest depth frame and integrate it (scanning only).
+
+        Depth integration is skipped while NAVIGATING to avoid translational
+        smearing — the 100 Hz publish_callback TF is not synchronised with
+        depth frames, so during forward motion the positional offset between
+        the TF timestamp and the actual sim state stretches obstacles along
+        the direction of travel.  All mapping is done during the stationary
+        360° SCANNING phase instead.
+        """
         try:
             depth = self.cv_bridge.imgmsg_to_cv2(msg, '16UC1')
         except Exception as e:
@@ -224,7 +232,7 @@ class FrontierExplorer(Node):
             return
         self.latest_depth       = depth
         self.latest_depth_stamp = msg.header.stamp
-        if self.camera_K is not None:
+        if self.camera_K is not None and self.state != ExploreState.NAVIGATING:
             self._integrate_depth()
 
     def _camera_info_cb(self, msg: CameraInfo):
