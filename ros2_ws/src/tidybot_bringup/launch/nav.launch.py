@@ -12,7 +12,12 @@ def generate_launch_description():
             executable='object_classifier',   # Your python script/entry point
             name='classifier',
             output='screen',
-            parameters=[{'use_sim_time': False}] # Set to True if in MuJoCo
+            parameters=[
+                {'use_sim_time': True},
+                {'conf_threshold': 0.25},
+                {'restrict_classes': False},
+                {'class_ids': [46]},
+            ]
         ),
 
         # 2. The Explore and Find Node (The "Brain")
@@ -24,7 +29,8 @@ def generate_launch_description():
             output='screen',
             parameters=[
                 {'target_class_id': 46}, # 46 is 'banana' in YOLOv8
-                {'use_sim_time': False}
+                {'target_label': 'banana'},
+                {'use_sim_time': True}
             ]
         )
     ])

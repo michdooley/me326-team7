@@ -47,6 +47,8 @@ install(PROGRAMS
   scripts/frontier_exploration_codex.py
   scripts/objective1_task.py
   scripts/task_navigate_with_avoidance.py
+  scripts/task_navigate_and_return.py
+  scripts/explore_and_find_object.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

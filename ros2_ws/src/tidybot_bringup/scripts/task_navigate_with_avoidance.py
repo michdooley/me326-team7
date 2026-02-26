@@ -8,7 +8,7 @@ Usage:
     ros2 run tidybot_bringup task_navigate_with_avoidance.py --ros-args -p navigation_mode:=reactive_forward
 
 Modes:
-    - seek_red_cylinder (default): search for and approach a red cylinder.
+    - seek_target (default): search for and approach target class from /objbbox.
     - rviz_goal: navigate to a clicked 2D Nav Goal in RViz.
     - reactive_forward: drive forward and turn when blocked.
 """
@@ -20,6 +20,7 @@ from geometry_msgs.msg import Pose2D, PoseStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image
 from std_msgs.msg import Float64MultiArray
+from vision_msgs.msg import Detection2DArray
 from enum import Enum
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -62,19 +63,20 @@ class NavigationTaskNode(Node):
     FORWARD_REGION_Y_MIN_FRAC = 0.40
     MIN_BLOCKING_AREA_FRAC = 0.01
     STOP_LOG_INTERVAL = 1.0
-    DEFAULT_NAVIGATION_MODE = 'seek_red_cylinder'
+    DEFAULT_NAVIGATION_MODE = 'seek_target'
     REACTIVE_FORWARD_STEP_M = 0.35
-    REACTIVE_TURN_STEP_RAD = 0.45
+    REACTIVE_TURN_STEP_RAD = 0.30
     SEEK_TARGET_STOP_DISTANCE_M = 0.35
-    SEEK_HEADING_GAIN = 0.8
+    SEEK_HEADING_GAIN = 0.45
     SEEK_FORWARD_STEP_M = 0.25
-    APPROACH_MAX_BEARING_RAD = 0.8
+    APPROACH_MAX_BEARING_RAD = 0.30
     APPROACH_CENTER_TOLERANCE = 0.12
+    APPROACH_CENTER_HYSTERESIS = 0.06
     APPROACH_TURN_SIGN = -1.0
     APPROACH_AVOID_STEP_M = 0.30
     APPROACH_AVOID_MIN_TURN_RAD = 0.45
     APPROACH_OBSTACLE_TARGET_MARGIN_M = 0.20
-    APPROACH_AVOID_TURN_STEP_RAD = 0.35
+    APPROACH_AVOID_TURN_STEP_RAD = 0.22
     APPROACH_AVOID_MAX_DURATION_S = 4.0
     APPROACH_CLEAR_FRAMES = 4
     APPROACH_AVOID_TURNS_BEFORE_NUDGE = 1
@@ -87,8 +89,10 @@ class NavigationTaskNode(Node):
     APPROACH_BLOCK_CORRIDOR_PERCENTILE = 20.0
     APPROACH_BLOCK_MIN_VALID_PIXELS = 120
     RED_MIN_PIXELS = 120
+    TARGET_CLASS_ID = 46
+    YOLO_DETECTION_MAX_AGE_S = 1.5
     SEEK_SEARCH_SCAN_TOTAL_RAD = 2.0 * np.pi
-    SEEK_SEARCH_SCAN_STEP_RAD = 0.18
+    SEEK_SEARCH_SCAN_STEP_RAD = 0.10
     SEEK_SEARCH_SCAN_EXPLORED_RAD = 1.8
     SEEK_SEARCH_MOVE_DURATION_S = 2.5
     SEEK_SEARCH_MOVE_DISTANCE_M = 0.9
@@ -96,15 +100,29 @@ class NavigationTaskNode(Node):
     SEEK_SEARCH_VISIT_PENALTY = 0.25
     APPROACH_DETECT_FRAMES = 3
     APPROACH_LOST_FRAMES = 12
-    APPROACH_TARGET_MEMORY_S = 0.8
+    APPROACH_TARGET_MEMORY_S = 1.5
+    APPROACH_REACHED_VISIBLE_FRAMES = 2
+    SIMPLE_YOLO_APPROACH_ENABLE = True
+    SIMPLE_CENTER_TURN_STEP_RAD = 0.08
+    SIMPLE_FORWARD_STEP_M = 0.10
+    SIMPLE_MIN_FORWARD_STEP_M = 0.03
+    APPROACH_TILT_DOWN_SIGN = 1.0
+    SIMPLE_TILT_DOWN_STEP_RAD = 0.06
+    SIMPLE_TILT_DOWN_LIMIT_RAD = 1.00
+    SIMPLE_TILT_BASE_SCALE_ROTATE = 0.45
+    SIMPLE_TILT_DEADBAND_FRAC = 0.01
+    SIMPLE_TILT_UP_SCALE = 0.60
+    APPROACH_STOP_DISTANCE_BUFFER_M = 0.08
     AUTO_TILT_ENABLE = True
-    AUTO_TILT_TARGET_Y_FRAC = 0.62
-    AUTO_TILT_DEADBAND_FRAC = 0.08
-    AUTO_TILT_STEP_RAD = 0.03
-    AUTO_TILT_MIN_RAD = -0.85
+    AUTO_TILT_TARGET_Y_FRAC = 0.76
+    AUTO_TILT_DEADBAND_FRAC = 0.03
+    AUTO_TILT_GAIN = 0.20
+    AUTO_TILT_UP_SCALE = 0.35
+    AUTO_TILT_STEP_RAD = 0.08
+    AUTO_TILT_MIN_RAD = -1.20
     AUTO_TILT_MAX_RAD = 0.30
-    AUTO_TILT_NEAR_DIST_M = 0.75
-    AUTO_TILT_NEAR_EXTRA_DOWN = 0.08
+    AUTO_TILT_NEAR_DIST_M = 1.20
+    AUTO_TILT_NEAR_EXTRA_DOWN = 0.16
     EXPLORE_MEMORY_CELL_SIZE_M = 0.5
     EXPLORE_CANDIDATE_COUNT = 12
     EXPLORE_UNEXPLORED_VISITS_THRESHOLD = 1
@@ -115,11 +133,14 @@ class NavigationTaskNode(Node):
         # Navigation mode:
         # - rviz_goal: click a 2D goal in RViz and navigate to it.
         # - reactive_forward: keep driving forward; if blocked, rotate until clear.
-        # - seek_red_cylinder: navigate to red cylinder using camera/depth.
+        # - seek_target: navigate to detected target using YOLO bbox + depth.
         self.navigation_mode = self.declare_parameter(
             'navigation_mode', self.DEFAULT_NAVIGATION_MODE
         ).value
-        if self.navigation_mode not in ('rviz_goal', 'reactive_forward', 'seek_red_cylinder'):
+        if self.navigation_mode == 'seek_red_cylinder':
+            # Backward-compatible alias.
+            self.navigation_mode = 'seek_target'
+        if self.navigation_mode not in ('rviz_goal', 'reactive_forward', 'seek_target'):
             self.get_logger().warn(
                 f'Unknown navigation_mode="{self.navigation_mode}", using "{self.DEFAULT_NAVIGATION_MODE}".'
             )
@@ -150,6 +171,12 @@ class NavigationTaskNode(Node):
             self.declare_parameter(
                 'approach_center_tolerance',
                 self.APPROACH_CENTER_TOLERANCE
+            ).value
+        )
+        self.approach_center_hysteresis = float(
+            self.declare_parameter(
+                'approach_center_hysteresis',
+                self.APPROACH_CENTER_HYSTERESIS
             ).value
         )
         self.approach_turn_sign = float(
@@ -296,6 +323,87 @@ class NavigationTaskNode(Node):
                 self.APPROACH_TARGET_MEMORY_S
             ).value
         )
+        self.approach_reached_visible_frames = int(
+            self.declare_parameter(
+                'approach_reached_visible_frames',
+                self.APPROACH_REACHED_VISIBLE_FRAMES
+            ).value
+        )
+        self.simple_yolo_approach_enable = bool(
+            self.declare_parameter(
+                'simple_yolo_approach_enable',
+                self.SIMPLE_YOLO_APPROACH_ENABLE
+            ).value
+        )
+        self.simple_center_turn_step_rad = float(
+            self.declare_parameter(
+                'simple_center_turn_step_rad',
+                self.SIMPLE_CENTER_TURN_STEP_RAD
+            ).value
+        )
+        self.simple_forward_step_m = float(
+            self.declare_parameter(
+                'simple_forward_step_m',
+                self.SIMPLE_FORWARD_STEP_M
+            ).value
+        )
+        self.simple_min_forward_step_m = float(
+            self.declare_parameter(
+                'simple_min_forward_step_m',
+                self.SIMPLE_MIN_FORWARD_STEP_M
+            ).value
+        )
+        self.approach_tilt_down_sign = float(
+            self.declare_parameter(
+                'approach_tilt_down_sign',
+                self.APPROACH_TILT_DOWN_SIGN
+            ).value
+        )
+        self.approach_stop_distance_buffer_m = float(
+            self.declare_parameter(
+                'approach_stop_distance_buffer_m',
+                self.APPROACH_STOP_DISTANCE_BUFFER_M
+            ).value
+        )
+        self.simple_tilt_down_step_rad = float(
+            self.declare_parameter(
+                'simple_tilt_down_step_rad',
+                self.SIMPLE_TILT_DOWN_STEP_RAD
+            ).value
+        )
+        self.simple_tilt_down_limit_rad = float(
+            self.declare_parameter(
+                'simple_tilt_down_limit_rad',
+                self.SIMPLE_TILT_DOWN_LIMIT_RAD
+            ).value
+        )
+        self.simple_tilt_base_scale_rotate = float(
+            self.declare_parameter(
+                'simple_tilt_base_scale_rotate',
+                self.SIMPLE_TILT_BASE_SCALE_ROTATE
+            ).value
+        )
+        self.simple_tilt_deadband_frac = float(
+            self.declare_parameter(
+                'simple_tilt_deadband_frac',
+                self.SIMPLE_TILT_DEADBAND_FRAC
+            ).value
+        )
+        self.simple_tilt_up_scale = float(
+            self.declare_parameter(
+                'simple_tilt_up_scale',
+                self.SIMPLE_TILT_UP_SCALE
+            ).value
+        )
+        self.use_yolo_target_detection = bool(
+            self.declare_parameter('use_yolo_target_detection', True).value
+        )
+        self.target_class_id = int(
+            self.declare_parameter('target_class_id', self.TARGET_CLASS_ID).value
+        )
+        self.yolo_detection_max_age_s = float(
+            self.declare_parameter('yolo_detection_max_age_s', self.YOLO_DETECTION_MAX_AGE_S).value
+        )
         self.auto_tilt_enable = bool(
             self.declare_parameter('auto_tilt_enable', self.AUTO_TILT_ENABLE).value
         )
@@ -304,6 +412,12 @@ class NavigationTaskNode(Node):
         )
         self.auto_tilt_deadband_frac = float(
             self.declare_parameter('auto_tilt_deadband_frac', self.AUTO_TILT_DEADBAND_FRAC).value
+        )
+        self.auto_tilt_gain = float(
+            self.declare_parameter('auto_tilt_gain', self.AUTO_TILT_GAIN).value
+        )
+        self.auto_tilt_up_scale = float(
+            self.declare_parameter('auto_tilt_up_scale', self.AUTO_TILT_UP_SCALE).value
         )
         self.auto_tilt_step_rad = float(
             self.declare_parameter('auto_tilt_step_rad', self.AUTO_TILT_STEP_RAD).value
@@ -346,6 +460,9 @@ class NavigationTaskNode(Node):
         # Subscriber
         self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
         self.goal_sub = self.create_subscription(PoseStamped, '/goal_pose', self.goal_callback, 10)
+        self.yolo_sub = self.create_subscription(
+            Detection2DArray, '/objbbox', self.yolo_detections_callback, 10
+        )
 
         # Camera-based obstacle detection state
         self.obstacle_bbox_depth = None  # (x, y, w, h) in depth image coordinates
@@ -358,9 +475,14 @@ class NavigationTaskNode(Node):
         self.red_target_visible = False
         self.red_bbox_color = None  # (x, y, w, h) in color image
         self.red_target_distance_m = None
+        self.yolo_bbox_color = None  # latest target-class bbox in color image coords
+        self.yolo_bbox_time = None
         self.last_red_seen_time = None
         self.last_red_bbox_color = None
         self.last_red_distance_m = None
+        self.last_target_heading = None
+        self.last_target_heading_time = None
+        self.last_target_distance_m = None
         self.latest_depth_mm = None
         self.latest_depth_valid = None
         self.latest_color_shape = None
@@ -381,6 +503,8 @@ class NavigationTaskNode(Node):
         self.approach_avoid_start_time = self.get_clock().now()
         self.approach_clear_streak = 0
         self.approach_avoid_cmd_count = 0
+        self.approach_centered_locked = False
+        self.approach_reached_visible_streak = 0
         self.visit_counts = {}
         self.last_visited_cell = None
         self.scanned_cells = set()
@@ -427,13 +551,17 @@ class NavigationTaskNode(Node):
             self.get_logger().info(
                 'Reactive mode enabled: driving forward, rotating when obstacle blocks path.'
             )
-        elif self.navigation_mode == 'seek_red_cylinder':
+        elif self.navigation_mode == 'seek_target':
             self.get_logger().info(
-                'Seek-red mode enabled: SEARCH_SCAN -> SEARCH_MOVE -> APPROACH.'
+                'Seek-target mode enabled: SEARCH_SCAN -> SEARCH_MOVE -> APPROACH.'
             )
             if not CV_AVAILABLE:
                 self.get_logger().warn(
-                    'seek_red_cylinder requires cv_bridge/opencv image processing for detection.'
+                    'seek_target requires cv_bridge/opencv image processing for detection.'
+                )
+            if self.use_yolo_target_detection:
+                self.get_logger().info(
+                    f'Using YOLO detections from /objbbox (target_class_id={self.target_class_id}).'
                 )
         if CV_AVAILABLE:
             self.get_logger().info(
@@ -485,6 +613,61 @@ class NavigationTaskNode(Node):
             f'New goal: ({self.target_x:.2f}, {self.target_y:.2f}) '
             f'facing {np.rad2deg(self.target_theta):.0f}°'
         )
+
+    def yolo_detections_callback(self, msg: Detection2DArray):
+        """Track latest YOLO bbox for configured target class in color-image coordinates."""
+        if not self.use_yolo_target_detection:
+            return
+
+        best_bbox = None
+        best_score = -1.0
+        for detection in msg.detections:
+            if not detection.results:
+                continue
+            class_raw = detection.results[0].hypothesis.class_id
+            try:
+                class_id = int(class_raw)
+            except (TypeError, ValueError):
+                continue
+            if class_id != self.target_class_id:
+                continue
+
+            score = float(detection.results[0].hypothesis.score)
+            cx = float(detection.bbox.center.position.x)
+            cy = float(detection.bbox.center.position.y)
+            w = float(detection.bbox.size_x)
+            h = float(detection.bbox.size_y)
+            x = int(round(cx - 0.5 * w))
+            y = int(round(cy - 0.5 * h))
+            bbox = (x, y, int(max(1, round(w))), int(max(1, round(h))))
+            if score > best_score:
+                best_score = score
+                best_bbox = bbox
+
+        if best_bbox is not None:
+            self.yolo_bbox_color = best_bbox
+            self.yolo_bbox_time = self.get_clock().now()
+
+    def _get_yolo_target_bbox(self):
+        """Return recent target bbox from YOLO, clipped to latest color image shape."""
+        if not self.use_yolo_target_detection:
+            return None
+        if self.yolo_bbox_color is None or self.yolo_bbox_time is None:
+            return None
+        if self.latest_color_shape is None:
+            return None
+
+        age_s = (self.get_clock().now() - self.yolo_bbox_time).nanoseconds / 1e9
+        if age_s > self.yolo_detection_max_age_s:
+            return None
+
+        x, y, w, h = self.yolo_bbox_color
+        color_h, color_w = self.latest_color_shape
+        x = max(0, min(x, color_w - 1))
+        y = max(0, min(y, color_h - 1))
+        w = max(1, min(w, color_w - x))
+        h = max(1, min(h, color_h - y))
+        return x, y, w, h
 
     def get_distance_to_target(self) -> float:
         dx = self.target_x - self.current_x
@@ -552,29 +735,47 @@ class NavigationTaskNode(Node):
 
         self.latest_color_shape = color_image.shape[:2]
         overlay = color_image.copy()
-        red_bbox = self._detect_red_target_bbox(color_image)
-        self.red_target_visible = red_bbox is not None
-        self.red_bbox_color = red_bbox
+        if self.use_yolo_target_detection:
+            target_bbox = self._get_yolo_target_bbox()
+        else:
+            target_bbox = self._detect_red_target_bbox(color_image)
+        self.red_target_visible = target_bbox is not None
+        self.red_bbox_color = target_bbox
         self.red_target_distance_m = self._estimate_red_target_distance()
 
         if self.red_target_visible:
             self.last_red_seen_time = self.get_clock().now()
             self.last_red_bbox_color = self.red_bbox_color
             self.last_red_distance_m = self.red_target_distance_m
-            if self.auto_tilt_enable:
+            if self.auto_tilt_enable and not (
+                self.use_yolo_target_detection and self.simple_yolo_approach_enable
+            ):
                 self._update_camera_tilt_for_target(self.red_bbox_color, self.red_target_distance_m)
             rx, ry, rw, rh = self.red_bbox_color
             cv2.rectangle(overlay, (rx, ry), (rx + rw, ry + rh), (0, 255, 0), 2)
             if self.red_target_distance_m is not None:
+                target_label = (
+                    f'Class {self.target_class_id}' if self.use_yolo_target_detection else 'Red target'
+                )
                 cv2.putText(
                     overlay,
-                    f'Red target: {self.red_target_distance_m:.2f} m',
+                    f'{target_label}: {self.red_target_distance_m:.2f} m',
                     (rx, max(20, ry - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
                     (0, 255, 0),
                     2,
                 )
+        elif (
+            self.auto_tilt_enable
+            and not (self.use_yolo_target_detection and self.simple_yolo_approach_enable)
+            and self.last_red_seen_time is not None
+            and self.last_red_bbox_color is not None
+        ):
+            # Keep mild tilt recentering during brief detector dropouts.
+            dt = (self.get_clock().now() - self.last_red_seen_time).nanoseconds / 1e9
+            if dt <= self.approach_target_memory_s:
+                self._update_camera_tilt_for_target(self.last_red_bbox_color, self.last_red_distance_m)
 
         if self.obstacle_bbox_depth is not None and self.obstacle_distance_m is not None:
             bbox_color = self._map_bbox_to_color(
@@ -618,11 +819,26 @@ class NavigationTaskNode(Node):
         if abs(error) < self.auto_tilt_deadband_frac:
             return
 
-        # Positive error => target appears too high -> tilt down (more negative tilt).
+        # Asymmetric proportional correction:
+        # - tilt down quickly when target is too high in image,
+        # - recover up more slowly to avoid oscillation/hunting.
+        #
+        # NOTE: In this setup, increasing camera_tilt_cmd tilts camera downward.
         if error > 0.0:
-            self.camera_tilt_cmd -= self.auto_tilt_step_rad
+            down_delta = float(
+                np.clip(self.auto_tilt_gain * error, 0.0, self.auto_tilt_step_rad)
+            )
+            self.camera_tilt_cmd += down_delta
         else:
-            self.camera_tilt_cmd += self.auto_tilt_step_rad
+            up_scale = max(0.0, min(self.auto_tilt_up_scale, 1.0))
+            up_delta = float(
+                np.clip(
+                    self.auto_tilt_gain * (-error) * up_scale,
+                    0.0,
+                    self.auto_tilt_step_rad * up_scale,
+                )
+            )
+            self.camera_tilt_cmd -= up_delta
 
         self.camera_tilt_cmd = float(
             np.clip(self.camera_tilt_cmd, self.auto_tilt_min_rad, self.auto_tilt_max_rad)
@@ -840,7 +1056,7 @@ class NavigationTaskNode(Node):
         if self.navigation_mode == 'rviz_goal' and not self.has_goal:
             return
 
-        if self.navigation_mode == 'seek_red_cylinder':
+        if self.navigation_mode == 'seek_target':
             self.seek_mode = 'search_scan'
             self.scan_accumulated_yaw = 0.0
             self.scan_last_theta = self.current_theta
@@ -853,8 +1069,8 @@ class NavigationTaskNode(Node):
         if self.navigation_mode == 'reactive_forward':
             self.handle_reactive_forward(current_time)
             return
-        if self.navigation_mode == 'seek_red_cylinder':
-            self.handle_seek_red_cylinder(current_time)
+        if self.navigation_mode == 'seek_target':
+            self.handle_seek_target(current_time)
             return
 
         if self.is_at_target():
@@ -924,8 +1140,18 @@ class NavigationTaskNode(Node):
         forward_y = self.current_y + self.reactive_forward_step_m * np.sin(self.current_theta)
         self.publish_pose_target(forward_x, forward_y, self.current_theta)
 
-    def handle_seek_red_cylinder(self, current_time):
-        """Primary objective: navigate toward red cylinder with SEARCH/APPROACH loop."""
+    def handle_seek_target(self, current_time):
+        """Primary objective: navigate toward YOLO target with SEARCH/APPROACH loop."""
+        if self.red_target_reached_logged:
+            self.publish_hold_position()
+            return
+        detect_frames_required = max(1, self.approach_detect_frames)
+        lost_frames_required = max(1, self.approach_lost_frames)
+        if self.use_yolo_target_detection:
+            # YOLO detections can flicker; enter approach quickly and keep target lock longer.
+            detect_frames_required = 1
+            lost_frames_required = max(lost_frames_required, 20)
+
         if self.red_target_visible:
             self.red_detect_streak += 1
             self.red_lost_streak = 0
@@ -933,12 +1159,17 @@ class NavigationTaskNode(Node):
             self.red_detect_streak = 0
             self.red_lost_streak += 1
 
-        if self.seek_mode != 'approach' and self.red_detect_streak >= max(1, self.approach_detect_frames):
+        if self.seek_mode != 'approach' and self.red_detect_streak >= detect_frames_required:
             self.seek_mode = 'approach'
             self.approach_avoid_active = False
+            self.approach_centered_locked = False
+            self.approach_reached_visible_streak = 0
             self.get_logger().info('Seek mode: APPROACH (target detected).')
 
-        if self.seek_mode == 'approach' and self.red_lost_streak >= max(1, self.approach_lost_frames):
+        if self.seek_mode != 'approach' and self._recenter_from_last_target(current_time):
+            return
+
+        if self.seek_mode == 'approach' and self.red_lost_streak >= lost_frames_required:
             memory_active = False
             if self.last_red_seen_time is not None:
                 dt = (current_time - self.last_red_seen_time).nanoseconds / 1e9
@@ -946,6 +1177,8 @@ class NavigationTaskNode(Node):
             if not memory_active:
                 self.seek_mode = 'search_scan'
                 self.approach_avoid_active = False
+                self.approach_centered_locked = False
+                self.approach_reached_visible_streak = 0
                 self.scan_accumulated_yaw = 0.0
                 self.scan_last_theta = self.current_theta
                 self.get_logger().info('Seek mode: SEARCH_SCAN (lost target).')
@@ -960,6 +1193,200 @@ class NavigationTaskNode(Node):
     def _wrapped_angle_diff(self, current: float, previous: float) -> float:
         """Smallest signed angle difference current - previous."""
         return np.arctan2(np.sin(current - previous), np.cos(current - previous))
+
+    def _heading_from_target_bbox(self, bbox):
+        """Compute desired heading and normalized x error from target bbox."""
+        if bbox is None or self.latest_color_shape is None:
+            return self.current_theta, 0.0
+
+        rx, _, rw, _ = bbox
+        img_center_x = rx + 0.5 * rw
+        color_width = float(max(self.latest_color_shape[1], 1))
+        x_error = ((img_center_x / color_width) - 0.5) * 2.0
+        bearing = np.clip(
+            self.approach_turn_sign * self.seek_heading_gain * x_error,
+            -self.approach_max_bearing_rad,
+            self.approach_max_bearing_rad,
+        )
+        return self.current_theta + bearing, x_error
+
+    def _recenter_from_last_target(self, current_time) -> bool:
+        """Rotate toward last seen target for a short window to improve reacquisition."""
+        if self.last_target_heading is None or self.last_target_heading_time is None:
+            return False
+        dt = (current_time - self.last_target_heading_time).nanoseconds / 1e9
+        if dt > self.approach_target_memory_s:
+            return False
+
+        self.publish_pose_target(self.current_x, self.current_y, self.last_target_heading)
+        return True
+
+    def _nudge_tilt(self, down: bool, scale: float = 1.0):
+        """Nudge camera tilt in simple mode (down or up)."""
+        if not self.auto_tilt_enable:
+            return
+        step = max(0.0, float(scale)) * self.simple_tilt_down_step_rad
+        step = min(step, self.simple_tilt_down_step_rad * 2.0)
+        down_sign = 1.0 if self.approach_tilt_down_sign >= 0.0 else -1.0
+        cmd_sign = down_sign if down else -down_sign
+        self.camera_tilt_cmd += cmd_sign * step
+
+        # Extend allowed tilt envelope in the configured "down" direction for simple mode.
+        down_limit = abs(self.simple_tilt_down_limit_rad)
+        if down_sign > 0.0:
+            tilt_min = self.auto_tilt_min_rad
+            tilt_max = max(self.auto_tilt_max_rad, down_limit)
+        else:
+            tilt_min = min(self.auto_tilt_min_rad, -down_limit)
+            tilt_max = self.auto_tilt_max_rad
+        self.camera_tilt_cmd = float(
+            np.clip(self.camera_tilt_cmd, tilt_min, tilt_max)
+        )
+        msg = Float64MultiArray()
+        msg.data = [self.camera_pan_cmd, self.camera_tilt_cmd]
+        self.pan_tilt_pub.publish(msg)
+
+    def _handle_simple_yolo_approach(self):
+        """
+        Simplified YOLO approach:
+        1) rotate in place until bbox is centered,
+        2) then drive straight forward,
+        3) tilt camera down only until target is vertically centered.
+        """
+        now = self.get_clock().now()
+        target_visible_now = self.red_target_visible and self.red_bbox_color is not None
+
+        if target_visible_now:
+            bbox = self.red_bbox_color
+            distance_m = self.red_target_distance_m
+            target_theta, x_error = self._heading_from_target_bbox(bbox)
+            self.last_target_heading = target_theta
+            self.last_target_heading_time = now
+            if distance_m is not None:
+                self.last_target_distance_m = distance_m
+        else:
+            if self.last_target_heading is None or self.last_target_heading_time is None:
+                self.publish_hold_position()
+                return
+            dt = (now - self.last_target_heading_time).nanoseconds / 1e9
+            if dt > self.approach_target_memory_s:
+                self.publish_hold_position()
+                return
+            target_theta = self.last_target_heading
+            x_error = 1.0  # force recenter behavior while blind
+            distance_m = self.last_target_distance_m
+
+        # Vertical framing control (simple rule):
+        # - if bbox center is lower than desired row, tilt down
+        # - if bbox center is higher than desired row, tilt up
+        need_tilt_down = False
+        need_tilt_up = False
+        tilt_error = 0.0
+        if target_visible_now and self.latest_color_shape is not None:
+            _, by, _, bh = self.red_bbox_color
+            image_h = float(max(self.latest_color_shape[0], 1))
+            center_y_frac = (by + 0.5 * bh) / image_h
+            tilt_error = center_y_frac - self.auto_tilt_target_y_frac
+            need_tilt_down = tilt_error > self.simple_tilt_deadband_frac
+            need_tilt_up = tilt_error < -self.simple_tilt_deadband_frac
+
+        # Stop when centered and close by depth (or obstacle-range fallback).
+        stop_distance = self.seek_target_stop_distance_m + self.approach_stop_distance_buffer_m
+        distance_for_stop = distance_m if distance_m is not None else self.last_target_distance_m
+        reached_visible = (
+            target_visible_now
+            and abs(x_error) <= self.approach_center_tolerance
+            and (
+                (distance_for_stop is not None and distance_for_stop <= stop_distance)
+                or (
+                    self.obstacle_distance_m is not None
+                    and self.obstacle_distance_m <= stop_distance
+                )
+            )
+        )
+        if reached_visible:
+            self.approach_reached_visible_streak += 1
+        else:
+            self.approach_reached_visible_streak = 0
+
+        if self.approach_reached_visible_streak >= max(1, self.approach_reached_visible_frames):
+            self.publish_hold_position()
+            if not self.red_target_reached_logged:
+                self.get_logger().info(
+                    f'Target reached within {distance_m:.2f}m. Holding position.'
+                )
+                self.red_target_reached_logged = True
+            return
+        self.red_target_reached_logged = False
+
+        # Rotate slowly until centered.
+        if target_visible_now:
+            centered = abs(x_error) <= self.approach_center_tolerance
+        else:
+            centered = False
+        if not centered:
+            yaw_delta = self._wrapped_angle_diff(target_theta, self.current_theta)
+            yaw_step = float(np.clip(yaw_delta, -self.simple_center_turn_step_rad, self.simple_center_turn_step_rad))
+            self.publish_pose_target(self.current_x, self.current_y, self.current_theta + yaw_step)
+            if target_visible_now and (need_tilt_down or need_tilt_up):
+                tilt_scale = float(np.clip(
+                    self.simple_tilt_base_scale_rotate + abs(tilt_error) * 1.2,
+                    0.25,
+                    0.95,
+                ))
+                if need_tilt_down:
+                    self._nudge_tilt(down=True, scale=tilt_scale)
+                elif need_tilt_up:
+                    self._nudge_tilt(
+                        down=False,
+                        scale=tilt_scale * max(0.0, min(1.0, self.simple_tilt_up_scale)),
+                    )
+            return
+
+        # Centered: move straight forward.
+        # If we can see target but have no depth estimate, don't drive blind.
+        if target_visible_now and distance_m is None:
+            self.publish_hold_position()
+            if need_tilt_down or need_tilt_up:
+                tilt_scale = float(np.clip(0.40 + abs(tilt_error) * 1.0, 0.30, 0.90))
+                if need_tilt_down:
+                    self._nudge_tilt(down=True, scale=tilt_scale)
+                else:
+                    self._nudge_tilt(
+                        down=False,
+                        scale=tilt_scale * max(0.0, min(1.0, self.simple_tilt_up_scale)),
+                    )
+            return
+        # If target is lost and we have no remembered range, don't drive blind.
+        if (not target_visible_now) and distance_m is None:
+            self.publish_hold_position()
+            return
+
+        if distance_m is not None:
+            advance = float(np.clip(
+                distance_m - self.seek_target_stop_distance_m,
+                self.simple_min_forward_step_m,
+                self.simple_forward_step_m,
+            ))
+        else:
+            advance = self.simple_forward_step_m * 0.6
+
+        target_x = self.current_x + advance * np.cos(self.current_theta)
+        target_y = self.current_y + advance * np.sin(self.current_theta)
+        self.publish_pose_target(target_x, target_y, self.current_theta)
+
+        if target_visible_now and (need_tilt_down or need_tilt_up):
+            tilt_scale = 0.45 + abs(tilt_error) * 1.25
+            if distance_m is not None and distance_m < self.auto_tilt_near_dist_m:
+                tilt_scale += 0.10
+            tilt_scale = float(np.clip(tilt_scale, 0.35, 0.95))
+            if need_tilt_down:
+                self._nudge_tilt(down=True, scale=tilt_scale)
+            else:
+                self._nudge_tilt(
+                    down=False,
+                    scale=tilt_scale * max(0.0, min(1.0, self.simple_tilt_up_scale)),
+                )
 
     def _current_cell_is_unexplored(self) -> bool:
         current_cell = self._cell_from_xy(self.current_x, self.current_y)
@@ -1035,32 +1462,49 @@ class NavigationTaskNode(Node):
         )
 
     def _handle_approach_mode(self):
+        if self.use_yolo_target_detection and self.simple_yolo_approach_enable:
+            self._handle_simple_yolo_approach()
+            return
+
+        now = self.get_clock().now()
+        target_visible_now = self.red_target_visible and self.red_bbox_color is not None
         bbox = self.red_bbox_color
         distance_m = self.red_target_distance_m
-        if not self.red_target_visible or bbox is None:
-            # Briefly keep chasing last seen target to ride out detector flicker.
-            if self.last_red_seen_time is None or self.last_red_bbox_color is None:
+
+        heading_error = 0.0
+        if target_visible_now:
+            target_theta, x_error = self._heading_from_target_bbox(bbox)
+            self.last_target_heading = target_theta
+            self.last_target_heading_time = now
+
+            # If target is visible but depth ROI dropped out, use recent target range estimate.
+            if distance_m is None and self.last_red_seen_time is not None and self.last_red_distance_m is not None:
+                dt = (now - self.last_red_seen_time).nanoseconds / 1e9
+                if dt <= self.approach_target_memory_s:
+                    distance_m = self.last_red_distance_m
+            if distance_m is not None:
+                self.last_target_distance_m = distance_m
+        else:
+            # During brief YOLO dropout, keep following last known target heading/range.
+            if self.last_target_heading is None or self.last_target_heading_time is None:
                 self.publish_hold_position()
                 return
-            dt = (self.get_clock().now() - self.last_red_seen_time).nanoseconds / 1e9
+            dt = (now - self.last_target_heading_time).nanoseconds / 1e9
             if dt > self.approach_target_memory_s:
                 self.publish_hold_position()
                 return
-            bbox = self.last_red_bbox_color
-            if distance_m is None:
-                distance_m = self.last_red_distance_m
-        else:
-            # If target is visible but depth ROI dropped out, use recent target range estimate.
-            if distance_m is None and self.last_red_seen_time is not None and self.last_red_distance_m is not None:
-                dt = (self.get_clock().now() - self.last_red_seen_time).nanoseconds / 1e9
-                if dt <= self.approach_target_memory_s:
-                    distance_m = self.last_red_distance_m
 
-        blocked = self._is_approach_path_blocked(distance_m, self.red_target_visible)
+            target_theta = self.last_target_heading
+            heading_error = self._wrapped_angle_diff(target_theta, self.current_theta)
+            x_error = 0.0
+            if distance_m is None:
+                distance_m = self.last_target_distance_m
+
+        blocked = self._is_approach_path_blocked(distance_m, target_visible_now)
         obstacle_is_target = False
         if (
             blocked
-            and self.red_target_visible
+            and target_visible_now
             and distance_m is not None
             and self.obstacle_distance_m is not None
             and abs(self.obstacle_distance_m - distance_m) <= self.approach_obstacle_target_margin_m
@@ -1083,7 +1527,7 @@ class NavigationTaskNode(Node):
             else:
                 self.approach_clear_streak = 0
 
-            elapsed_avoid = (self.get_clock().now() - self.approach_avoid_start_time).nanoseconds / 1e9
+            elapsed_avoid = (now - self.approach_avoid_start_time).nanoseconds / 1e9
             if self.approach_clear_streak >= max(1, self.approach_clear_frames) or elapsed_avoid >= self.approach_avoid_max_duration_s:
                 self.approach_avoid_active = False
                 self.approach_clear_streak = 0
@@ -1108,42 +1552,59 @@ class NavigationTaskNode(Node):
                 self.publish_pose_target(avoid_x, avoid_y, avoid_theta)
                 return
 
-        if distance_m is not None and distance_m <= self.seek_target_stop_distance_m:
+        # Only declare "reached" using fresh visible centered detections (no memory-only latch).
+        centered_now = target_visible_now and abs(x_error) <= self.approach_center_tolerance
+        reached_now = (
+            target_visible_now
+            and centered_now
+            and distance_m is not None
+            and distance_m <= self.seek_target_stop_distance_m
+        )
+        if reached_now:
+            self.approach_reached_visible_streak += 1
+        else:
+            self.approach_reached_visible_streak = 0
+
+        if self.approach_reached_visible_streak >= max(1, self.approach_reached_visible_frames):
             self.publish_hold_position()
             if not self.red_target_reached_logged:
                 self.get_logger().info(
-                    f'Red target reached within {distance_m:.2f}m. Holding position.'
+                    f'Target reached within {distance_m:.2f}m. Holding position.'
                 )
                 self.red_target_reached_logged = True
             return
         self.red_target_reached_logged = False
 
-        rx, _, rw, _ = bbox
-        img_center_x = rx + 0.5 * rw
-        color_width = float(max(self.latest_color_shape[1], 1))
-        x_error = ((img_center_x / color_width) - 0.5) * 2.0
-        # Turn sign is parameterized to match image->yaw convention in this setup.
-        bearing = np.clip(
-            self.approach_turn_sign * self.seek_heading_gain * x_error,
-            -self.approach_max_bearing_rad,
-            self.approach_max_bearing_rad,
-        )
-        target_theta = self.current_theta + bearing
-
-        # Rotate-in-place to center target first, then translate.
-        if abs(x_error) > self.approach_center_tolerance:
+        # Rotate in place until target is centered (or remembered heading is aligned).
+        if target_visible_now:
+            if self.approach_centered_locked:
+                should_rotate = abs(x_error) > (
+                    self.approach_center_tolerance + self.approach_center_hysteresis
+                )
+            else:
+                should_rotate = abs(x_error) > self.approach_center_tolerance
+            self.approach_centered_locked = not should_rotate
+        else:
+            should_rotate = abs(heading_error) > 0.08
+            self.approach_centered_locked = False
+        if should_rotate:
             self.publish_pose_target(self.current_x, self.current_y, target_theta)
             return
 
-        # Use depth to set forward progress toward the perceived target point.
+        # Once centered, advance forward toward current/remembered target range.
+        forward_cap = self.seek_forward_step_m if target_visible_now else (self.seek_forward_step_m * 0.6)
         if distance_m is not None:
             advance = np.clip(
                 distance_m - self.seek_target_stop_distance_m,
-                0.05,
-                self.seek_forward_step_m,
+                0.04,
+                forward_cap,
             )
         else:
-            advance = self.seek_forward_step_m * 0.5
+            advance = forward_cap * 0.6
+
+        # When target is centered in view, avoid micro-rotations during approach.
+        if target_visible_now:
+            target_theta = self.current_theta
 
         target_x = self.current_x + advance * np.cos(target_theta)
         target_y = self.current_y + advance * np.sin(target_theta)

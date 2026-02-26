@@ -40,6 +40,14 @@ Visualization Manager:
       Transport Hint: raw
       Queue Size: 2
 
+    - Class: rviz_default_plugins/Image
+      Name: YOLO Camera
+      Enabled: true
+      Topic:
+        Value: /camera/color/image_yolo
+      Transport Hint: raw
+      Queue Size: 2
+
     - Class: rviz_default_plugins/Grid
       Name: Grid
       Enabled: true
