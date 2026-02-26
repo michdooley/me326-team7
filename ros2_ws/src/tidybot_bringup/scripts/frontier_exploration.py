@@ -1144,25 +1144,6 @@ class FrontierExplorer(Node):
                 f'dist={dist:.2f} hdg_err={np.degrees(heading_error):.0f}° '
                 f'pos=({bx:.2f},{by:.2f})')
 
-        # ── Map-based proximity: find direction to nearest mapped obstacle ──
-        robot_gx, robot_gy = self.world_to_grid(bx, by)
-        map_repulse_angle = None  # angle AWAY from obstacle, if close
-        if hasattr(self, '_inflated_occ') and self.in_grid(robot_gx, robot_gy):
-            r_check = 4  # cells = 0.20 m
-            y_lo = max(0, robot_gy - r_check)
-            y_hi = min(self.GRID_SIZE, robot_gy + r_check + 1)
-            x_lo = max(0, robot_gx - r_check)
-            x_hi = min(self.GRID_SIZE, robot_gx + r_check + 1)
-            patch = self._inflated_occ[y_lo:y_hi, x_lo:x_hi]
-            if np.any(patch):
-                # Find centroid of nearby obstacle cells → steer away
-                oys, oxs = np.where(patch)
-                obs_gx = float(np.mean(oxs)) + x_lo
-                obs_gy = float(np.mean(oys)) + y_lo
-                obs_wx, obs_wy = self.grid_to_world(int(obs_gx), int(obs_gy))
-                # Angle FROM obstacle TO robot = direction to flee
-                map_repulse_angle = np.arctan2(by - obs_wy, bx - obs_wx)
-
         cmd = Twist()
 
         # ── Depth obstacle avoidance ─────────────────────────────────
@@ -1171,12 +1152,7 @@ class FrontierExplorer(Node):
         left_dist, center_dist, right_dist = distances
         min_dist = min(left_dist, center_dist, right_dist)
 
-        if map_repulse_angle is not None:
-            # ── Near a mapped obstacle: drive away from it ───────────
-            flee_error = self._normalize_angle(map_repulse_angle - actual_heading)
-            cmd.angular.z = float(np.clip(2.0 * flee_error, -1.0, 1.0))
-            cmd.linear.x = float(self.NAV_LINEAR_SPEED * 0.5)
-        elif not center_clear:
+        if not center_clear:
             # ── Depth sees obstacle ahead: steer around it ───────────
             self.get_logger().info(
                 f'[NAV] Depth obstacle: L={left_dist:.2f} C={center_dist:.2f} '
