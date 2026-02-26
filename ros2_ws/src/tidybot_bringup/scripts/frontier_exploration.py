@@ -186,6 +186,7 @@ class FrontierExplorer(Node):
         # Waypoint navigation state
         self.nav_waypoints     = []    # list of (gx, gy)
         self.nav_waypoint_idx  = 0
+        self.nav_beeline       = False # True when driving without an A* path
 
         # TF
         self.tf_buffer   = tf2_ros.Buffer()
@@ -1028,16 +1029,23 @@ class FrontierExplorer(Node):
 
             self.nav_waypoints    = path
             self.nav_waypoint_idx = 0
+            self.nav_beeline      = False
             self.nav_start_time   = time.time()
             self.state = ExploreState.NAVIGATING
             return
 
-        # All frontiers had no A* path — re-select without a full 360° scan.
-        # The map updates continuously; re-running find_frontiers() may yield
-        # new results as the occupancy grid evolves.
+        # All A* paths failed — drive directly toward the best frontier and
+        # rely on depth obstacle avoidance to steer around obstacles.
+        wx, wy, size, score = frontiers[0]
+        goal_gx, goal_gy = self.world_to_grid(wx, wy)
         self.get_logger().warn(
-            '[SELECT] No A* path to any frontier — will re-select.')
-        # Stay in SELECTING state (will re-run on next tick)
+            f'[SELECT] No A* path — beelining toward ({wx:.2f}, {wy:.2f}) '
+            f'with obstacle avoidance.')
+        self.nav_waypoints    = [(goal_gx, goal_gy)]
+        self.nav_waypoint_idx = 0
+        self.nav_beeline      = True
+        self.nav_start_time   = time.time()
+        self.state = ExploreState.NAVIGATING
 
     def _state_navigating(self):
         """Follow A* waypoints via cmd_vel with map-based re-planning."""
@@ -1058,7 +1066,8 @@ class FrontierExplorer(Node):
         actual_heading = btheta - np.pi / 2  # MuJoCo → world heading
 
         # ── Check if path is blocked on the mapped obstacles ───────────
-        if self._is_path_blocked():
+        # Skip for beeline paths — obstacle avoidance handles it reactively.
+        if not self.nav_beeline and self._is_path_blocked():
             self.get_logger().info('[NAV] Path blocked on map — re-planning...')
             if self._replan_from_here():
                 return  # re-planned successfully, follow new path next tick
