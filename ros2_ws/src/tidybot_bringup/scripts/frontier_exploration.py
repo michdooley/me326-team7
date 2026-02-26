@@ -147,7 +147,7 @@ class FrontierExplorer(Node):
     WAYPOINT_TOLERANCE = 0.3   # m — distance to accept waypoint arrival
     NAV_LINEAR_SPEED   = 0.25  # m/s — forward speed during waypoint following
     OBSTACLE_THRESHOLD = 0.5   # m — depth distance to trigger avoidance
-    NAV_STUCK_TIME     = 5.0   # s — re-scan if no waypoint progress
+    NAV_STUCK_TIME     = 15.0  # s — re-scan if no waypoint progress
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -615,10 +615,11 @@ class FrontierExplorer(Node):
         return None  # no path found within expansion budget
 
     def _subsample_path(self, path):
-        """Extract waypoints every WAYPOINT_SPACING cells from a full A* path."""
-        if len(path) <= 2:
+        """Extract waypoints every WAYPOINT_SPACING cells, skipping start cell."""
+        if len(path) <= 1:
             return path
-        waypoints = [path[0]]
+        # Skip path[0] (robot's current position) — start from first intermediate
+        waypoints = []
         for i in range(self.WAYPOINT_SPACING, len(path) - 1, self.WAYPOINT_SPACING):
             waypoints.append(path[i])
         waypoints.append(path[-1])  # always include goal
@@ -1065,6 +1066,14 @@ class FrontierExplorer(Node):
 
         desired_heading = np.arctan2(dy, dx)
         heading_error = self._normalize_angle(desired_heading - actual_heading)
+
+        # ── Periodic status log (every ~2 s) ──────────────────────────
+        if not hasattr(self, '_nav_last_log') or now - self._nav_last_log > 2.0:
+            self._nav_last_log = now
+            self.get_logger().info(
+                f'[NAV] wp {self.nav_waypoint_idx}/{len(self.nav_waypoints)} '
+                f'dist={dist:.2f} hdg_err={np.degrees(heading_error):.0f}° '
+                f'pos=({bx:.2f},{by:.2f})')
 
         # ── Depth obstacle avoidance ───────────────────────────────────
         clearance, distances = self._analyze_depth_obstacles()
