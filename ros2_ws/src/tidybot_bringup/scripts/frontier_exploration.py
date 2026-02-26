@@ -132,7 +132,7 @@ class FrontierExplorer(Node):
     MAP_PUBLISH_RATE = 1.0   # Hz
 
     # ── 360° scan ─────────────────────────────────────────────────────────────
-    SCAN_ANGULAR_VEL = 0.8   # rad/s  (~8 s per revolution, slower = less TF lag error)
+    SCAN_ANGULAR_VEL = 0.4   # rad/s  (~16 s per revolution, slower = less smearing)
     SCAN_SETTLE_TIME = 1.0   # s — wait after stopping for vibration to die
 
     # ── Frontier selection ────────────────────────────────────────────────────
@@ -187,6 +187,7 @@ class FrontierExplorer(Node):
         # Waypoint navigation state
         self.nav_waypoints     = []    # list of (gx, gy)
         self.nav_waypoint_idx  = 0
+        self.last_cmd_angular  = 0.0   # track angular vel for depth gating
 
         # TF
         self.tf_buffer   = tf2_ros.Buffer()
@@ -220,13 +221,19 @@ class FrontierExplorer(Node):
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
-    def _depth_cb(self, msg: Image):
-        """Store the latest depth frame and integrate it into the map.
+    # Max angular velocity (rad/s) for depth integration.  Frames captured
+    # while the robot is rotating faster than this are stored (for obstacle
+    # avoidance) but NOT integrated into the log-odds grid, preventing
+    # rotational smearing that makes obstacles look like arcs.
+    MAX_MAPPING_ANGULAR_VEL = 0.5  # rad/s
 
-        Depth is integrated in all states (including NAVIGATING) so the
-        map stays current as the robot drives.  At 0.25 m/s and ~30 Hz
-        depth, positional error is ~8 mm/frame — well within the 5 cm
-        grid resolution.
+    def _depth_cb(self, msg: Image):
+        """Store the latest depth frame and conditionally integrate it.
+
+        Depth is always stored (for obstacle avoidance), but only
+        integrated into the occupancy grid when the robot's angular
+        velocity is below MAX_MAPPING_ANGULAR_VEL.  Fast turns cause
+        rotational smearing that corrupts the map.
         """
         try:
             depth = self.cv_bridge.imgmsg_to_cv2(msg, '16UC1')
@@ -236,7 +243,8 @@ class FrontierExplorer(Node):
         self.latest_depth       = depth
         self.latest_depth_stamp = msg.header.stamp
         if self.camera_K is not None:
-            self._integrate_depth()
+            if abs(self.last_cmd_angular) <= self.MAX_MAPPING_ANGULAR_VEL:
+                self._integrate_depth()
 
     def _camera_info_cb(self, msg: CameraInfo):
         self.camera_K = np.array(msg.k).reshape(3, 3)
@@ -983,6 +991,7 @@ class FrontierExplorer(Node):
         self.get_logger().info('[SCAN] Starting 360° rotation scan...')
 
     def _stop_base(self):
+        self.last_cmd_angular = 0.0
         self.cmd_vel_pub.publish(Twist())
 
     def _state_scanning(self):
@@ -1012,6 +1021,7 @@ class FrontierExplorer(Node):
         else:
             cmd = Twist()
             cmd.angular.z = self.SCAN_ANGULAR_VEL
+            self.last_cmd_angular = cmd.angular.z
             self.cmd_vel_pub.publish(cmd)
 
     def _state_selecting(self):
@@ -1181,6 +1191,7 @@ class FrontierExplorer(Node):
         if min_dist < 0.35:
             cmd.linear.x = 0.0
 
+        self.last_cmd_angular = cmd.angular.z
         self.cmd_vel_pub.publish(cmd)
 
     def _state_complete(self):
