@@ -532,21 +532,28 @@ class FrontierExplorer(Node):
 
     # ── Path planning ──────────────────────────────────────────────────────────
 
-    def _plan_path(self, start_gx, start_gy, goal_gx, goal_gy):
+    def _plan_path(self, start_gx, start_gy, goal_gx, goal_gy, clearance_m=None):
         """A* on the inflated occupancy grid.
 
         Returns a list of (gx, gy) waypoints subsampled every WAYPOINT_SPACING
-        cells, or None if no path exists.  The traversable mask is
-        free_mask & ~inflated_occ (robot-width-safe corridors).
+        cells, or None if no path exists.
+
+        *clearance_m* overrides ROBOT_CLEARANCE for this call (used for
+        reduced-inflation fallback when full inflation blocks all paths).
         """
+        if clearance_m is None:
+            clearance_m = self.ROBOT_CLEARANCE
         free_mask = self.log_odds <= self.LOG_ODDS_FREE_THRESH
         confirmed_occ = ((self.log_odds  >= self.LOG_ODDS_OCC_THRESH) &
                          (self.hit_count >= self.MIN_HIT_COUNT))
-        r_clear = int(np.ceil(self.ROBOT_CLEARANCE / self.GRID_RESOLUTION))
-        ky_c, kx_c = np.ogrid[-r_clear:r_clear + 1, -r_clear:r_clear + 1]
-        clear_disc = (ky_c ** 2 + kx_c ** 2) <= r_clear ** 2
-        inflated = binary_dilation(confirmed_occ, structure=clear_disc)
-        traversable = free_mask & ~inflated
+        if clearance_m > 0:
+            r_clear = int(np.ceil(clearance_m / self.GRID_RESOLUTION))
+            ky_c, kx_c = np.ogrid[-r_clear:r_clear + 1, -r_clear:r_clear + 1]
+            clear_disc = (ky_c ** 2 + kx_c ** 2) <= r_clear ** 2
+            inflated = binary_dilation(confirmed_occ, structure=clear_disc)
+            traversable = free_mask & ~inflated
+        else:
+            traversable = free_mask & ~confirmed_occ
 
         # Ensure start and goal are in-bounds
         if not (self.in_grid(start_gx, start_gy) and
@@ -1006,51 +1013,40 @@ class FrontierExplorer(Node):
         bx, by, _ = base_pose
         robot_gx, robot_gy = self.world_to_grid(bx, by)
 
-        # Try each frontier in score order until we find one with a valid A* path.
-        for wx, wy, size, score in frontiers:
-            self.get_logger().info(
-                f'[SELECT] Trying frontier ({wx:.2f}, {wy:.2f}) '
-                f'cluster={size} score={score:.0f}')
+        # Try each frontier with progressively reduced inflation.
+        # Full clearance first (safest), then half, then zero (rely on
+        # depth obstacle avoidance for real-time safety).
+        clearances = [None, self.ROBOT_CLEARANCE * 0.5, 0.0]
+        labels     = ['full', 'half', 'zero']
 
-            goal_gx, goal_gy = self.world_to_grid(wx, wy)
-            path = self._plan_path(robot_gx, robot_gy, goal_gx, goal_gy)
+        for clearance, label in zip(clearances, labels):
+            for wx, wy, size, score in frontiers:
+                if clearance is None:
+                    self.get_logger().info(
+                        f'[SELECT] Trying frontier ({wx:.2f}, {wy:.2f}) '
+                        f'cluster={size} score={score:.0f}')
 
-            if path is None:
+                goal_gx, goal_gy = self.world_to_grid(wx, wy)
+                path = self._plan_path(robot_gx, robot_gy, goal_gx, goal_gy,
+                                       clearance_m=clearance)
+
+                if path is None:
+                    continue
+
                 self.get_logger().info(
-                    f'[SELECT] No A* path to ({wx:.2f}, {wy:.2f}) — skipping.')
-                continue
+                    f'[SELECT] A* path ({label} inflation): {len(path)} '
+                    f'waypoints to ({wx:.2f}, {wy:.2f})')
 
-            self.get_logger().info(
-                f'[SELECT] A* path found: {len(path)} waypoints to '
-                f'({wx:.2f}, {wy:.2f})')
+                self.nav_waypoints    = path
+                self.nav_waypoint_idx = 0
+                self.nav_start_time   = time.time()
+                self.state = ExploreState.NAVIGATING
+                return
 
-            self.nav_waypoints    = path
-            self.nav_waypoint_idx = 0
-            self.nav_start_time   = time.time()
-            self.state = ExploreState.NAVIGATING
-            return
-
-        # All frontiers had no A* path — beeline toward the best one.
-        # Driving closer changes the robot's position, updates the map via
-        # continuous depth integration, and lets A* succeed on re-select.
-        best_wx, best_wy = frontiers[0][0], frontiers[0][1]
-        dx, dy = best_wx - bx, best_wy - by
-        d = np.hypot(dx, dy)
-        # Aim for a point 1.5 m toward the frontier (or the frontier itself
-        # if closer) so the robot makes progress without overshooting.
-        step = min(d, 1.5)
-        tgt_wx = bx + step * dx / max(d, 0.01)
-        tgt_wy = by + step * dy / max(d, 0.01)
-        tgt_gx, tgt_gy = self.world_to_grid(tgt_wx, tgt_wy)
-
+        # Truly no path at any inflation level — scan for new data
         self.get_logger().warn(
-            f'[SELECT] No A* path to any frontier — beelining toward '
-            f'({best_wx:.2f}, {best_wy:.2f})')
-
-        self.nav_waypoints    = [(tgt_gx, tgt_gy)]
-        self.nav_waypoint_idx = 0
-        self.nav_start_time   = time.time()
-        self.state = ExploreState.NAVIGATING
+            '[SELECT] No path to any frontier at any clearance — re-scanning.')
+        self._start_scan()
 
     def _state_navigating(self):
         """Follow A* waypoints via cmd_vel with map-based re-planning."""
