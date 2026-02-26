@@ -145,8 +145,8 @@ class FrontierExplorer(Node):
     NO_FRONTIER_LIMIT  = 3     # consecutive empty scans → declare COMPLETE
     WAYPOINT_SPACING   = 20    # cells (~1.0 m) between A* waypoints
     WAYPOINT_TOLERANCE = 0.3   # m — distance to accept waypoint arrival
-    NAV_LINEAR_SPEED   = 0.25  # m/s — forward speed during waypoint following
-    OBSTACLE_THRESHOLD = 0.5   # m — depth distance to trigger avoidance
+    NAV_LINEAR_SPEED   = 0.20  # m/s — forward speed during waypoint following
+    OBSTACLE_THRESHOLD = 0.8   # m — depth distance to trigger avoidance
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -646,13 +646,35 @@ class FrontierExplorer(Node):
         return confirmed_occ
 
     def _is_path_blocked(self):
-        """Check remaining waypoints against obstacles at the nav clearance."""
+        """Check the line between consecutive waypoints for obstacles.
+
+        Uses Bresenham-style sampling along each segment (not just waypoint
+        cells) so obstacles between widely-spaced waypoints are detected.
+        """
         nav_clear = getattr(self, 'nav_clearance', None)
         inflated = self._compute_inflated(nav_clear)
+
+        # Build list of points to check: current position + remaining waypoints
+        pose = self.get_base_pose()
+        if pose is None:
+            return False
+        bx, by, _ = pose
+        rgx, rgy = self.world_to_grid(bx, by)
+
+        points = [(rgx, rgy)]
         for i in range(self.nav_waypoint_idx, len(self.nav_waypoints)):
-            gx, gy = self.nav_waypoints[i]
-            if self.in_grid(gx, gy) and inflated[gy, gx]:
-                return True
+            points.append(self.nav_waypoints[i])
+
+        # Walk each segment, sampling every few cells
+        for k in range(len(points) - 1):
+            x0, y0 = points[k]
+            x1, y1 = points[k + 1]
+            seg_len = max(abs(x1 - x0), abs(y1 - y0), 1)
+            for t in range(seg_len + 1):
+                sx = x0 + (x1 - x0) * t // seg_len
+                sy = y0 + (y1 - y0) * t // seg_len
+                if self.in_grid(sx, sy) and inflated[sy, sx]:
+                    return True
         return False
 
     def _replan_from_here(self):
@@ -1137,37 +1159,53 @@ class FrontierExplorer(Node):
                 f'dist={dist:.2f} hdg_err={np.degrees(heading_error):.0f}° '
                 f'pos=({bx:.2f},{by:.2f})')
 
+        # ── Map-based proximity: check if robot is near a mapped obstacle ─
+        robot_gx, robot_gy = self.world_to_grid(bx, by)
+        map_too_close = False
+        if hasattr(self, '_inflated_occ') and self.in_grid(robot_gx, robot_gy):
+            # Check a small window around the robot for inflated obstacles
+            r_check = 3  # cells = 0.15 m
+            y_lo = max(0, robot_gy - r_check)
+            y_hi = min(self.GRID_SIZE, robot_gy + r_check + 1)
+            x_lo = max(0, robot_gx - r_check)
+            x_hi = min(self.GRID_SIZE, robot_gx + r_check + 1)
+            map_too_close = bool(np.any(self._inflated_occ[y_lo:y_hi, x_lo:x_hi]))
+
         cmd = Twist()
 
         if abs(heading_error) > 0.6:
             # ── Large heading error: rotate in place ──────────────────
-            # No forward motion → no collision risk → skip depth avoidance.
-            # This prevents obstacle avoidance from fighting the needed turn.
             cmd.angular.z = float(np.clip(2.0 * heading_error, -1.0, 1.0))
         else:
             # ── Heading roughly aligned: drive forward with avoidance ─
             clearance, distances = self._analyze_depth_obstacles()
             left_clear, center_clear, right_clear = clearance
             left_dist, center_dist, right_dist = distances
+            min_dist = min(left_dist, center_dist, right_dist)
 
-            if center_clear:
-                cmd.linear.x = float(min(self.NAV_LINEAR_SPEED, dist * 0.5))
+            if center_clear and not map_too_close:
+                # Scale speed by proximity — slower as obstacles get closer
+                speed = self.NAV_LINEAR_SPEED
+                if min_dist < 1.5:
+                    speed *= min(min_dist / 1.5, 1.0)
+                cmd.linear.x = float(min(speed, dist * 0.5))
                 cmd.angular.z = float(np.clip(1.5 * heading_error, -0.8, 0.8))
             else:
+                # Center blocked or map says we're too close — stop and steer
                 self.get_logger().info(
-                    f'[NAV] Depth obstacle: L={left_dist:.2f} C={center_dist:.2f} '
-                    f'R={right_dist:.2f} — steering around')
+                    f'[NAV] Obstacle: L={left_dist:.2f} C={center_dist:.2f} '
+                    f'R={right_dist:.2f} map_close={map_too_close} — steering')
                 if left_dist > right_dist:
-                    cmd.angular.z = 0.5
-                    cmd.linear.x = 0.05
+                    cmd.angular.z = 0.8
                 elif right_dist > left_dist:
-                    cmd.angular.z = -0.5
-                    cmd.linear.x = 0.05
+                    cmd.angular.z = -0.8
                 else:
-                    cmd.angular.z = 0.6
+                    cmd.angular.z = 0.8
+                # No forward motion while steering around obstacles
+                cmd.linear.x = 0.0
 
-            # Safety: stop forward if very close to anything
-            if min(left_dist, center_dist, right_dist) < 0.25:
+            # Safety: hard stop if anything very close
+            if min_dist < 0.35:
                 cmd.linear.x = 0.0
 
         self.cmd_vel_pub.publish(cmd)
