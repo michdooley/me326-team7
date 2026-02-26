@@ -1,0 +1,43 @@
+<mujoco model="tidybot banana only scene">
+  <include file="tidybot_wx250s_bimanual.xml"/>
+
+  <size njmax="256" nconmax="128"/>
+  <statistic center="0 0 0.525" extent="1.1" meansize="0.05"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.1 0.1 0.1" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="140" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+    <material name="banana_mat" rgba="0.95 0.90 0.10 1"/>
+
+    <mesh name="banana_mesh" file="fruit/banana.stl" scale="0.019 0.019 0.019"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.5" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <body name="banana" pos="1.80 0.80 0.06">
+      <freejoint name="banana_joint"/>
+      <geom name="banana_geom" type="mesh" mesh="banana_mesh" mass="0.12"
+        material="banana_mat" friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
+    </body>
+  </worldbody>
+
+  <keyframe>
+    <key name="scene_home"
+      qpos="0 0 1.5708
+        0 0
+        0 0 0 0 0 0 0.037 0.037
+        0 0 0 0 0 0 0.037 0.037
+        1.80 0.80 0.06 1 0 0 0"
+      ctrl="0 0 1.5708 0 0 0 0 0 0 0 0 0.037 0.037 0 0 0 0 0 0 0.037 0.037"/>
+  </keyframe>
+</mujoco>
