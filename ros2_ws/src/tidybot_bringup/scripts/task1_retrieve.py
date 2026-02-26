@@ -4,7 +4,7 @@ Task 1: Object Retrieval State Machine
 
 Orchestrates the full object retrieval task:
     LISTEN → SEARCH → APPROACH → PLAN_GRASP → PRE_GRASP → GRASP →
-    VERIFY_GRASP → RETURN → DONE
+    LIFT → VERIFY_GRASP → RETURN → DONE
 
 Uses NavigateToObject for search/approach, the external classifier node
 (/objbbox) for YOLO detections, /plan_grasp (GraspNet) for 6-DOF grasp
@@ -26,8 +26,14 @@ Usage:
     # Terminal 1: Launch sim
     ros2 launch tidybot_bringup sim.launch.py
 
-    # Terminal 2: Run task
+    # Terminal 2: Run task (sim, default target=banana)
     ros2 run tidybot_bringup task1_retrieve.py
+
+    # With custom target
+    ros2 run tidybot_bringup task1_retrieve.py --ros-args -p target_object:=apple
+
+    # Real hardware
+    ros2 run tidybot_bringup task1_retrieve.py --ros-args -p sim:=false
 """
 
 import sys
@@ -51,7 +57,7 @@ import tf2_ros
 
 from geometry_msgs.msg import Pose, Twist, Quaternion, Point, PointStamped
 from std_msgs.msg import Float64MultiArray
-from tidybot_msgs.msg import ArmCommand
+from tidybot_msgs.msg import ArmCommand, GripperCommand
 from tidybot_msgs.srv import PlanGrasp, PlanToTarget
 
 from sensor_msgs.msg import Image, CameraInfo
@@ -78,16 +84,6 @@ def create_pose(x, y, z, qw=1.0, qx=0.0, qy=0.0, qz=0.0):
     return pose
 
 
-def open_gripper(publisher):
-    msg = Float64MultiArray()
-    msg.data = [0.0]
-    publisher.publish(msg)
-
-
-def close_gripper(publisher):
-    msg = Float64MultiArray()
-    msg.data = [1.0]
-    publisher.publish(msg)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -102,6 +98,7 @@ class Task1State(Enum):
     PLAN_GRASP   = auto()  # Detect object, compute grasp poses
     PRE_GRASP    = auto()  # Move arm to approach pose via /plan_to_target
     GRASP        = auto()  # Execute grasp + close gripper
+    LIFT         = auto()  # Lift object before verification
     VERIFY_GRASP = auto()  # Visual verification of grasp success
     RETURN       = auto()  # Navigate back to start position
     DONE         = auto()
@@ -125,6 +122,8 @@ PRE_GRASP_Z_OFFSET = 0.10     # 10 cm above object for approach
 GRASP_Z_OFFSET = 0.00         # offset from detected surface top
 GRASP_MOVE_DURATION = 2.0     # seconds for arm motions
 GRIPPER_SETTLE_TIME = 1.0     # seconds to let gripper close/open
+LIFT_HEIGHT = 0.10            # 10 cm above grasp pose
+LIFT_MOVE_DURATION = 2.0      # seconds for lift motion
 CAMERA_TILT_GRASP = 0.5       # camera tilt to look at table for detection
 
 # ── Verification ──────────────────────────────────────────────────────
@@ -159,6 +158,11 @@ class Task1Retrieve(Node):
 
         self.nav_node = nav_node
 
+        # ── Parameters ──
+        self.declare_parameter('sim', True)
+        self.declare_parameter('target_object', 'banana')
+        self.sim = self.get_parameter('sim').value
+
         # ── TF2 (for odom→base_link lookups in RETURN) ──
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -182,10 +186,16 @@ class Task1Retrieve(Node):
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.right_arm_pub = self.create_publisher(ArmCommand, '/right_arm/cmd', 10)
         self.left_arm_pub = self.create_publisher(ArmCommand, '/left_arm/cmd', 10)
-        self.right_gripper_pub = self.create_publisher(
-            Float64MultiArray, '/right_gripper/cmd', 10)
-        self.left_gripper_pub = self.create_publisher(
-            Float64MultiArray, '/left_gripper/cmd', 10)
+        if self.sim:
+            self.right_gripper_pub = self.create_publisher(
+                Float64MultiArray, '/right_gripper/cmd', 10)
+            self.left_gripper_pub = self.create_publisher(
+                Float64MultiArray, '/left_gripper/cmd', 10)
+        else:
+            self.right_gripper_pub = self.create_publisher(
+                GripperCommand, '/right_gripper/command', 10)
+            self.left_gripper_pub = self.create_publisher(
+                GripperCommand, '/left_gripper/command', 10)
         self.pan_tilt_pub = self.create_publisher(
             Float64MultiArray, '/camera/pan_tilt_cmd', 10)
 
@@ -200,7 +210,7 @@ class Task1Retrieve(Node):
         self.state_start_time = None
 
         # ── Task data ──
-        self.target_object = 'banana'   # hardcoded for now (skip audio)
+        self.target_object = self.get_parameter('target_object').value
         self.active_arm = 'right'
         self.start_pose = None          # (x, y, theta) in odom to return to
 
@@ -235,8 +245,9 @@ class Task1Retrieve(Node):
         self.get_logger().info('=' * 50)
         self.get_logger().info(
             'States: LISTEN → SEARCH → PLAN_GRASP → PRE_GRASP → '
-            'GRASP → VERIFY → RETURN → DONE'
+            'GRASP → LIFT → VERIFY → RETURN → DONE'
         )
+        self.get_logger().info(f'Mode: {"sim" if self.sim else "real"}')
         self.get_logger().info(f'Target object: {self.target_object}')
         self.get_logger().info(f'Max grasp retries: {MAX_GRASP_RETRIES}')
 
@@ -291,6 +302,30 @@ class Task1Retrieve(Node):
         if self.active_arm == 'right':
             return self.right_gripper_pub
         return self.left_gripper_pub
+
+    def _open_gripper(self):
+        """Open gripper (sim: Float64MultiArray, real: GripperCommand)."""
+        pub = self._get_gripper_pub()
+        if self.sim:
+            msg = Float64MultiArray()
+            msg.data = [0.0]
+        else:
+            msg = GripperCommand()
+            msg.position = 0.0
+            msg.effort = 0.5
+        pub.publish(msg)
+
+    def _close_gripper(self):
+        """Close gripper (sim: Float64MultiArray, real: GripperCommand)."""
+        pub = self._get_gripper_pub()
+        if self.sim:
+            msg = Float64MultiArray()
+            msg.data = [1.0]
+        else:
+            msg = GripperCommand()
+            msg.position = 1.0
+            msg.effort = 1.0
+        pub.publish(msg)
 
     # ── Classifier subscription callbacks ──
 
@@ -592,7 +627,7 @@ class Task1Retrieve(Node):
                 self.get_logger().error(
                     f'  [verify] Grasp failed after {MAX_GRASP_RETRIES} '
                     f'attempts — giving up')
-                open_gripper(self._get_gripper_pub())
+                self._open_gripper()
                 self._send_arm_cmd(ARM_HOME, 2.0)
                 self.transition_to(Task1State.ERROR)
             else:
@@ -600,7 +635,7 @@ class Task1Retrieve(Node):
                     f'  [verify] Grasp not confirmed — retrying '
                     f'(attempt {self.grasp_attempt_count}/{MAX_GRASP_RETRIES})')
                 # Release object, return arm to home, retry
-                open_gripper(self._get_gripper_pub())
+                self._open_gripper()
                 self._send_arm_cmd(ARM_HOME, 2.0)
                 self.transition_to(Task1State.APPROACH)
 
@@ -620,9 +655,6 @@ class Task1Retrieve(Node):
 
         # ==================== LISTEN ====================
         if self.state == Task1State.LISTEN:
-            # Hardcode target object (skip audio for now)
-            # self.target_object is set in __init__
-
             # Record start pose from TF
             self.start_pose = self._get_base_pose_in_odom()
             if self.start_pose is None:
@@ -759,7 +791,7 @@ class Task1Retrieve(Node):
             if elapsed < 0.1:
                 self.grasp_phase = 0
                 self.plan_future = None
-                open_gripper(self._get_gripper_pub())
+                self._open_gripper()
                 self.get_logger().info('Opening gripper...')
                 return
 
@@ -844,13 +876,59 @@ class Task1Retrieve(Node):
                 if time.time() - self.phase_start_time >= \
                         GRASP_MOVE_DURATION + 0.5:
                     self.get_logger().info('Closing gripper...')
-                    close_gripper(self._get_gripper_pub())
+                    self._close_gripper()
                     self.grasp_phase = 3
                     self.phase_start_time = time.time()
 
             elif self.grasp_phase == 3:
-                # Phase 3: Wait for gripper to close, then verify
+                # Phase 3: Wait for gripper to close, then lift
                 if time.time() - self.phase_start_time >= GRIPPER_SETTLE_TIME:
+                    self.transition_to(Task1State.LIFT)
+
+        # ==================== LIFT ====================
+        elif self.state == Task1State.LIFT:
+            if elapsed < 0.1:
+                self.grasp_phase = 0
+                self.plan_future = None
+                return
+
+            if self.grasp_phase == 0:
+                # Compute lift pose: same (x,y,orientation), z + LIFT_HEIGHT
+                lift_pose = Pose()
+                lift_pose.position.x = self.grasp_pose.position.x
+                lift_pose.position.y = self.grasp_pose.position.y
+                lift_pose.position.z = self.grasp_pose.position.z + LIFT_HEIGHT
+                lift_pose.orientation = self.grasp_pose.orientation
+                self._send_plan_to_target(lift_pose, 'lift')
+                self.grasp_phase = 1
+
+            elif self.grasp_phase == 1:
+                # Wait for /plan_to_target response
+                if self.plan_future is not None and self.plan_future.done():
+                    try:
+                        result = self.plan_future.result()
+                    except Exception as e:
+                        self.get_logger().warn(
+                            f'[lift] Service exception: {e}')
+                        result = None
+
+                    if result and result.success:
+                        self.get_logger().info('  [lift] OK')
+                    else:
+                        msg = result.message if result else 'exception'
+                        self.get_logger().warn(
+                            f'  [lift] Failed (non-fatal): {msg}')
+                    self.grasp_phase = 2
+                    self.phase_start_time = time.time()
+                elif elapsed > 15.0:
+                    self.get_logger().warn('[lift] Timed out (non-fatal)')
+                    self.grasp_phase = 2
+                    self.phase_start_time = time.time()
+
+            elif self.grasp_phase == 2:
+                # Wait for arm motion to complete, then verify
+                if time.time() - self.phase_start_time >= \
+                        LIFT_MOVE_DURATION + 0.5:
                     self.transition_to(Task1State.VERIFY_GRASP)
 
         # ==================== VERIFY_GRASP ====================
@@ -904,7 +982,7 @@ class Task1Retrieve(Node):
             if elapsed < 0.1:
                 self._stop_base()
                 # Open gripper to release object
-                open_gripper(self._get_gripper_pub())
+                self._open_gripper()
                 self._send_arm_cmd(ARM_HOME, 2.0)
                 self.get_logger().info('')
                 self.get_logger().info('=' * 50)
@@ -915,7 +993,7 @@ class Task1Retrieve(Node):
         elif self.state == Task1State.ERROR:
             if elapsed < 0.1:
                 self._stop_base()
-                open_gripper(self._get_gripper_pub())
+                self._open_gripper()
                 self._send_arm_cmd(ARM_HOME, 2.0)
                 self.get_logger().error('Task 1 failed — stopping robot')
 
@@ -927,8 +1005,9 @@ class Task1Retrieve(Node):
 def main(args=None):
     rclpy.init(args=args)
 
-    # Create NavigateToObject (driven by its own timer internally)
-    nav_node = NavigateToObject(target_object='banana')
+    # Create NavigateToObject (driven by its own timer internally).
+    # Target is set later in LISTEN state via nav_node.set_target().
+    nav_node = NavigateToObject(target_object=None)
 
     # Create master state machine, passing nav_node reference
     task_node = Task1Retrieve(nav_node)
