@@ -1144,54 +1144,65 @@ class FrontierExplorer(Node):
                 f'dist={dist:.2f} hdg_err={np.degrees(heading_error):.0f}° '
                 f'pos=({bx:.2f},{by:.2f})')
 
-        # ── Map-based proximity: check if robot is near a mapped obstacle ─
+        # ── Map-based proximity: find direction to nearest mapped obstacle ──
         robot_gx, robot_gy = self.world_to_grid(bx, by)
-        map_too_close = False
+        map_repulse_angle = None  # angle AWAY from obstacle, if close
         if hasattr(self, '_inflated_occ') and self.in_grid(robot_gx, robot_gy):
-            # Check a small window around the robot for inflated obstacles
-            r_check = 3  # cells = 0.15 m
+            r_check = 4  # cells = 0.20 m
             y_lo = max(0, robot_gy - r_check)
             y_hi = min(self.GRID_SIZE, robot_gy + r_check + 1)
             x_lo = max(0, robot_gx - r_check)
             x_hi = min(self.GRID_SIZE, robot_gx + r_check + 1)
-            map_too_close = bool(np.any(self._inflated_occ[y_lo:y_hi, x_lo:x_hi]))
+            patch = self._inflated_occ[y_lo:y_hi, x_lo:x_hi]
+            if np.any(patch):
+                # Find centroid of nearby obstacle cells → steer away
+                oys, oxs = np.where(patch)
+                obs_gx = float(np.mean(oxs)) + x_lo
+                obs_gy = float(np.mean(oys)) + y_lo
+                obs_wx, obs_wy = self.grid_to_world(int(obs_gx), int(obs_gy))
+                # Angle FROM obstacle TO robot = direction to flee
+                map_repulse_angle = np.arctan2(by - obs_wy, bx - obs_wx)
 
         cmd = Twist()
 
-        if abs(heading_error) > 0.6:
-            # ── Large heading error: rotate in place ──────────────────
+        # ── Depth obstacle avoidance (always computed when heading OK) ──
+        clearance, distances = self._analyze_depth_obstacles()
+        left_clear, center_clear, right_clear = clearance
+        left_dist, center_dist, right_dist = distances
+        min_dist = min(left_dist, center_dist, right_dist)
+
+        if abs(heading_error) > 0.6 and map_repulse_angle is None:
+            # ── Large heading error, no nearby obstacle: rotate in place ─
             cmd.angular.z = float(np.clip(2.0 * heading_error, -1.0, 1.0))
-        else:
-            # ── Heading roughly aligned: drive forward with avoidance ─
-            clearance, distances = self._analyze_depth_obstacles()
-            left_clear, center_clear, right_clear = clearance
-            left_dist, center_dist, right_dist = distances
-            min_dist = min(left_dist, center_dist, right_dist)
-
-            if center_clear and not map_too_close:
-                # Scale speed by proximity — slower as obstacles get closer
-                speed = self.NAV_LINEAR_SPEED
-                if min_dist < 1.5:
-                    speed *= min(min_dist / 1.5, 1.0)
-                cmd.linear.x = float(min(speed, dist * 0.5))
-                cmd.angular.z = float(np.clip(1.5 * heading_error, -0.8, 0.8))
+        elif map_repulse_angle is not None:
+            # ── Near a mapped obstacle: drive away from it ───────────
+            flee_error = self._normalize_angle(map_repulse_angle - actual_heading)
+            cmd.angular.z = float(np.clip(2.0 * flee_error, -1.0, 1.0))
+            # Drive forward to escape the proximity zone
+            cmd.linear.x = float(self.NAV_LINEAR_SPEED * 0.5)
+        elif not center_clear:
+            # ── Depth sees obstacle ahead: steer around it ───────────
+            self.get_logger().info(
+                f'[NAV] Depth obstacle: L={left_dist:.2f} C={center_dist:.2f} '
+                f'R={right_dist:.2f} — steering')
+            if left_dist > right_dist:
+                cmd.angular.z = 0.8
+            elif right_dist > left_dist:
+                cmd.angular.z = -0.8
             else:
-                # Center blocked or map says we're too close — stop and steer
-                self.get_logger().info(
-                    f'[NAV] Obstacle: L={left_dist:.2f} C={center_dist:.2f} '
-                    f'R={right_dist:.2f} map_close={map_too_close} — steering')
-                if left_dist > right_dist:
-                    cmd.angular.z = 0.8
-                elif right_dist > left_dist:
-                    cmd.angular.z = -0.8
-                else:
-                    cmd.angular.z = 0.8
-                # No forward motion while steering around obstacles
-                cmd.linear.x = 0.0
+                cmd.angular.z = 0.8
+            cmd.linear.x = 0.0
+        else:
+            # ── Clear path: drive toward waypoint ────────────────────
+            speed = self.NAV_LINEAR_SPEED
+            if min_dist < 1.5:
+                speed *= min(min_dist / 1.5, 1.0)
+            cmd.linear.x = float(min(speed, dist * 0.5))
+            cmd.angular.z = float(np.clip(1.5 * heading_error, -0.8, 0.8))
 
-            # Safety: hard stop if anything very close
-            if min_dist < 0.35:
-                cmd.linear.x = 0.0
+        # Safety: hard stop if anything very close in depth
+        if min_dist < 0.35:
+            cmd.linear.x = 0.0
 
         self.cmd_vel_pub.publish(cmd)
 
