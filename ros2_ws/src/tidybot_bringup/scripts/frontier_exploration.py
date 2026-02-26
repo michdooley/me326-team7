@@ -99,6 +99,7 @@ class FrontierExplorer(Node):
     MIN_DEPTH_M       = 0.40   # ignore returns closer than this (robot body)
     MAX_DEPTH_M       = 5.00   # ignore returns farther  than this
     DEPTH_SUBSAMPLE   = 8      # process every Nth pixel (speed vs. quality)
+    DEPTH_H_CROP      = 0.20   # fraction of image width to crop from each side
     ROBOT_BODY_RADIUS = 0.60   # m — XY radius around camera to exclude self-hits
     FREE_TRACE_MAX_M  = 3.00   # m — max free-ray length for floor/ceiling returns
 
@@ -140,7 +141,7 @@ class FrontierExplorer(Node):
     ROBOT_CLEARANCE     = 0.30 # m — inflation radius for A* and goal validation
 
     # ── Navigation (cmd_vel waypoint following) ─────────────────────────────
-    NAV_TIMEOUT        = 30.0  # s per waypoint — resets on each waypoint advance
+    NAV_TIMEOUT        = 120.0  # s per waypoint — resets on each waypoint advance
     NO_FRONTIER_LIMIT  = 3     # consecutive empty scans → declare COMPLETE
     WAYPOINT_SPACING   = 20    # cells (~1.0 m) between A* waypoints
     WAYPOINT_TOLERANCE = 0.3   # m — distance to accept waypoint arrival
@@ -361,7 +362,11 @@ class FrontierExplorer(Node):
         h, w  = depth.shape
         step  = self.DEPTH_SUBSAMPLE
 
-        vs, us    = np.mgrid[0:h:step, 0:w:step]
+        # Crop horizontal edges to reduce rotational smearing — edge pixels
+        # have larger angular offsets and any TF timing lag produces arcs
+        # instead of straight lines in the occupancy grid.
+        margin = int(w * self.DEPTH_H_CROP)
+        vs, us    = np.mgrid[0:h:step, margin:w - margin:step]
         us        = us.ravel();  vs = vs.ravel()
         depths_mm = depth[vs, us].astype(np.float64)
 
@@ -693,10 +698,15 @@ class FrontierExplorer(Node):
         # Ignore top 30% (ceiling) and bottom 20% (ground)
         v_start = int(h * 0.3)
         v_end   = int(h * 0.8)
+        # Crop horizontal edges (same as mapping FOV)
+        margin = int(w * self.DEPTH_H_CROP)
+        u_start = margin
+        u_end   = w - margin
+        third   = (u_end - u_start) // 3
 
-        left_region   = depth[v_start:v_end, 0:w // 3]
-        center_region = depth[v_start:v_end, w // 3:2 * w // 3]
-        right_region  = depth[v_start:v_end, 2 * w // 3:w]
+        left_region   = depth[v_start:v_end, u_start:u_start + third]
+        center_region = depth[v_start:v_end, u_start + third:u_start + 2 * third]
+        right_region  = depth[v_start:v_end, u_start + 2 * third:u_end]
 
         def sector_min_dist(region):
             valid = region[region > 0].astype(np.float64)
