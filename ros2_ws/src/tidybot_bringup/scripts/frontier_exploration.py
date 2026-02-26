@@ -131,12 +131,12 @@ class FrontierExplorer(Node):
     MAP_PUBLISH_RATE = 1.0   # Hz
 
     # ── 360° scan ─────────────────────────────────────────────────────────────
-    SCAN_ANGULAR_VEL = 1.5   # rad/s  (~4 s per revolution, bridge max is 1.5)
+    SCAN_ANGULAR_VEL = 0.8   # rad/s  (~8 s per revolution, slower = less TF lag error)
     SCAN_SETTLE_TIME = 1.0   # s — wait after stopping for vibration to die
 
     # ── Frontier selection ────────────────────────────────────────────────────
     MIN_FRONTIER_SIZE   = 8    # cells — ignore tiny frontier clusters
-    MIN_FRONTIER_DIST   = 0.5  # m — ignore frontiers closer than this to the robot
+    MIN_FRONTIER_DIST   = 1.5  # m — ignore frontiers closer than this to the robot
     ROBOT_CLEARANCE     = 0.30 # m — inflation radius for A* and goal validation
 
     # ── Navigation (cmd_vel waypoint following) ─────────────────────────────
@@ -186,7 +186,6 @@ class FrontierExplorer(Node):
         # Waypoint navigation state
         self.nav_waypoints     = []    # list of (gx, gy)
         self.nav_waypoint_idx  = 0
-        self.nav_beeline       = False # True when driving without an A* path
 
         # TF
         self.tf_buffer   = tf2_ros.Buffer()
@@ -221,14 +220,12 @@ class FrontierExplorer(Node):
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
     def _depth_cb(self, msg: Image):
-        """Store the latest depth frame and integrate it (scanning only).
+        """Store the latest depth frame and integrate it into the map.
 
-        Depth integration is skipped while NAVIGATING to avoid translational
-        smearing — the 100 Hz publish_callback TF is not synchronised with
-        depth frames, so during forward motion the positional offset between
-        the TF timestamp and the actual sim state stretches obstacles along
-        the direction of travel.  All mapping is done during the stationary
-        360° SCANNING phase instead.
+        Depth is integrated in all states (including NAVIGATING) so the
+        map stays current as the robot drives.  At 0.25 m/s and ~30 Hz
+        depth, positional error is ~8 mm/frame — well within the 5 cm
+        grid resolution.
         """
         try:
             depth = self.cv_bridge.imgmsg_to_cv2(msg, '16UC1')
@@ -237,7 +234,7 @@ class FrontierExplorer(Node):
             return
         self.latest_depth       = depth
         self.latest_depth_stamp = msg.header.stamp
-        if self.camera_K is not None and self.state != ExploreState.NAVIGATING:
+        if self.camera_K is not None:
             self._integrate_depth()
 
     def _camera_info_cb(self, msg: CameraInfo):
@@ -1029,23 +1026,16 @@ class FrontierExplorer(Node):
 
             self.nav_waypoints    = path
             self.nav_waypoint_idx = 0
-            self.nav_beeline      = False
             self.nav_start_time   = time.time()
             self.state = ExploreState.NAVIGATING
             return
 
-        # All A* paths failed — drive directly toward the best frontier and
-        # rely on depth obstacle avoidance to steer around obstacles.
-        wx, wy, size, score = frontiers[0]
-        goal_gx, goal_gy = self.world_to_grid(wx, wy)
+        # All frontiers had no A* path — re-select without a full 360° scan.
+        # The map updates continuously; re-running find_frontiers() may yield
+        # new results as the occupancy grid evolves.
         self.get_logger().warn(
-            f'[SELECT] No A* path — beelining toward ({wx:.2f}, {wy:.2f}) '
-            f'with obstacle avoidance.')
-        self.nav_waypoints    = [(goal_gx, goal_gy)]
-        self.nav_waypoint_idx = 0
-        self.nav_beeline      = True
-        self.nav_start_time   = time.time()
-        self.state = ExploreState.NAVIGATING
+            '[SELECT] No A* path to any frontier — will re-select.')
+        # Stay in SELECTING state (will re-run on next tick)
 
     def _state_navigating(self):
         """Follow A* waypoints via cmd_vel with map-based re-planning."""
@@ -1066,8 +1056,7 @@ class FrontierExplorer(Node):
         actual_heading = btheta - np.pi / 2  # MuJoCo → world heading
 
         # ── Check if path is blocked on the mapped obstacles ───────────
-        # Skip for beeline paths — obstacle avoidance handles it reactively.
-        if not self.nav_beeline and self._is_path_blocked():
+        if self._is_path_blocked():
             self.get_logger().info('[NAV] Path blocked on map — re-planning...')
             if self._replan_from_here():
                 return  # re-planned successfully, follow new path next tick
