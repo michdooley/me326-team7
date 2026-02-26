@@ -136,9 +136,8 @@ class FrontierExplorer(Node):
 
     # ── Frontier selection ────────────────────────────────────────────────────
     MIN_FRONTIER_SIZE   = 8    # cells — ignore tiny frontier clusters
-    MIN_FRONTIER_DIST   = 1.0  # m — ignore frontiers closer than this to the robot
-    ROBOT_CLEARANCE     = 0.45 # m — min clearance from obstacles for goals/centroids
-    FRONTIER_NAV_OFFSET = 0.4  # m — goal set this far in front of centroid
+    MIN_FRONTIER_DIST   = 0.5  # m — ignore frontiers closer than this to the robot
+    ROBOT_CLEARANCE     = 0.30 # m — inflation radius for A* and goal validation
 
     # ── Navigation (cmd_vel waypoint following) ─────────────────────────────
     NAV_TIMEOUT        = 30.0  # s per waypoint — resets on each waypoint advance
@@ -790,22 +789,15 @@ class FrontierExplorer(Node):
         bx, by, _ = base_pose
         robot_gx, robot_gy = self.world_to_grid(bx, by)
 
-        # ── Reachability: connected-component labeling on inflated-free cells ──
-        # Flood-fills through cells that are confirmed free AND outside the
-        # inflated obstacle zone — i.e. corridors wide enough for the robot.
-        # Frontier cells often sit inside the inflated zone (they border unknown
-        # space near obstacles), so we dilate the reachable set by clear_disc:
-        # a frontier is "reachable" if the robot can get within ROBOT_CLEARANCE
-        # of it via a robot-safe path.
-        traversable = free_mask & ~self._inflated_occ
-        _labeled, _ = ndimage_label(traversable, structure=np.ones((3, 3), dtype=bool))
+        # ── Reachability: connected-component labeling on free cells ─────────
+        # Flood-fill on uninflated free space to check basic connectivity.
+        # Inflation (robot width) is enforced by A* path planning, not here.
+        _labeled, _ = ndimage_label(free_mask, structure=np.ones((3, 3), dtype=bool))
         if (self.in_grid(robot_gx, robot_gy) and
                 _labeled[robot_gy, robot_gx] > 0):
             reachable = (_labeled == _labeled[robot_gy, robot_gx])
-            reachable_near = binary_dilation(reachable, structure=clear_disc)
         else:
             reachable = None
-            reachable_near = None
 
         # Pre-build a boolean disc mask of radius MAX_DEPTH_M in grid cells.
         # Reused for every cluster so we only allocate it once.
@@ -831,29 +823,26 @@ class FrontierExplorer(Node):
                 n_dist += 1
                 continue
 
-            # ── 2. Reachability: robot can get within ROBOT_CLEARANCE ─────
-            # reachable_near is the inflated-safe reachable set dilated by
-            # clear_disc, so a frontier cell passes if there's a robot-safe
-            # path that gets within ROBOT_CLEARANCE of it.
-            if reachable_near is not None:
-                if not np.any(reachable_near[cys, cxs]):
+            # ── 2. Reachability: same free-space component as robot ────
+            # Frontier cells are free by definition, so checking them
+            # directly against the uninflated reachable set works.
+            # A* enforces the inflation (robot-width) constraint later.
+            if reachable is not None:
+                if not np.any(reachable[cys, cxs]):
                     n_reach += 1
                     continue
 
-            # ── 3. Snap centroid to nearest valid cluster cell ─────────────
+            # ── 3. Snap centroid to nearest cluster cell outside inflation ──
             # The raw centroid (mean position) often lands on an UNKNOWN or
             # inflated-obstacle cell because frontier cells border unknown
-            # space.  Snap to the nearest cluster cell that is both clear of
-            # the inflated obstacle zone and reachable.
+            # space.  Snap to the nearest cluster cell outside the inflated
+            # zone so A* can accept it as a goal.
             centroid_valid = (
                 self.in_grid(mgx, mgy) and
-                not self._inflated_occ[mgy, mgx] and
-                (reachable is None or reachable[mgy, mgx]))
+                not self._inflated_occ[mgy, mgx])
 
             if not centroid_valid:
                 valid = ~self._inflated_occ[cys, cxs]
-                if reachable is not None:
-                    valid &= reachable[cys, cxs]
                 if not np.any(valid):
                     n_clear += 1
                     continue
