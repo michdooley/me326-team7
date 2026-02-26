@@ -646,35 +646,20 @@ class FrontierExplorer(Node):
         return confirmed_occ
 
     def _is_path_blocked(self):
-        """Check the line between consecutive waypoints for obstacles.
+        """Check remaining waypoint cells against obstacles.
 
-        Uses Bresenham-style sampling along each segment (not just waypoint
-        cells) so obstacles between widely-spaced waypoints are detected.
+        Only checks the waypoint cells themselves (not the robot's current
+        position), because A* routes around inflated obstacles — the
+        straight line from the robot to the next waypoint may cross
+        inflated cells that the actual path avoids.  Robot proximity
+        to obstacles is handled separately in _state_navigating.
         """
         nav_clear = getattr(self, 'nav_clearance', None)
         inflated = self._compute_inflated(nav_clear)
-
-        # Build list of points to check: current position + remaining waypoints
-        pose = self.get_base_pose()
-        if pose is None:
-            return False
-        bx, by, _ = pose
-        rgx, rgy = self.world_to_grid(bx, by)
-
-        points = [(rgx, rgy)]
         for i in range(self.nav_waypoint_idx, len(self.nav_waypoints)):
-            points.append(self.nav_waypoints[i])
-
-        # Walk each segment, sampling every few cells
-        for k in range(len(points) - 1):
-            x0, y0 = points[k]
-            x1, y1 = points[k + 1]
-            seg_len = max(abs(x1 - x0), abs(y1 - y0), 1)
-            for t in range(seg_len + 1):
-                sx = x0 + (x1 - x0) * t // seg_len
-                sy = y0 + (y1 - y0) * t // seg_len
-                if self.in_grid(sx, sy) and inflated[sy, sx]:
-                    return True
+            gx, gy = self.nav_waypoints[i]
+            if self.in_grid(gx, gy) and inflated[gy, gx]:
+                return True
         return False
 
     def _replan_from_here(self):
