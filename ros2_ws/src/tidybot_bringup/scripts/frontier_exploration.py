@@ -615,13 +615,14 @@ class FrontierExplorer(Node):
         bx, by, _ = base_pose
         robot_gx, robot_gy = self.world_to_grid(bx, by)
 
-        # ── Reachability: connected-component labeling of free non-obstacle cells ──
-        # Flood-fills (via scipy) through cells that are confirmed free AND not
-        # inside the inflated obstacle zone.  Only frontier centroids whose grid
-        # cell belongs to the same component as the robot are kept — this removes
-        # frontiers that are physically cut off behind walls even though they look
-        # free on the 2-D map projection.
-        traversable = free_mask & ~self._inflated_occ
+        # ── Reachability: connected-component labeling of confirmed free cells ──
+        # Flood-fills through cells that are confirmed free (log_odds ≤ FREE_THRESH).
+        # Inflation is NOT applied here — it would block frontier cells that sit
+        # just a few cells from confirmed obstacles (the smeared/unconfirmed strip
+        # between free and occupied is often < 0.45 m).  Inflation is still enforced
+        # later in centroid snapping and goal walk-back to keep the final nav goal
+        # at a safe distance from walls.
+        traversable = free_mask
         _labeled, _ = ndimage_label(traversable, structure=np.ones((3, 3), dtype=bool))
         if (self.in_grid(robot_gx, robot_gy) and
                 _labeled[robot_gy, robot_gx] > 0):
