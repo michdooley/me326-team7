@@ -45,6 +45,7 @@ install(PROGRAMS
   scripts/pick_up_block_real.py
   scripts/frontier_exploration.py
   scripts/explore_and_find_object.py
+  scripts/explore_find_object_and_return.py
   scripts/objective1_task.py
   DESTINATION lib/${PROJECT_NAME}
 )
