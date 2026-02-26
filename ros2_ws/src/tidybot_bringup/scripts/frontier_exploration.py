@@ -145,7 +145,7 @@ class FrontierExplorer(Node):
     NO_FRONTIER_LIMIT  = 3     # consecutive empty scans → declare COMPLETE
     WAYPOINT_SPACING   = 20    # cells (~1.0 m) between A* waypoints
     WAYPOINT_TOLERANCE = 0.3   # m — distance to accept waypoint arrival
-    NAV_LINEAR_SPEED   = 0.20  # m/s — forward speed during waypoint following
+    NAV_LINEAR_SPEED   = 0.30  # m/s — forward speed during waypoint following
     OBSTACLE_THRESHOLD = 0.8   # m — depth distance to trigger avoidance
 
     # ─────────────────────────────────────────────────────────────────────────
