@@ -543,10 +543,15 @@ class FrontierExplorer(Node):
         than MIN_FRONTIER_SIZE are discarded.
 
         Clusters are additionally filtered by:
-          • MIN_FRONTIER_DIST  — centroid must be > 1.5 m from the robot.
-          • ROBOT_CLEARANCE    — centroid must not be inside the obstacle-inflated zone.
-          • Reachability       — centroid must be in the same free-space connected
-                                 component as the robot (scipy label flood-fill).
+          • MIN_FRONTIER_DIST  — centroid must be > MIN_FRONTIER_DIST from the robot.
+          • Reachability       — at least one cell in the cluster must be in the
+                                 same free-space connected component as the robot
+                                 (scipy label flood-fill).
+          • Centroid snapping  — if the raw centroid (mean position) falls on an
+                                 invalid cell (unknown, inflated-obstacle, or
+                                 unreachable), it is snapped to the nearest valid
+                                 cluster cell.  If no valid cell exists, the
+                                 cluster is discarded.
 
         Score = unknown_cells_within_MAX_DEPTH_M / distance
 
@@ -632,35 +637,62 @@ class FrontierExplorer(Node):
         disc    = (ky ** 2 + kx ** 2) <= r_cells ** 2   # (side × side) bool
 
         results = []
+        n_dist = n_reach = n_clear = 0   # diagnostic counters
+
         for cluster in clusters:
-            mgx = int(np.mean([c[0] for c in cluster]))
-            mgy = int(np.mean([c[1] for c in cluster]))
+            cluster_cells = np.array(cluster)          # (N, 2) — columns: gx, gy
+            cxs, cys = cluster_cells[:, 0], cluster_cells[:, 1]
+
+            # ── 1. Distance filter (coarse) ────────────────────────────────
+            mgx = int(np.mean(cxs))
+            mgy = int(np.mean(cys))
             wx, wy = self.grid_to_world(mgx, mgy)
             dist   = np.hypot(wx - bx, wy - by)
 
-            # Skip frontiers too close to the robot.  These arise at the edge
-            # of the footprint-clearing radius and score deceptively high
-            # because the distance denominator is tiny.
             if dist < self.MIN_FRONTIER_DIST:
+                n_dist += 1
                 continue
 
-            # Skip if the centroid is within ROBOT_CLEARANCE of any confirmed
-            # obstacle — the robot cannot safely stand at this location.
-            if self._inflated_occ[mgy, mgx]:
-                continue
+            # ── 2. Reachability: at least one cluster cell reachable ───────
+            # Frontier cells are FREE by definition, so they appear in the
+            # traversable mask unless they also fall in the inflated obstacle
+            # zone.  Checking any cell (not just the centroid) avoids false
+            # rejections when the centroid lands on an UNKNOWN cell.
+            if reachable is not None:
+                if not np.any(reachable[cys, cxs]):
+                    n_reach += 1
+                    continue
 
-            # Skip if the centroid is unreachable from the robot via confirmed
-            # free space — i.e. it is behind a wall with no navigable path.
-            if reachable is not None and not reachable[mgy, mgx]:
-                continue
+            # ── 3. Snap centroid to nearest valid cluster cell ─────────────
+            # The raw centroid (mean position) often lands on an UNKNOWN or
+            # inflated-obstacle cell because frontier cells border unknown
+            # space.  Snap to the nearest cluster cell that is both clear of
+            # the inflated obstacle zone and reachable.
+            centroid_valid = (
+                self.in_grid(mgx, mgy) and
+                not self._inflated_occ[mgy, mgx] and
+                (reachable is None or reachable[mgy, mgx]))
 
-            # Count UNKNOWN cells within sensor range of this frontier centroid.
+            if not centroid_valid:
+                valid = ~self._inflated_occ[cys, cxs]
+                if reachable is not None:
+                    valid &= reachable[cys, cxs]
+                if not np.any(valid):
+                    n_clear += 1
+                    continue
+                valid_idx = np.where(valid)[0]
+                dists2 = (cxs[valid_idx] - mgx) ** 2 + (cys[valid_idx] - mgy) ** 2
+                best = valid_idx[np.argmin(dists2)]
+                mgx, mgy = int(cxs[best]), int(cys[best])
+                wx, wy = self.grid_to_world(mgx, mgy)
+                dist   = np.hypot(wx - bx, wy - by)
+
+            # ── 4. Information-gain score ──────────────────────────────────
             y_lo = max(0,             mgy - r_cells)
             y_hi = min(self.GRID_SIZE, mgy + r_cells + 1)
             x_lo = max(0,             mgx - r_cells)
             x_hi = min(self.GRID_SIZE, mgx + r_cells + 1)
 
-            # Corresponding slice of the disc kernel (handles grid edges)
             ky_lo = y_lo - (mgy - r_cells)
             ky_hi = ky_lo + (y_hi - y_lo)
             kx_lo = x_lo - (mgx - r_cells)
@@ -671,6 +703,10 @@ class FrontierExplorer(Node):
 
             score = nearby_unknown / max(dist, 0.5)
             results.append((wx, wy, len(cluster), score))
+
+        self.get_logger().info(
+            f'[FRONTIER] {len(clusters)} clusters → {len(results)} valid '
+            f'(filtered: dist={n_dist}, reach={n_reach}, clear={n_clear})')
 
         results.sort(key=lambda r: r[3], reverse=True)
         return results
