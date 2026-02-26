@@ -136,7 +136,7 @@ class FrontierExplorer(Node):
 
     # ── Frontier selection ────────────────────────────────────────────────────
     MIN_FRONTIER_SIZE   = 8    # cells — ignore tiny frontier clusters
-    MIN_FRONTIER_DIST   = 1.5  # m — ignore frontiers closer than this to the robot
+    MIN_FRONTIER_DIST   = 1.0  # m — ignore frontiers closer than this to the robot
     ROBOT_CLEARANCE     = 0.30 # m — inflation radius for A* and goal validation
 
     # ── Navigation (cmd_vel waypoint following) ─────────────────────────────
@@ -1030,12 +1030,27 @@ class FrontierExplorer(Node):
             self.state = ExploreState.NAVIGATING
             return
 
-        # All frontiers had no A* path — re-select without a full 360° scan.
-        # The map updates continuously; re-running find_frontiers() may yield
-        # new results as the occupancy grid evolves.
+        # All frontiers had no A* path — beeline toward the best one.
+        # Driving closer changes the robot's position, updates the map via
+        # continuous depth integration, and lets A* succeed on re-select.
+        best_wx, best_wy = frontiers[0][0], frontiers[0][1]
+        dx, dy = best_wx - bx, best_wy - by
+        d = np.hypot(dx, dy)
+        # Aim for a point 1.5 m toward the frontier (or the frontier itself
+        # if closer) so the robot makes progress without overshooting.
+        step = min(d, 1.5)
+        tgt_wx = bx + step * dx / max(d, 0.01)
+        tgt_wy = by + step * dy / max(d, 0.01)
+        tgt_gx, tgt_gy = self.world_to_grid(tgt_wx, tgt_wy)
+
         self.get_logger().warn(
-            '[SELECT] No A* path to any frontier — will re-select.')
-        # Stay in SELECTING state (will re-run on next tick)
+            f'[SELECT] No A* path to any frontier — beelining toward '
+            f'({best_wx:.2f}, {best_wy:.2f})')
+
+        self.nav_waypoints    = [(tgt_gx, tgt_gy)]
+        self.nav_waypoint_idx = 0
+        self.nav_start_time   = time.time()
+        self.state = ExploreState.NAVIGATING
 
     def _state_navigating(self):
         """Follow A* waypoints via cmd_vel with map-based re-planning."""
