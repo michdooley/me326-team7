@@ -834,67 +834,69 @@ class FrontierExplorer(Node):
             return
 
         self.no_frontier_count = 0
-        wx, wy, size, score = frontiers[0]
-        self.get_logger().info(
-            f'[SELECT] Best frontier ({wx:.2f}, {wy:.2f}) '
-            f'cluster={size} info_score={score:.0f}')
 
         base_pose = self.get_base_pose()
         if base_pose is None:
             self._start_scan()
             return
         bx, by, _ = base_pose
-        dx, dy = wx - bx, wy - by
-        dist   = np.hypot(dx, dy)
 
-        if dist > self.FRONTIER_NAV_OFFSET * 2:
-            ratio  = (dist - self.FRONTIER_NAV_OFFSET) / dist
-            goal_x = bx + dx * ratio
-            goal_y = by + dy * ratio
-        else:
-            goal_x, goal_y = wx, wy
+        # Try each frontier in score order until we find a navigable goal.
+        # The centroid was already validated as clear-of-inflated-obstacles in
+        # find_frontiers() (centroid snapping, step 3).  If the offset goal
+        # lands in the inflated zone, fall back to the centroid directly.
+        for wx, wy, size, score in frontiers:
+            dx, dy = wx - bx, wy - by
+            dist   = np.hypot(dx, dy)
 
-        # If the goal falls inside the inflated obstacle zone (e.g. the
-        # frontier centroid is near a wall even after the offset), walk the
-        # goal back along the robot→frontier line one grid cell at a time
-        # until it reaches obstacle-free space.
-        if hasattr(self, '_inflated_occ'):
-            gx_g = int((goal_x - self.GRID_ORIGIN_X) / self.GRID_RESOLUTION)
-            gy_g = int((goal_y - self.GRID_ORIGIN_Y) / self.GRID_RESOLUTION)
-            if (self.in_grid(gx_g, gy_g) and self._inflated_occ[gy_g, gx_g]):
-                norm = dist if dist > 0 else 1.0
-                ux, uy = dx / norm, dy / norm
-                step = self.GRID_RESOLUTION
-                found = False
-                for t in np.arange(dist - self.FRONTIER_NAV_OFFSET - step,
-                                   self.MIN_FRONTIER_DIST, -step):
-                    gx_t = int((bx + ux * t - self.GRID_ORIGIN_X) / self.GRID_RESOLUTION)
-                    gy_t = int((by + uy * t - self.GRID_ORIGIN_Y) / self.GRID_RESOLUTION)
-                    if (self.in_grid(gx_t, gy_t) and
-                            not self._inflated_occ[gy_t, gx_t]):
-                        goal_x = bx + ux * t
-                        goal_y = by + uy * t
-                        found = True
-                        break
-                if not found:
-                    self.get_logger().warn(
-                        '[SELECT] No clear goal along robot→frontier line — re-scanning.')
-                    self._start_scan()
-                    return
+            self.get_logger().info(
+                f'[SELECT] Trying frontier ({wx:.2f}, {wy:.2f}) '
+                f'cluster={size} score={score:.0f}')
 
-        goal_theta = np.arctan2(dy, dx)
-        user_theta = goal_theta - np.pi / 2   # bridge frame convention
+            # Compute offset goal (FRONTIER_NAV_OFFSET closer to robot)
+            if dist > self.FRONTIER_NAV_OFFSET * 2:
+                ratio  = (dist - self.FRONTIER_NAV_OFFSET) / dist
+                goal_x = bx + dx * ratio
+                goal_y = by + dy * ratio
+            else:
+                goal_x, goal_y = wx, wy
 
-        self.get_logger().info(
-            f'[SELECT] Goal ({goal_x:.2f}, {goal_y:.2f}) '
-            f'heading={np.degrees(goal_theta):.0f}°')
+            # Validate against inflated obstacle mask
+            if hasattr(self, '_inflated_occ'):
+                gx_g = int((goal_x - self.GRID_ORIGIN_X) / self.GRID_RESOLUTION)
+                gy_g = int((goal_y - self.GRID_ORIGIN_Y) / self.GRID_RESOLUTION)
 
-        goal = Pose2D()
-        goal.x = goal_x;  goal.y = goal_y;  goal.theta = user_theta
-        self.base_goal_reached = False
-        self.base_goal_pub.publish(goal)
-        self.nav_start_time = time.time()
-        self.state = ExploreState.NAVIGATING
+                if self.in_grid(gx_g, gy_g) and self._inflated_occ[gy_g, gx_g]:
+                    # Offset goal blocked — fall back to centroid directly
+                    goal_x, goal_y = wx, wy
+                    gx_g = int((goal_x - self.GRID_ORIGIN_X) / self.GRID_RESOLUTION)
+                    gy_g = int((goal_y - self.GRID_ORIGIN_Y) / self.GRID_RESOLUTION)
+
+                    if self.in_grid(gx_g, gy_g) and self._inflated_occ[gy_g, gx_g]:
+                        # Centroid also blocked — try next frontier
+                        self.get_logger().info(
+                            f'[SELECT] Skipping — goal in obstacle zone.')
+                        continue
+
+            goal_theta = np.arctan2(dy, dx)
+            user_theta = goal_theta - np.pi / 2   # bridge frame convention
+
+            self.get_logger().info(
+                f'[SELECT] Goal ({goal_x:.2f}, {goal_y:.2f}) '
+                f'heading={np.degrees(goal_theta):.0f}°')
+
+            goal = Pose2D()
+            goal.x = goal_x;  goal.y = goal_y;  goal.theta = user_theta
+            self.base_goal_reached = False
+            self.base_goal_pub.publish(goal)
+            self.nav_start_time = time.time()
+            self.state = ExploreState.NAVIGATING
+            return
+
+        # All frontiers exhausted — re-scan
+        self.get_logger().warn(
+            '[SELECT] No navigable goal from any frontier — re-scanning.')
+        self._start_scan()
 
     def _state_navigating(self):
         if self.base_goal_reached:
