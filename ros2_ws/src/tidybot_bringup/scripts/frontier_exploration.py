@@ -1165,20 +1165,16 @@ class FrontierExplorer(Node):
 
         cmd = Twist()
 
-        # ── Depth obstacle avoidance (always computed when heading OK) ──
+        # ── Depth obstacle avoidance ─────────────────────────────────
         clearance, distances = self._analyze_depth_obstacles()
         left_clear, center_clear, right_clear = clearance
         left_dist, center_dist, right_dist = distances
         min_dist = min(left_dist, center_dist, right_dist)
 
-        if abs(heading_error) > 0.6 and map_repulse_angle is None:
-            # ── Large heading error, no nearby obstacle: rotate in place ─
-            cmd.angular.z = float(np.clip(2.0 * heading_error, -1.0, 1.0))
-        elif map_repulse_angle is not None:
+        if map_repulse_angle is not None:
             # ── Near a mapped obstacle: drive away from it ───────────
             flee_error = self._normalize_angle(map_repulse_angle - actual_heading)
             cmd.angular.z = float(np.clip(2.0 * flee_error, -1.0, 1.0))
-            # Drive forward to escape the proximity zone
             cmd.linear.x = float(self.NAV_LINEAR_SPEED * 0.5)
         elif not center_clear:
             # ── Depth sees obstacle ahead: steer around it ───────────
@@ -1193,12 +1189,17 @@ class FrontierExplorer(Node):
                 cmd.angular.z = 0.8
             cmd.linear.x = 0.0
         else:
-            # ── Clear path: drive toward waypoint ────────────────────
-            speed = self.NAV_LINEAR_SPEED
+            # ── Drive toward waypoint with smooth arc ────────────────
+            # Scale forward speed by heading alignment: full speed when
+            # aligned, tapering to zero at 90°+. This avoids the hard
+            # rotate-in-place / drive-forward oscillation that causes
+            # S-shaped paths.
+            alignment = max(0.0, np.cos(heading_error))  # 1.0→aligned, 0→90°
+            speed = self.NAV_LINEAR_SPEED * alignment
             if min_dist < 1.5:
                 speed *= min(min_dist / 1.5, 1.0)
             cmd.linear.x = float(min(speed, dist * 0.5))
-            cmd.angular.z = float(np.clip(1.5 * heading_error, -0.8, 0.8))
+            cmd.angular.z = float(np.clip(2.0 * heading_error, -1.0, 1.0))
 
         # Safety: hard stop if anything very close in depth
         if min_dist < 0.35:
