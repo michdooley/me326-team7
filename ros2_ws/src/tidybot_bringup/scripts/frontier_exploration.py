@@ -96,7 +96,7 @@ class FrontierExplorer(Node):
     GRID_ORIGIN_Y   = -7.5   # world Y of grid row    0  (m)
 
     # ── Depth filtering ───────────────────────────────────────────────────────
-    MIN_DEPTH_M       = 0.30   # ignore returns closer than this (robot body)
+    MIN_DEPTH_M       = 0.40   # ignore returns closer than this (robot body)
     MAX_DEPTH_M       = 5.00   # ignore returns farther  than this
     DEPTH_SUBSAMPLE   = 8      # process every Nth pixel (speed vs. quality)
     ROBOT_BODY_RADIUS = 0.60   # m — XY radius around camera to exclude self-hits
@@ -991,6 +991,8 @@ class FrontierExplorer(Node):
                 self.get_logger().info('[SELECT] Exploration complete.')
                 self.state = ExploreState.COMPLETE
             else:
+                # No frontiers visible — a 360° scan is warranted to
+                # discover new unknown boundaries.
                 self.get_logger().info(
                     f'[SELECT] No frontiers '
                     f'({self.no_frontier_count}/{self.NO_FRONTIER_LIMIT}) '
@@ -1002,8 +1004,7 @@ class FrontierExplorer(Node):
 
         base_pose = self.get_base_pose()
         if base_pose is None:
-            self._start_scan()
-            return
+            return  # retry next tick
         bx, by, _ = base_pose
         robot_gx, robot_gy = self.world_to_grid(bx, by)
 
@@ -1031,10 +1032,12 @@ class FrontierExplorer(Node):
             self.state = ExploreState.NAVIGATING
             return
 
-        # All frontiers exhausted — re-scan
+        # All frontiers had no A* path — re-select without a full 360° scan.
+        # The map updates continuously; re-running find_frontiers() may yield
+        # new results as the occupancy grid evolves.
         self.get_logger().warn(
-            '[SELECT] No navigable goal from any frontier — re-scanning.')
-        self._start_scan()
+            '[SELECT] No A* path to any frontier — will re-select.')
+        # Stay in SELECTING state (will re-run on next tick)
 
     def _state_navigating(self):
         """Follow A* waypoints via cmd_vel with map-based re-planning."""
@@ -1043,8 +1046,8 @@ class FrontierExplorer(Node):
         # ── Safety timeout ─────────────────────────────────────────────
         if now - self.nav_start_time > self.NAV_TIMEOUT:
             self._stop_base()
-            self.get_logger().warn('[NAV] Timeout — re-scanning.')
-            self._start_scan()
+            self.get_logger().warn('[NAV] Timeout — re-selecting.')
+            self.state = ExploreState.SELECTING
             return
 
         # ── Get current pose ───────────────────────────────────────────
@@ -1062,8 +1065,8 @@ class FrontierExplorer(Node):
             else:
                 self._stop_base()
                 self.get_logger().warn(
-                    '[NAV] Re-plan failed — re-scanning to update map.')
-                self._start_scan()
+                    '[NAV] Re-plan failed — re-selecting.')
+                self.state = ExploreState.SELECTING
                 return
 
         # ── Current waypoint ───────────────────────────────────────────
