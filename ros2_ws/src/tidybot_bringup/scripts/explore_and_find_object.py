@@ -2,7 +2,7 @@
 """
 TidyBot2 Explore & Find Object
 
-Combines frontier exploration with color-based object detection.
+Combines frontier exploration with YOLO-based object detection.
 The robot explores unknown space using frontier-based exploration until
 it detects the target colored cube (red, yellow, or blue), then navigates
 to it.
@@ -14,9 +14,9 @@ State machine:
   4. APPROACHING — navigate to detected object's world position.
   5. COMPLETE    — object found and reached.
 
-Object detection uses HSV color filtering on the RGB camera feed.
-When the target color blob is detected in multiple consecutive frames,
-its world position is estimated via depth back-projection and the robot
+Object detection uses YOLO detections on the RGB camera feed.
+When the target class is detected in multiple consecutive frames, its
+world position is estimated via depth back-projection and the robot
 navigates to it.
 
 Publishes:
@@ -31,10 +31,10 @@ Subscribes:
   /camera/color/image_raw    — RGB frames for object detection
 
 Prerequisites:
-    ros2 launch tidybot_bringup sim.launch.py scene:=scene_obstacles.xml
+    ros2 launch tidybot_bringup sim.launch.py scene:=scene_fruit_obstacles.xml
 
 Usage:
-    ros2 run tidybot_bringup explore_and_find_object.py --ros-args -p target_color:=red
+    ros2 run tidybot_bringup explore_and_find_object.py --ros-args -p target_class_id:=46
 """
 
 import heapq
@@ -195,8 +195,13 @@ class ExploreAndFind(Node):
         #     self.target_color = 'red'
 
         # Object detection state (YOLO version)
-        self.declare_parameter('target_class_id', 46) # Default to 46 (e.g., banana/apple)
+        self.declare_parameter('target_class_id', 46)  # 46 is banana in COCO.
+        self.declare_parameter('target_label', 'banana')
         self.target_class_id = self.get_parameter('target_class_id').get_parameter_value().integer_value
+        self.target_color = (
+            self.get_parameter('target_label').get_parameter_value().string_value.strip()
+            or f'class_{self.target_class_id}'
+        )
         self.object_world_pos   = None   # (wx, wy) once confirmed
         self.detection_times    = []     # timestamps of recent detections
         self.last_detection_pos = None   # (wx, wy) of most recent detection
