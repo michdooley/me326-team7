@@ -25,10 +25,12 @@ Usage:
 import time
 import numpy as np
 import rclpy
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy  # noqa: F401
 from scipy.spatial.transform import Rotation
 
 import tf2_ros
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 
 from sensor_msgs.msg import Image, CameraInfo, JointState
 from geometry_msgs.msg import Pose, Quaternion
@@ -83,8 +85,16 @@ class NavigateGraspReturnNode(NavigationTaskNode):
     RETURN_TURN_STEP_RAD = 0.10
 
     # Override stop distance so banana lands in arm's reachable zone (~0.30-0.40m in base_link Y)
-    SEEK_TARGET_STOP_DISTANCE_M = 0.35
+    # Depth camera is offset forward from base_link, so depth distance < base_link Y distance.
+    # At 0.39m depth stop, banana was at y=-0.515 (too far). Need to get ~15cm closer.
+    SEEK_TARGET_STOP_DISTANCE_M = 0.20
     APPROACH_STOP_DISTANCE_BUFFER_M = 0.05
+
+    # More persistent target tracking — don't drop back to search so easily.
+    # Parent defaults: LOST_FRAMES=12(->20 for YOLO), MEMORY=1.5s, MAX_AGE=1.5s
+    APPROACH_LOST_FRAMES = 40         # wait 40 frames (~4s) before giving up approach
+    APPROACH_TARGET_MEMORY_S = 4.0    # keep approaching last known heading for 4s
+    YOLO_DETECTION_MAX_AGE_S = 3.0    # accept detections up to 3s old
 
     # Grasp parameters
     GRASP_ARM = 'right'
@@ -169,8 +179,11 @@ class NavigateGraspReturnNode(NavigationTaskNode):
         self.arm_pub = self.create_publisher(
             ArmCommand, f'/{self.grasp_arm}_arm/cmd', 10)
 
-        # --- IK planner service ---
-        self.plan_client = self.create_client(PlanToTarget, '/plan_to_target')
+        # --- IK planner service (separate callback group so calls work from timer) ---
+        self._service_cb_group = MutuallyExclusiveCallbackGroup()
+        self.plan_client = self.create_client(
+            PlanToTarget, '/plan_to_target',
+            callback_group=self._service_cb_group)
 
         # --- real hardware extras ---
         if not self.is_sim:
@@ -293,12 +306,15 @@ class NavigateGraspReturnNode(NavigationTaskNode):
         else:
             self.get_logger().warn('Grasp failed — returning home empty-handed.')
 
+        # Reset camera to level before driving home
+        self._set_camera_tilt(0.0)
+
         if self.return_enabled and self.home_pose_set:
             self.return_home_active = True
             self.get_logger().info(
                 f'Returning to home pose ({self.home_x:.2f}, {self.home_y:.2f}).')
 
-    GRASP_CAMERA_TILT_RAD = 0.35  # moderate downward tilt for grasp view
+    GRASP_CAMERA_TILT_RAD = 0.65  # ~37 deg down — needs to see banana at close range
 
     def _set_camera_tilt(self, tilt_rad):
         """Set camera tilt to a specific angle and wait for it to settle."""
@@ -415,9 +431,9 @@ class NavigateGraspReturnNode(NavigationTaskNode):
     # ------------------------------------------------------------------
 
     def _spin_for(self, seconds):
-        deadline = time.time() + seconds
-        while time.time() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.05)
+        """Wait for a duration. With MultiThreadedExecutor, callbacks are
+        processed by the executor threads so we just sleep."""
+        time.sleep(seconds)
 
     def _detect_target(self):
         """Find best YOLO detection matching our target class."""
@@ -611,12 +627,14 @@ class NavigateGraspReturnNode(NavigationTaskNode):
         return grasp_pose, pre_grasp_pose, info
 
     def _wait_for_future(self, future, timeout_sec=10.0):
-        """Poll spin_once until future completes (safe inside timer callbacks)."""
+        """Wait for service future to complete. With MultiThreadedExecutor,
+        the service response is processed by the executor on another thread,
+        so we just poll the future status."""
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.1)
             if future.done():
                 return True
+            time.sleep(0.05)
         return False
 
     def _try_ik(self, pose, use_orientation=True):
@@ -669,7 +687,7 @@ class NavigateGraspReturnNode(NavigationTaskNode):
         msg.data = [position]
         for _ in range(10):
             self.gripper_pub.publish(msg)
-            rclpy.spin_once(self, timeout_sec=0.05)
+            time.sleep(0.05)
         time.sleep(0.5)
 
     def _close_gripper_firm(self):
@@ -677,11 +695,11 @@ class NavigateGraspReturnNode(NavigationTaskNode):
         msg.data = [1.0]
         for _ in range(GRIPPER_CLOSE_REPEATS):
             self.gripper_pub.publish(msg)
-            rclpy.spin_once(self, timeout_sec=0.05)
+            time.sleep(0.05)
         time.sleep(GRIPPER_CLOSE_WAIT)
         for _ in range(10):
             self.gripper_pub.publish(msg)
-            rclpy.spin_once(self, timeout_sec=0.05)
+            time.sleep(0.05)
 
     def _go_home_arm(self, duration=3.0):
         """Return arm to safe position."""
@@ -750,6 +768,16 @@ class NavigateGraspReturnNode(NavigationTaskNode):
         distance = float(np.hypot(dx, dy))
         angle_error = self._wrapped_angle_diff(self.home_theta, self.current_theta)
 
+        # Periodic progress log
+        now = self.get_clock().now()
+        if not hasattr(self, '_last_return_log') or (now - self._last_return_log).nanoseconds / 1e9 > 3.0:
+            self._last_return_log = now
+            blocked = self.is_obstacle_blocking()
+            self.get_logger().info(
+                f'  Return home: dist={distance:.2f}m, '
+                f'angle_err={np.rad2deg(angle_error):.0f}deg, '
+                f'blocked={blocked}')
+
         if (distance <= self.return_position_tolerance
                 and abs(angle_error) <= self.return_angle_tolerance):
             if not self.return_home_complete:
@@ -765,20 +793,18 @@ class NavigateGraspReturnNode(NavigationTaskNode):
             self.publish_hold_position()
             return
 
-        if self.is_obstacle_blocking():
-            rotate_theta = (self.current_theta
-                            + np.sign(angle_error) * self.return_turn_step_rad)
-            self.publish_pose_target(self.current_x, self.current_y, rotate_theta)
-            return
-
+        # Skip obstacle check during return — the arm holding the object
+        # appears as an obstacle in the depth image and would block movement.
         self.publish_pose_target(self.home_x, self.home_y, self.home_theta)
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = NavigateGraspReturnNode()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         node.get_logger().info('Interrupted by user')
     finally:
