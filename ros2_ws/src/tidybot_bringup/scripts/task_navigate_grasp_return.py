@@ -82,6 +82,10 @@ class NavigateGraspReturnNode(NavigationTaskNode):
     RETURN_ANGLE_TOLERANCE = 0.20
     RETURN_TURN_STEP_RAD = 0.10
 
+    # Override stop distance so banana lands in arm's reachable zone (~0.30-0.40m in base_link Y)
+    SEEK_TARGET_STOP_DISTANCE_M = 0.35
+    APPROACH_STOP_DISTANCE_BUFFER_M = 0.05
+
     # Grasp parameters
     GRASP_ARM = 'right'
     GRASP_MOVE_DURATION_SIM = 2.0
@@ -90,7 +94,7 @@ class NavigateGraspReturnNode(NavigationTaskNode):
     LIFT_HEIGHT = 0.15
     Z_OFFSET = -0.02
     Z_BIAS = 0.0
-    BBOX_PAD = 1.3
+    BBOX_PAD = 1.0
 
     def __init__(self):
         super().__init__()
@@ -294,6 +298,18 @@ class NavigateGraspReturnNode(NavigationTaskNode):
             self.get_logger().info(
                 f'Returning to home pose ({self.home_x:.2f}, {self.home_y:.2f}).')
 
+    GRASP_CAMERA_TILT_RAD = 0.35  # moderate downward tilt for grasp view
+
+    def _set_camera_tilt(self, tilt_rad):
+        """Set camera tilt to a specific angle and wait for it to settle."""
+        self.camera_tilt_cmd = tilt_rad
+        msg = Float64MultiArray()
+        msg.data = [self.camera_pan_cmd, self.camera_tilt_cmd]
+        self.pan_tilt_pub.publish(msg)
+        self.get_logger().info(
+            f'  Camera tilt set to {np.rad2deg(tilt_rad):.0f} deg for grasping')
+        self._spin_for(1.5)  # wait for camera to settle + new frames
+
     def _execute_grasp(self):
         """Run detection -> depth -> plan -> pick -> lift. Returns True on success."""
 
@@ -302,6 +318,11 @@ class NavigateGraspReturnNode(NavigationTaskNode):
         if not self.plan_client.wait_for_service(timeout_sec=10.0):
             self.get_logger().error('/plan_to_target service not available!')
             return False
+
+        # Reset camera to a known good tilt angle for grasping.
+        # During approach, auto-tilt may have tilted too far down,
+        # causing the YOLO bbox to cover too much table/floor.
+        self._set_camera_tilt(self.GRASP_CAMERA_TILT_RAD)
 
         # Spin briefly to get fresh sensor data
         self._spin_for(1.0)
@@ -589,6 +610,15 @@ class NavigateGraspReturnNode(NavigationTaskNode):
                 f'z={grasp_z:.3f}m, width={grip_width*1000:.0f}mm')
         return grasp_pose, pre_grasp_pose, info
 
+    def _wait_for_future(self, future, timeout_sec=10.0):
+        """Poll spin_once until future completes (safe inside timer callbacks)."""
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if future.done():
+                return True
+        return False
+
     def _try_ik(self, pose, use_orientation=True):
         """Dry-run IK check. Returns (success, message)."""
         req = PlanToTarget.Request()
@@ -600,9 +630,10 @@ class NavigateGraspReturnNode(NavigationTaskNode):
         req.max_condition_number = 200.0
 
         future = self.plan_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
-        if not future.done() or future.exception():
+        if not self._wait_for_future(future, timeout_sec=10.0):
             return False, 'service call timed out'
+        if future.exception():
+            return False, f'service exception: {future.exception()}'
         result = future.result()
         return result.success, result.message
 
@@ -618,9 +649,11 @@ class NavigateGraspReturnNode(NavigationTaskNode):
 
         self.get_logger().info(f'  [{label}] Planning + executing...')
         future = self.plan_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=15.0)
-        if not future.done() or future.exception():
+        if not self._wait_for_future(future, timeout_sec=15.0):
             self.get_logger().error(f'  [{label}] service timed out')
+            return False
+        if future.exception():
+            self.get_logger().error(f'  [{label}] exception: {future.exception()}')
             return False
 
         result = future.result()
