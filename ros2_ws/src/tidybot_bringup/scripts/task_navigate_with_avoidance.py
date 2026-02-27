@@ -66,7 +66,7 @@ class NavigationTaskNode(Node):
     DEFAULT_NAVIGATION_MODE = 'seek_target'
     REACTIVE_FORWARD_STEP_M = 0.35
     REACTIVE_TURN_STEP_RAD = 0.30
-    SEEK_TARGET_STOP_DISTANCE_M = 0.35
+    SEEK_TARGET_STOP_DISTANCE_M = 0.2
     SEEK_HEADING_GAIN = 0.45
     SEEK_FORWARD_STEP_M = 0.25
     APPROACH_MAX_BEARING_RAD = 0.30
@@ -113,6 +113,7 @@ class NavigationTaskNode(Node):
     SIMPLE_TILT_DEADBAND_FRAC = 0.01
     SIMPLE_TILT_UP_SCALE = 0.60
     APPROACH_STOP_DISTANCE_BUFFER_M = 0.08
+    SIMPLE_REACH_BBOX_AREA_FRAC = 0.060
     AUTO_TILT_ENABLE = True
     AUTO_TILT_TARGET_Y_FRAC = 0.76
     AUTO_TILT_DEADBAND_FRAC = 0.03
@@ -363,6 +364,12 @@ class NavigationTaskNode(Node):
             self.declare_parameter(
                 'approach_stop_distance_buffer_m',
                 self.APPROACH_STOP_DISTANCE_BUFFER_M
+            ).value
+        )
+        self.simple_reach_bbox_area_frac = float(
+            self.declare_parameter(
+                'simple_reach_bbox_area_frac',
+                self.SIMPLE_REACH_BBOX_AREA_FRAC
             ).value
         )
         self.simple_tilt_down_step_rad = float(
@@ -1293,16 +1300,26 @@ class NavigationTaskNode(Node):
         # Stop when centered and close by depth (or obstacle-range fallback).
         stop_distance = self.seek_target_stop_distance_m + self.approach_stop_distance_buffer_m
         distance_for_stop = distance_m if distance_m is not None else self.last_target_distance_m
+        close_by_depth = (
+            distance_for_stop is not None
+            and distance_for_stop <= stop_distance
+        )
+        close_by_bbox = False
+        if target_visible_now and self.latest_color_shape is not None and distance_for_stop is None:
+            _, _, bw, bh = self.red_bbox_color
+            image_h, image_w = self.latest_color_shape
+            bbox_area_frac = (bw * bh) / float(max(1, image_h * image_w))
+            close_by_bbox = bbox_area_frac >= self.simple_reach_bbox_area_frac
+
+        # Allow a bit more x-error only when close by depth; keep strict for bbox-only fallback.
+        if close_by_depth:
+            stop_center_tolerance = self.approach_center_tolerance * 1.4
+        else:
+            stop_center_tolerance = self.approach_center_tolerance
         reached_visible = (
             target_visible_now
-            and abs(x_error) <= self.approach_center_tolerance
-            and (
-                (distance_for_stop is not None and distance_for_stop <= stop_distance)
-                or (
-                    self.obstacle_distance_m is not None
-                    and self.obstacle_distance_m <= stop_distance
-                )
-            )
+            and abs(x_error) <= stop_center_tolerance
+            and (close_by_depth or close_by_bbox)
         )
         if reached_visible:
             self.approach_reached_visible_streak += 1

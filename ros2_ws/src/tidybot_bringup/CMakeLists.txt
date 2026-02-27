@@ -48,6 +48,7 @@ install(PROGRAMS
   scripts/objective1_task.py
   scripts/task_navigate_with_avoidance.py
   scripts/task_navigate_and_return.py
+  scripts/task_navigate_grasp_return.py
   scripts/explore_and_find_object.py
   DESTINATION lib/${PROJECT_NAME}
 )
