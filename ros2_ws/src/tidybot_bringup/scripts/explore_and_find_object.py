@@ -80,7 +80,7 @@ COLOR_RANGES = {
     'red':    [((0,   80,  50),  (10,  255, 255)),
                ((165, 80,  50),  (180, 255, 255))],
     'blue':   [((95,  50,  40),  (135, 255, 255))],
-    'yellow': [((15,  60,  60),  (45,  255, 255))],
+    'yellow': [((20,  60,  60),  (45,  255, 255))],
     'green':  [((35,  40,  40),  (90,  255, 255))],
     'orange': [((8,   100, 80),  (20,  255, 255))],
 }
@@ -143,7 +143,7 @@ class ExploreAndFind(Node):
 
     # ── Object detection ──────────────────────────────────────────────────────
     MIN_DETECTION_AREA = 50    # px² — minimum color blob area
-    APPROACH_DIST      = 0.50  # m — declare arrived when this close
+    APPROACH_DIST      = 0.30  # m — declare arrived when this close
     DETECTION_CONFIRM  = 2     # consecutive frames to confirm detection
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1244,6 +1244,54 @@ class ExploreAndFind(Node):
             return
         bx, by, btheta = pose
         actual_heading = btheta - np.pi / 2
+
+        # ── Refine object position while approaching ──────────────
+        # Re-detect the object to update position estimate as we get closer
+        # (depth accuracy improves at shorter range).
+        if self.latest_rgb is not None and self.camera_K is not None:
+            hsv = cv2.cvtColor(self.latest_rgb, cv2.COLOR_BGR2HSV)
+            mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+            for lower, upper in COLOR_RANGES.get(self.target_color, []):
+                mask |= cv2.inRange(hsv, np.array(lower), np.array(upper))
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                largest = max(contours, key=cv2.contourArea)
+                area = cv2.contourArea(largest)
+                if area >= self.MIN_DETECTION_AREA:
+                    M = cv2.moments(largest)
+                    if M['m00'] > 0:
+                        cu = int(M['m10'] / M['m00'])
+                        cv_pt = int(M['m01'] / M['m00'])
+                        new_pos = self._estimate_object_position(cu, cv_pt)
+                        if new_pos is not None:
+                            old_ox, old_oy = self.object_world_pos
+                            shift = np.hypot(
+                                new_pos[0] - old_ox, new_pos[1] - old_oy)
+                            # Only update if shift is reasonable (< 1.5m)
+                            # to avoid jumping to a different object
+                            if shift < 1.5:
+                                self.object_world_pos = new_pos
+                                if shift > 0.15:
+                                    self.get_logger().info(
+                                        f'[APPROACH] Refined position: '
+                                        f'({new_pos[0]:.2f}, {new_pos[1]:.2f}) '
+                                        f'shift={shift:.2f}m')
+                                    # Re-plan path to updated position
+                                    goal_gx, goal_gy = self.world_to_grid(
+                                        new_pos[0], new_pos[1])
+                                    robot_gx, robot_gy = self.world_to_grid(
+                                        bx, by)
+                                    for cl in [None, self.ROBOT_CLEARANCE * 0.5]:
+                                        path = self._plan_path(
+                                            robot_gx, robot_gy,
+                                            goal_gx, goal_gy,
+                                            clearance_m=cl)
+                                        if path is not None:
+                                            self.nav_waypoints = path
+                                            self.nav_waypoint_idx = 0
+                                            self.nav_clearance = cl
+                                            break
 
         # Check distance to object
         ox, oy = self.object_world_pos
