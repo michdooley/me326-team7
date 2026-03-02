@@ -24,6 +24,7 @@ install(PROGRAMS
   scripts/test_base_sim.py
   scripts/test_camera_sim.py
   scripts/test_arms_sim.py
+  scripts/test_grippers_sim.py
   scripts/test_planner_sim.py
   scripts/test_real_hardware.py
   scripts/test_base_real.py
@@ -37,17 +38,20 @@ install(PROGRAMS
   scripts/diagnose_dynamixel.py
   scripts/example_state_machine.py
   scripts/trajectory_tracking.py
-  scripts/task1_retrieve.py
-  scripts/voice_command.py
-  scripts/navigate_to_object.py
-  scripts/rgbd_grasp_demo.py
-  scripts/rgbd_grasp_demo_real.py
+  scripts/task_navigate_to_position.py
+  scripts/test_simple_arm.py
+  scripts/test_motion_planner.py
+  scripts/pick_up_block.py
+  scripts/pick_up_block_real.py
+  scripts/frontier_exploration.py
+  scripts/explore_and_find_object.py
+  scripts/objective1_task.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
-# utility modules
-install(DIRECTORY utilities/
-  DESTINATION lib/${PROJECT_NAME}/utilities
+# Install subtask modules (importable by objective1_task.py)
+install(DIRECTORY scripts/subtasks
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 ament_package()

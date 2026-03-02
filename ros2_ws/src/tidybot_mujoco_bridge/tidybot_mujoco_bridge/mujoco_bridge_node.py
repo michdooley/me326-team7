@@ -116,6 +116,7 @@ class MuJoCoBridgeNode(Node):
             self.model = mujoco.MjModel.from_xml_path(model_path)
             self.data = mujoco.MjData(self.model)
 
+<<<<<<< HEAD
             # Load home keyframe if available for stable initial state
             try:
                 home_key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, 'home')
@@ -135,6 +136,23 @@ class MuJoCoBridgeNode(Node):
                         )
             except Exception:
                 self.get_logger().warn('No home keyframe found, using default state')
+=======
+            # Load keyframe for stable initial state
+            # Prefer scene_home (includes freejoint positions), fall back to home
+            keyframe_loaded = False
+            for key_name in ['scene_home', 'home']:
+                try:
+                    key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, key_name)
+                    if key_id >= 0:
+                        mujoco.mj_resetDataKeyframe(self.model, self.data, key_id)
+                        self.get_logger().info(f'Loaded keyframe "{key_name}" for stable initial state')
+                        keyframe_loaded = True
+                        break
+                except Exception:
+                    continue
+            if not keyframe_loaded:
+                self.get_logger().warn('No keyframe found, using default state')
+>>>>>>> origin/alexander
 
         except Exception as e:
             self.get_logger().error(f'Failed to load MuJoCo model: {e}')
@@ -227,6 +245,7 @@ class MuJoCoBridgeNode(Node):
         self.rgb_pub = self.create_publisher(Image, '/camera/color/image_raw', qos)
         self.depth_pub = self.create_publisher(Image, '/camera/depth/image_raw', qos)
         self.camera_info_pub = self.create_publisher(CameraInfo, '/camera/color/camera_info', qos)
+        self.depth_info_pub  = self.create_publisher(CameraInfo, '/camera/depth/camera_info', qos)
         self.goal_reached_pub = self.create_publisher(Bool, '/base/goal_reached', 10)
 
         # TF broadcaster
@@ -623,8 +642,6 @@ class MuJoCoBridgeNode(Node):
         if not HAS_CV_BRIDGE:
             return
 
-        now = self.get_clock().now().to_msg()
-
         with self.lock:
             # Render RGB image
             self.renderer.update_scene(self.data, camera='d435_rgb')
@@ -640,6 +657,45 @@ class MuJoCoBridgeNode(Node):
             self.renderer.disable_depth_rendering()
             # Flip vertically and horizontally to match ROS camera convention
             depth_image = np.fliplr(np.flipud(depth_image)).copy()
+
+            # Capture timestamp and robot state AFTER rendering while the lock
+            # is still held.  This ensures 'now' matches the exact sim state
+            # that was just rendered — eliminating the timestamp mismatch that
+            # occurred when 'now' was sampled before acquiring the lock.
+            now = self.get_clock().now().to_msg()
+
+            cam_base_x  = 0.0
+            cam_base_y  = 0.0
+            cam_base_th = 0.0
+            if 'joint_x' in self.joint_ids:
+                cam_base_x = float(
+                    self.data.qpos[self.model.jnt_qposadr[self.joint_ids['joint_x']]])
+            if 'joint_y' in self.joint_ids:
+                cam_base_y = float(
+                    self.data.qpos[self.model.jnt_qposadr[self.joint_ids['joint_y']]])
+            if 'joint_th' in self.joint_ids:
+                cam_base_th = float(
+                    self.data.qpos[self.model.jnt_qposadr[self.joint_ids['joint_th']]])
+
+        # Broadcast odom→base_link TF with the SAME timestamp as the depth
+        # image, using the robot state read from the exact sim snapshot that
+        # was rendered.  This TF is sent BEFORE the depth message so that it
+        # is already in the TF buffer when the subscriber processes the depth
+        # frame and calls lookup_transform(msg.header.stamp).
+        cy = np.cos(cam_base_th * 0.5)
+        sy = np.sin(cam_base_th * 0.5)
+        cam_tf = TransformStamped()
+        cam_tf.header.stamp        = now
+        cam_tf.header.frame_id     = 'odom'
+        cam_tf.child_frame_id      = 'base_link'
+        cam_tf.transform.translation.x = cam_base_x
+        cam_tf.transform.translation.y = cam_base_y
+        cam_tf.transform.translation.z = 0.0
+        cam_tf.transform.rotation.x    = 0.0
+        cam_tf.transform.rotation.y    = 0.0
+        cam_tf.transform.rotation.z    = sy
+        cam_tf.transform.rotation.w    = cy
+        self.tf_broadcaster.sendTransform(cam_tf)
 
         # Publish RGB image
         try:
@@ -675,6 +731,21 @@ class MuJoCoBridgeNode(Node):
         camera_info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
         camera_info.p = [fx, 0.0, 320.0, 0.0, 0.0, fy, 240.0, 0.0, 0.0, 0.0, 1.0, 0.0]
         self.camera_info_pub.publish(camera_info)
+
+        # Depth camera uses a wider FOV (57° vs 42° for RGB) — publish its own
+        # camera_info so depth projection uses the correct intrinsics.
+        fy_d = 480 / (2 * np.tan(np.radians(57) / 2))
+        fx_d = fy_d  # Square pixels
+        depth_info = CameraInfo()
+        depth_info.header.stamp    = now
+        depth_info.header.frame_id = 'camera_depth_optical_frame'
+        depth_info.width  = 640
+        depth_info.height = 480
+        depth_info.k = [fx_d, 0.0, 320.0, 0.0, fy_d, 240.0, 0.0, 0.0, 1.0]
+        depth_info.d = [0.0, 0.0, 0.0, 0.0, 0.0]
+        depth_info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        depth_info.p = [fx_d, 0.0, 320.0, 0.0, 0.0, fy_d, 240.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+        self.depth_info_pub.publish(depth_info)
 
     def destroy_node(self):
         """Clean up resources."""
