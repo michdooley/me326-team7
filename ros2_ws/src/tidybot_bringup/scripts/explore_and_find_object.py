@@ -122,7 +122,7 @@ class ExploreAndFind(Node):
     MAP_PUBLISH_RATE = 1.0   # Hz
 
     # ── 360 scan ─────────────────────────────────────────────────────────────
-    SCAN_ANGULAR_VEL = 0.4   # rad/s
+    SCAN_ANGULAR_VEL = 0.2   # rad/s
     SCAN_SETTLE_TIME = 0.5   # s
 
     # ── Frontier selection ────────────────────────────────────────────────────
@@ -631,7 +631,8 @@ class ExploreAndFind(Node):
         right_region  = depth[v_start:v_end, u_start + 2 * third:u_end]
 
         def sector_min_dist(region):
-            valid = region[region > 0].astype(np.float64)
+            min_mm = self.MIN_DEPTH_M * 1000.0
+            valid = region[(region > min_mm)].astype(np.float64)
             if len(valid) == 0:
                 return 999.0
             return float(np.percentile(valid, 10)) / 1000.0
