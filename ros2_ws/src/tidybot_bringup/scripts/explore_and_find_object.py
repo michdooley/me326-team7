@@ -50,7 +50,7 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Point, Twist
 from nav_msgs.msg import MapMetaData, OccupancyGrid
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import ColorRGBA
@@ -218,6 +218,10 @@ class ExploreAndFind(Node):
             MarkerArray, '/object_marker', 10)
         self.cmd_vel_pub       = self.create_publisher(
             Twist, '/cmd_vel', 10)
+        self.inflated_map_pub  = self.create_publisher(
+            OccupancyGrid, '/inflated_map', 10)
+        self.nav_path_pub      = self.create_publisher(
+            MarkerArray, '/nav_path', 10)
 
         self.get_logger().info('=' * 55)
         self.get_logger().info(
@@ -606,6 +610,7 @@ class ExploreAndFind(Node):
 
         self.nav_waypoints = path
         self.nav_waypoint_idx = 0
+        self.publish_nav_path()
         self.get_logger().info(
             f'[NAV] Re-planned: {len(path)} waypoints from '
             f'({bx:.2f},{by:.2f})')
@@ -620,7 +625,7 @@ class ExploreAndFind(Node):
 
         h, w = depth.shape
         v_start = int(h * 0.3)
-        v_end   = int(h * 0.8)
+        v_end   = int(h * 0.55)  # stop at 55% to avoid floor returns
         margin = int(w * self.DEPTH_H_CROP)
         u_start = margin
         u_end   = w - margin
@@ -834,6 +839,7 @@ class ExploreAndFind(Node):
                 self.nav_waypoint_idx = 0
                 self.nav_start_time   = time.time()
                 self.nav_clearance    = clearance
+                self.publish_nav_path()
                 self.state = ExploreState.APPROACHING
                 self.get_logger().info(
                     f'[APPROACH] Path to {self.target_color} cube at '
@@ -1047,6 +1053,8 @@ class ExploreAndFind(Node):
         msg.info.origin.orientation.w = 1.0
         msg.data = grid.ravel().tolist()
         self.map_pub.publish(msg)
+        self.publish_inflated_map()
+        self.publish_nav_path()
 
     def publish_frontiers(self, frontiers):
         ma = MarkerArray()
@@ -1068,6 +1076,60 @@ class ExploreAndFind(Node):
             m.lifetime.sec = 5
             ma.markers.append(m)
         self.frontier_pub.publish(ma)
+
+    def publish_inflated_map(self):
+        """Publish the A*-inflated obstacle layer as a second OccupancyGrid."""
+        inflated = self._compute_inflated()
+        confirmed_occ = ((self.log_odds >= self.LOG_ODDS_OCC_THRESH) &
+                         (self.hit_count >= self.MIN_HIT_COUNT))
+        grid = np.zeros((self.GRID_SIZE, self.GRID_SIZE), dtype=np.int8)
+        grid[inflated] = 50          # inflated zone — grey
+        grid[confirmed_occ] = 100    # real obstacle — black
+        grid[(self.hit_count == 0) & (self.log_odds == 0.0)] = -1  # unknown
+
+        msg = OccupancyGrid()
+        msg.header.stamp              = self.get_clock().now().to_msg()
+        msg.header.frame_id           = 'odom'
+        msg.info                      = MapMetaData()
+        msg.info.resolution           = self.GRID_RESOLUTION
+        msg.info.width                = self.GRID_SIZE
+        msg.info.height               = self.GRID_SIZE
+        msg.info.origin.position.x    = float(self.GRID_ORIGIN_X)
+        msg.info.origin.position.y    = float(self.GRID_ORIGIN_Y)
+        msg.info.origin.position.z    = 0.0
+        msg.info.origin.orientation.w = 1.0
+        msg.data = grid.ravel().tolist()
+        self.inflated_map_pub.publish(msg)
+
+    def publish_nav_path(self):
+        """Publish the current planned waypoints as a LINE_STRIP marker."""
+        ma = MarkerArray()
+        # Clear old path
+        del_m = Marker()
+        del_m.header.stamp    = self.get_clock().now().to_msg()
+        del_m.header.frame_id = 'odom'
+        del_m.ns              = 'nav_path'
+        del_m.action          = Marker.DELETEALL
+        ma.markers.append(del_m)
+
+        if self.nav_waypoints:
+            m = Marker()
+            m.header.stamp    = self.get_clock().now().to_msg()
+            m.header.frame_id = 'odom'
+            m.ns              = 'nav_path'
+            m.id              = 0
+            m.type            = Marker.LINE_STRIP
+            m.action          = Marker.ADD
+            m.scale.x         = 0.06
+            m.color           = ColorRGBA(r=0.0, g=0.6, b=1.0, a=1.0)
+            m.pose.orientation.w = 1.0
+            for gx, gy in self.nav_waypoints:
+                wx, wy = self.grid_to_world(gx, gy)
+                p = Point(); p.x = wx; p.y = wy; p.z = 0.05
+                m.points.append(p)
+            ma.markers.append(m)
+
+        self.nav_path_pub.publish(ma)
 
     # ── State machine ─────────────────────────────────────────────────────────
 
@@ -1184,6 +1246,7 @@ class ExploreAndFind(Node):
                 self.nav_waypoint_idx = 0
                 self.nav_start_time   = time.time()
                 self.nav_clearance    = clearance
+                self.publish_nav_path()
                 self.state = ExploreState.NAVIGATING
                 return
 
@@ -1377,6 +1440,7 @@ class ExploreAndFind(Node):
                                             self.nav_waypoints = path
                                             self.nav_waypoint_idx = 0
                                             self.nav_clearance = cl
+                                            self.publish_nav_path()
                                             break
 
         # Check distance to object
@@ -1418,6 +1482,7 @@ class ExploreAndFind(Node):
                     self.nav_waypoint_idx = 0
                     self.nav_start_time = time.time()
                     self.nav_clearance = clearance
+                    self.publish_nav_path()
                     return
             # Give up
             self._stop_base()
