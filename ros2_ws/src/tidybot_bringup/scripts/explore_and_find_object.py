@@ -137,6 +137,7 @@ class ExploreAndFind(Node):
     WAYPOINT_TOLERANCE = 0.3    # m
     NAV_LINEAR_SPEED   = 0.30   # m/s
     OBSTACLE_THRESHOLD = 0.8    # m
+    DEPTH_STEER_TIMEOUT = 3.0  # s — force re-plan after steering this long
 
     # ── Depth integration angular gating ──────────────────────────────────────
     MAX_MAPPING_ANGULAR_VEL = 0.5  # rad/s
@@ -144,7 +145,8 @@ class ExploreAndFind(Node):
     # ── Object detection ──────────────────────────────────────────────────────
     MIN_DETECTION_AREA = 50    # px² — minimum color blob area
     APPROACH_DIST      = 0.30  # m — declare arrived when this close
-    DETECTION_CONFIRM  = 2     # consecutive frames to confirm detection
+    DETECT_WINDOW      = 2.0   # s — time window for detection confirmation
+    DETECT_COUNT_REQ   = 2     # frames within window to confirm
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -190,8 +192,9 @@ class ExploreAndFind(Node):
                 f'Unknown target_color "{self.target_color}". Using "red".')
             self.target_color = 'red'
         self.object_world_pos   = None   # (wx, wy) once confirmed
-        self.detection_count    = 0      # consecutive detection frames
+        self.detection_times    = []     # timestamps of recent detections
         self.last_detection_pos = None   # (wx, wy) of most recent detection
+        self.depth_steer_start  = None   # when depth-steering began (stuck detection)
 
         # TF
         self.tf_buffer   = tf2_ros.Buffer()
@@ -641,7 +644,7 @@ class ExploreAndFind(Node):
 
         Runs HSV color filtering, finds the largest matching blob, and
         estimates its world position via depth back-projection.  Requires
-        DETECTION_CONFIRM consecutive detections to set object_world_pos.
+        DETECT_COUNT_REQ detections within DETECT_WINDOW seconds to confirm.
 
         Returns True when the object is confirmed.
         """
@@ -658,14 +661,12 @@ class ExploreAndFind(Node):
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            self.detection_count = 0
             return False
 
         # Take the largest blob
         largest = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(largest)
         if area < self.MIN_DETECTION_AREA:
-            self.detection_count = 0
             return False
 
         # Centroid of the blob
@@ -678,25 +679,30 @@ class ExploreAndFind(Node):
         # Estimate world position using depth
         pos = self._estimate_object_position(cu, cv_pt)
         if pos is None:
-            self.detection_count = 0
             return False
 
-        # Check consistency with previous detection
+        # Check consistency — if position jumped far, reset window
         if self.last_detection_pos is not None:
             d = np.hypot(pos[0] - self.last_detection_pos[0],
                          pos[1] - self.last_detection_pos[1])
             if d > 1.0:
-                self.detection_count = 0
+                self.detection_times = []
 
-        self.detection_count += 1
+        now = time.time()
+        self.detection_times.append(now)
         self.last_detection_pos = pos
+
+        # Prune old detections outside the window
+        cutoff = now - self.DETECT_WINDOW
+        self.detection_times = [t for t in self.detection_times if t >= cutoff]
 
         self.get_logger().info(
             f'[DETECT] {self.target_color} candidate at '
             f'({pos[0]:.2f}, {pos[1]:.2f}) area={area:.0f} '
-            f'count={self.detection_count}/{self.DETECTION_CONFIRM}')
+            f'count={len(self.detection_times)}/{self.DETECT_COUNT_REQ} '
+            f'in {self.DETECT_WINDOW}s window')
 
-        if self.detection_count >= self.DETECTION_CONFIRM:
+        if len(self.detection_times) >= self.DETECT_COUNT_REQ:
             self.object_world_pos = pos
             self.get_logger().info(
                 f'[DETECT] *** {self.target_color} cube CONFIRMED at '
@@ -1089,10 +1095,22 @@ class ExploreAndFind(Node):
             self.cmd_vel_pub.publish(cmd)
 
     def _state_selecting(self):
-        # ── If object already detected, try to approach it first ──────
+        # ── If object confirmed, try to approach it first ─────────────
         if self.object_world_pos is not None:
             if self._plan_approach():
                 return
+
+        # ── If object was glimpsed (unconfirmed), try approaching that ─
+        if self.object_world_pos is None and self.last_detection_pos is not None:
+            self.get_logger().info(
+                f'[SELECT] Trying unconfirmed sighting at '
+                f'({self.last_detection_pos[0]:.2f}, '
+                f'{self.last_detection_pos[1]:.2f})')
+            self.object_world_pos = self.last_detection_pos
+            if self._plan_approach():
+                return
+            # Couldn't path there — clear and fall through to frontiers
+            self.object_world_pos = None
 
         frontiers = self.find_frontiers()
         self.publish_frontiers(frontiers)
@@ -1231,6 +1249,18 @@ class ExploreAndFind(Node):
         min_dist = min(left_dist, center_dist, right_dist)
 
         if not center_clear:
+            if self.depth_steer_start is None:
+                self.depth_steer_start = now
+            elif now - self.depth_steer_start > self.DEPTH_STEER_TIMEOUT:
+                self.get_logger().info(
+                    '[NAV] Stuck on depth obstacle — forcing re-plan.')
+                self.depth_steer_start = None
+                self._stop_base()
+                if self._replan_from_here():
+                    return
+                self.get_logger().warn('[NAV] Re-plan failed — re-selecting.')
+                self.state = ExploreState.SELECTING
+                return
             self.get_logger().info(
                 f'[NAV] Depth obstacle: L={left_dist:.2f} C={center_dist:.2f} '
                 f'R={right_dist:.2f} — steering')
@@ -1242,6 +1272,7 @@ class ExploreAndFind(Node):
                 cmd.angular.z = 0.8
             cmd.linear.x = 0.0
         else:
+            self.depth_steer_start = None
             alignment = max(0.0, np.cos(heading_error))
             speed = self.NAV_LINEAR_SPEED * alignment
             if min_dist < 1.5:
@@ -1407,6 +1438,32 @@ class ExploreAndFind(Node):
         min_dist = min(left_dist, center_dist, right_dist)
 
         if not center_clear:
+            if self.depth_steer_start is None:
+                self.depth_steer_start = now
+            elif now - self.depth_steer_start > self.DEPTH_STEER_TIMEOUT:
+                self.get_logger().info(
+                    '[APPROACH] Stuck on depth obstacle — forcing re-plan.')
+                self.depth_steer_start = None
+                self._stop_base()
+                goal_gx, goal_gy = self.world_to_grid(ox, oy)
+                robot_gx, robot_gy = self.world_to_grid(bx, by)
+                replanned = False
+                for cl in [None, self.ROBOT_CLEARANCE * 0.5]:
+                    path = self._plan_path(
+                        robot_gx, robot_gy, goal_gx, goal_gy,
+                        clearance_m=cl)
+                    if path is not None:
+                        self.nav_waypoints = path
+                        self.nav_waypoint_idx = 0
+                        self.nav_start_time = time.time()
+                        self.nav_clearance = cl
+                        replanned = True
+                        break
+                if not replanned:
+                    self.get_logger().warn(
+                        '[APPROACH] Re-plan failed — re-selecting.')
+                    self.state = ExploreState.SELECTING
+                return
             if left_dist > right_dist:
                 cmd.angular.z = 0.8
             elif right_dist > left_dist:
@@ -1415,6 +1472,7 @@ class ExploreAndFind(Node):
                 cmd.angular.z = 0.8
             cmd.linear.x = 0.0
         else:
+            self.depth_steer_start = None
             alignment = max(0.0, np.cos(heading_error))
             speed = self.NAV_LINEAR_SPEED * alignment
             if min_dist < 1.5:
