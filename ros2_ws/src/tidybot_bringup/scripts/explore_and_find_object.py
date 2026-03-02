@@ -1343,10 +1343,21 @@ class ExploreAndFind(Node):
                             old_ox, old_oy = self.object_world_pos
                             shift = np.hypot(
                                 new_pos[0] - old_ox, new_pos[1] - old_oy)
-                            # Only update if shift is reasonable (< 1.5m)
-                            # to avoid jumping to a different object
-                            if shift < 1.5:
-                                self.object_world_pos = new_pos
+                            # Only update if shift is small; depth back-
+                            # projection is noisy at range so cap at 0.5m.
+                            # Apply EMA smoothing to prevent single noisy
+                            # readings from jumping the estimate.
+                            if shift < 0.5:
+                                alpha = 0.4  # blend weight for new reading
+                                smoothed = (
+                                    alpha * new_pos[0] + (1 - alpha) * old_ox,
+                                    alpha * new_pos[1] + (1 - alpha) * old_oy,
+                                )
+                                self.object_world_pos = smoothed
+                                new_pos = smoothed
+                                shift = np.hypot(
+                                    smoothed[0] - old_ox,
+                                    smoothed[1] - old_oy)
                                 if shift > 0.15:
                                     self.get_logger().info(
                                         f'[APPROACH] Refined position: '
@@ -1455,48 +1466,16 @@ class ExploreAndFind(Node):
         left_dist, center_dist, right_dist = distances
         min_dist = min(left_dist, center_dist, right_dist)
 
-        if not center_clear:
-            if self.depth_steer_start is None:
-                self.depth_steer_start = now
-            elif now - self.depth_steer_start > self.DEPTH_STEER_TIMEOUT:
-                self.get_logger().info(
-                    '[APPROACH] Stuck on depth obstacle — forcing re-plan.')
-                self.depth_steer_start = None
-                self._stop_base()
-                goal_gx, goal_gy = self.world_to_grid(ox, oy)
-                robot_gx, robot_gy = self.world_to_grid(bx, by)
-                replanned = False
-                for cl in [None, self.ROBOT_CLEARANCE * 0.5]:
-                    path = self._plan_path(
-                        robot_gx, robot_gy, goal_gx, goal_gy,
-                        clearance_m=cl)
-                    if path is not None:
-                        self.nav_waypoints = path
-                        self.nav_waypoint_idx = 0
-                        self.nav_start_time = time.time()
-                        self.nav_clearance = cl
-                        replanned = True
-                        break
-                if not replanned:
-                    self.get_logger().warn(
-                        '[APPROACH] Re-plan failed — re-selecting.')
-                    self.state = ExploreState.SELECTING
-                return
-            if left_dist > right_dist:
-                cmd.angular.z = 1.0
-            elif right_dist > left_dist:
-                cmd.angular.z = -1.0
-            else:
-                cmd.angular.z = 1.0
-            cmd.linear.x = 0.0
-        else:
-            self.depth_steer_start = None
-            alignment = max(0.0, np.cos(heading_error))
-            speed = self.NAV_LINEAR_SPEED * alignment
-            if min_dist < 1.5:
-                speed *= min(min_dist / 1.5, 1.0)
-            cmd.linear.x = float(min(speed, dist * 0.5))
-            cmd.angular.z = float(np.clip(2.0 * heading_error, -1.2, 1.2))
+        # During approach, trust the A* path for obstacle avoidance.
+        # Depth steering is skipped here because the floor and the target
+        # object itself cause persistent false "center blocked" readings.
+        # A hard safety stop is kept for truly close obstacles.
+        alignment = max(0.0, np.cos(heading_error))
+        speed = self.NAV_LINEAR_SPEED * alignment
+        if min_dist < 1.5:
+            speed *= min(min_dist / 1.5, 1.0)
+        cmd.linear.x = float(min(speed, dist * 0.5))
+        cmd.angular.z = float(np.clip(2.0 * heading_error, -1.2, 1.2))
 
         if min_dist < 0.35:
             cmd.linear.x = 0.0
