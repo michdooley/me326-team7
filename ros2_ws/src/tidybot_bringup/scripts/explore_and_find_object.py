@@ -48,7 +48,7 @@ from scipy.ndimage import binary_dilation, label as ndimage_label
 import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 from geometry_msgs.msg import Point, Twist
 from nav_msgs.msg import MapMetaData, OccupancyGrid
@@ -122,7 +122,7 @@ class ExploreAndFind(Node):
     MAP_PUBLISH_RATE = 1.0   # Hz
 
     # ── 360 scan ─────────────────────────────────────────────────────────────
-    SCAN_ANGULAR_VEL = 0.2   # rad/s
+    SCAN_ANGULAR_VEL = 0.3   # rad/s
     SCAN_SETTLE_TIME = 0.5   # s
 
     # ── Frontier selection ────────────────────────────────────────────────────
@@ -135,7 +135,7 @@ class ExploreAndFind(Node):
     NO_FRONTIER_LIMIT  = 3
     WAYPOINT_SPACING   = 20
     WAYPOINT_TOLERANCE = 0.3    # m
-    NAV_LINEAR_SPEED   = 0.35   # m/s
+    NAV_LINEAR_SPEED   = 0.2   # m/s
     OBSTACLE_THRESHOLD = 0.8    # m
     DEPTH_STEER_TIMEOUT = 3.0  # s — force re-plan after steering this long
 
@@ -181,6 +181,7 @@ class ExploreAndFind(Node):
         self.nav_waypoints     = []
         self.nav_waypoint_idx  = 0
         self.last_cmd_angular  = 0.0
+        self.last_approach_replan = 0.0
 
         # Object detection state
         self.declare_parameter('target_color', 'red')
@@ -218,10 +219,14 @@ class ExploreAndFind(Node):
             MarkerArray, '/object_marker', 10)
         self.cmd_vel_pub       = self.create_publisher(
             Twist, '/cmd_vel', 10)
+        latch_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.inflated_map_pub  = self.create_publisher(
-            OccupancyGrid, '/inflated_map', 10)
+            OccupancyGrid, '/inflated_map', latch_qos)
         self.nav_path_pub      = self.create_publisher(
-            MarkerArray, '/nav_path', 10)
+            MarkerArray, '/nav_path', latch_qos)
 
         self.get_logger().info('=' * 55)
         self.get_logger().info(
@@ -588,7 +593,10 @@ class ExploreAndFind(Node):
     def _is_path_blocked(self):
         nav_clear = getattr(self, 'nav_clearance', None)
         inflated = self._compute_inflated(nav_clear)
-        for i in range(self.nav_waypoint_idx, len(self.nav_waypoints)):
+        # Only look 3 waypoints ahead — distant map noise should not trigger
+        # a replan; the robot will reroute when it gets closer.
+        lookahead = min(self.nav_waypoint_idx + 3, len(self.nav_waypoints))
+        for i in range(self.nav_waypoint_idx, lookahead):
             gx, gy = self.nav_waypoints[i]
             if self.in_grid(gx, gy) and inflated[gy, gx]:
                 return True
@@ -1454,8 +1462,10 @@ class ExploreAndFind(Node):
             self.state = ExploreState.COMPLETE
             return
 
-        # Re-plan if path blocked
-        if self._is_path_blocked():
+        # Re-plan if path blocked — rate-limited to avoid thrashing
+        if (self._is_path_blocked() and
+                now - self.last_approach_replan > 2.0):
+            self.last_approach_replan = now
             self.get_logger().info('[APPROACH] Path blocked — re-planning...')
             if not self._replan_from_here():
                 self._stop_base()
