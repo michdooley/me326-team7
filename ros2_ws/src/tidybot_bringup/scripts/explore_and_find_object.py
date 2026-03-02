@@ -122,7 +122,7 @@ class ExploreAndFind(Node):
     MAP_PUBLISH_RATE = 1.0   # Hz
 
     # ── 360 scan ─────────────────────────────────────────────────────────────
-    SCAN_ANGULAR_VEL = 0.6   # rad/s
+    SCAN_ANGULAR_VEL = 0.4   # rad/s
     SCAN_SETTLE_TIME = 0.5   # s
 
     # ── Frontier selection ────────────────────────────────────────────────────
@@ -135,17 +135,17 @@ class ExploreAndFind(Node):
     NO_FRONTIER_LIMIT  = 3
     WAYPOINT_SPACING   = 20
     WAYPOINT_TOLERANCE = 0.3    # m
-    NAV_LINEAR_SPEED   = 0.45   # m/s
+    NAV_LINEAR_SPEED   = 0.35   # m/s
     OBSTACLE_THRESHOLD = 0.8    # m
     DEPTH_STEER_TIMEOUT = 3.0  # s — force re-plan after steering this long
 
     # ── Depth integration angular gating ──────────────────────────────────────
-    MAX_MAPPING_ANGULAR_VEL = 0.7  # rad/s
+    MAX_MAPPING_ANGULAR_VEL = 0.5  # rad/s
 
     # ── Object detection ──────────────────────────────────────────────────────
     MIN_DETECTION_AREA = 50    # px² — minimum color blob area
     APPROACH_DIST      = 0.30  # m — declare arrived when this close
-    DETECT_WINDOW      = 3.0   # s — time window for detection confirmation
+    DETECT_WINDOW      = 2.0   # s — time window for detection confirmation
     DETECT_COUNT_REQ   = 2     # frames within window to confirm
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1282,11 +1282,11 @@ class ExploreAndFind(Node):
                 f'[NAV] Depth obstacle: L={left_dist:.2f} C={center_dist:.2f} '
                 f'R={right_dist:.2f} — steering')
             if left_dist > right_dist:
-                cmd.angular.z = 1.2
+                cmd.angular.z = 1.0
             elif right_dist > left_dist:
-                cmd.angular.z = -1.2
+                cmd.angular.z = -1.0
             else:
-                cmd.angular.z = 1.2
+                cmd.angular.z = 1.0
             cmd.linear.x = 0.0
         else:
             self.depth_steer_start = None
@@ -1295,7 +1295,7 @@ class ExploreAndFind(Node):
             if min_dist < 1.5:
                 speed *= min(min_dist / 1.5, 1.0)
             cmd.linear.x = float(min(speed, dist * 0.5))
-            cmd.angular.z = float(np.clip(2.5 * heading_error, -1.5, 1.5))
+            cmd.angular.z = float(np.clip(2.0 * heading_error, -1.2, 1.2))
 
         if min_dist < 0.35:
             cmd.linear.x = 0.0
@@ -1482,11 +1482,11 @@ class ExploreAndFind(Node):
                     self.state = ExploreState.SELECTING
                 return
             if left_dist > right_dist:
-                cmd.angular.z = 1.2
+                cmd.angular.z = 1.0
             elif right_dist > left_dist:
-                cmd.angular.z = -1.2
+                cmd.angular.z = -1.0
             else:
-                cmd.angular.z = 1.2
+                cmd.angular.z = 1.0
             cmd.linear.x = 0.0
         else:
             self.depth_steer_start = None
@@ -1495,7 +1495,7 @@ class ExploreAndFind(Node):
             if min_dist < 1.5:
                 speed *= min(min_dist / 1.5, 1.0)
             cmd.linear.x = float(min(speed, dist * 0.5))
-            cmd.angular.z = float(np.clip(2.5 * heading_error, -1.5, 1.5))
+            cmd.angular.z = float(np.clip(2.0 * heading_error, -1.2, 1.2))
 
         if min_dist < 0.35:
             cmd.linear.x = 0.0
