@@ -967,11 +967,37 @@ class ExploreAndFind(Node):
             nearby_unknown = int(np.sum(patch & disc[ky_lo:ky_hi, kx_lo:kx_hi]))
 
             score = nearby_unknown / max(dist, 0.5)
+
+            # ── Bias toward last-seen object position ─────────────
+            # If the target was glimpsed (even unconfirmed), prefer
+            # frontiers that move toward it.
+            if self.last_detection_pos is not None:
+                obj_dx = self.last_detection_pos[0] - bx
+                obj_dy = self.last_detection_pos[1] - by
+                frt_dx = wx - bx
+                frt_dy = wy - by
+                obj_dist = np.hypot(obj_dx, obj_dy)
+                frt_dist = np.hypot(frt_dx, frt_dy)
+                if obj_dist > 0.1 and frt_dist > 0.1:
+                    # Cosine similarity: +1 when frontier is in same
+                    # direction as object, -1 when opposite
+                    cos_sim = ((obj_dx * frt_dx + obj_dy * frt_dy)
+                               / (obj_dist * frt_dist))
+                    # Boost: multiply score by 1.0–3.0 based on alignment
+                    # cos_sim in [-1,1] → boost in [0.5, 3.0]
+                    boost = 1.75 + 1.25 * cos_sim
+                    score *= boost
+
             results.append((wx, wy, len(cluster), score))
 
+        bias_str = ''
+        if self.last_detection_pos is not None:
+            bias_str = (f', biased toward ({self.last_detection_pos[0]:.1f},'
+                        f' {self.last_detection_pos[1]:.1f})')
         self.get_logger().info(
             f'[FRONTIER] {len(clusters)} clusters -> {len(results)} valid '
-            f'(filtered: dist={n_dist}, reach={n_reach}, clear={n_clear})')
+            f'(filtered: dist={n_dist}, reach={n_reach}, clear={n_clear})'
+            f'{bias_str}')
 
         results.sort(key=lambda r: r[3], reverse=True)
         return results
