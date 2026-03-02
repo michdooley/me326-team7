@@ -496,7 +496,24 @@ class ExploreAndFind(Node):
             traversable[start_gy, start_gx] = True
 
         if not traversable[goal_gy, goal_gx]:
-            return None
+            # Goal is in inflated zone — snap to nearest traversable cell
+            best_d2 = float('inf')
+            best_gx, best_gy = None, None
+            search_r = int(np.ceil(clearance_m / self.GRID_RESOLUTION)) + 5
+            for dy in range(-search_r, search_r + 1):
+                for dx in range(-search_r, search_r + 1):
+                    nx, ny = goal_gx + dx, goal_gy + dy
+                    if (0 <= nx < self.GRID_SIZE and
+                            0 <= ny < self.GRID_SIZE and
+                            traversable[ny, nx]):
+                        d2 = dx * dx + dy * dy
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best_gx, best_gy = nx, ny
+            if best_gx is None:
+                return None
+            goal_gx, goal_gy = best_gx, best_gy
+            goal = (goal_gx, goal_gy)
 
         SQRT2 = 1.414
         DIRS = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
