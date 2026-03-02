@@ -28,7 +28,7 @@ Publishes:
 Subscribes:
   /camera/depth/image_raw    — depth frames (16UC1, mm)
   /camera/depth/camera_info  — depth camera intrinsics
-  /camera/rgb/image_raw      — RGB frames for object detection
+  /camera/color/image_raw    — RGB frames for object detection
 
 Prerequisites:
     ros2 launch tidybot_bringup sim.launch.py scene:=scene_obstacles.xml
@@ -74,13 +74,15 @@ class ExploreState(Enum):
 
 
 # HSV color ranges for cube detection (OpenCV HSV: H=[0,180], S/V=[0,255])
+# Ranges are intentionally wide to handle MuJoCo lighting variation
+# (headlight diffuse + ambient + directional light).
 COLOR_RANGES = {
-    'red':    [((0,   120, 100), (8,   255, 255)),
-               ((172, 120, 100), (180, 255, 255))],
-    'blue':   [((100, 80,  60),  (130, 255, 255))],
-    'yellow': [((20,  100, 100), (38,  255, 255))],
-    'green':  [((40,  80,  50),  (85,  255, 255))],
-    'orange': [((10,  140, 140), (22,  255, 255))],
+    'red':    [((0,   80,  50),  (10,  255, 255)),
+               ((165, 80,  50),  (180, 255, 255))],
+    'blue':   [((95,  50,  40),  (135, 255, 255))],
+    'yellow': [((15,  60,  60),  (45,  255, 255))],
+    'green':  [((35,  40,  40),  (90,  255, 255))],
+    'orange': [((8,   100, 80),  (20,  255, 255))],
 }
 
 
@@ -142,7 +144,7 @@ class ExploreAndFind(Node):
     # ── Object detection ──────────────────────────────────────────────────────
     MIN_DETECTION_AREA = 50    # px² — minimum color blob area
     APPROACH_DIST      = 0.50  # m — declare arrived when this close
-    DETECTION_CONFIRM  = 3     # consecutive frames to confirm detection
+    DETECTION_CONFIRM  = 2     # consecutive frames to confirm detection
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -201,7 +203,7 @@ class ExploreAndFind(Node):
                                  self._depth_cb,       be)
         self.create_subscription(CameraInfo, '/camera/depth/camera_info',
                                  self._camera_info_cb, be)
-        self.create_subscription(Image,      '/camera/rgb/image_raw',
+        self.create_subscription(Image,      '/camera/color/image_raw',
                                  self._rgb_cb,         be)
 
         # Publishers
@@ -249,6 +251,12 @@ class ExploreAndFind(Node):
             self.latest_rgb = self.cv_bridge.imgmsg_to_cv2(msg, 'bgr8')
         except Exception as e:
             self.get_logger().warn(f'RGB conversion failed: {e}')
+            return
+        if not hasattr(self, '_rgb_logged'):
+            self._rgb_logged = True
+            h, w = self.latest_rgb.shape[:2]
+            self.get_logger().info(
+                f'[RGB] First frame: {w}x{h} encoding={msg.encoding}')
 
     def _camera_info_cb(self, msg: CameraInfo):
         self.camera_K = np.array(msg.k).reshape(3, 3)
