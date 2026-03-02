@@ -969,24 +969,19 @@ class ExploreAndFind(Node):
             score = nearby_unknown / max(dist, 0.5)
 
             # ── Bias toward last-seen object position ─────────────
-            # If the target was glimpsed (even unconfirmed), prefer
-            # frontiers that move toward it.
+            # If the target was glimpsed (even unconfirmed), override
+            # the exploration score: rank primarily by proximity to
+            # the object, with a small info-gain tiebreaker.
             if self.last_detection_pos is not None:
-                obj_dx = self.last_detection_pos[0] - bx
-                obj_dy = self.last_detection_pos[1] - by
-                frt_dx = wx - bx
-                frt_dy = wy - by
-                obj_dist = np.hypot(obj_dx, obj_dy)
-                frt_dist = np.hypot(frt_dx, frt_dy)
-                if obj_dist > 0.1 and frt_dist > 0.1:
-                    # Cosine similarity: +1 when frontier is in same
-                    # direction as object, -1 when opposite
-                    cos_sim = ((obj_dx * frt_dx + obj_dy * frt_dy)
-                               / (obj_dist * frt_dist))
-                    # Boost: multiply score by 1.0–3.0 based on alignment
-                    # cos_sim in [-1,1] → boost in [0.5, 3.0]
-                    boost = 1.75 + 1.25 * cos_sim
-                    score *= boost
+                dist_to_obj = np.hypot(wx - self.last_detection_pos[0],
+                                       wy - self.last_detection_pos[1])
+                # Primary: closer to object = higher score
+                # 1/(d+0.3) so a frontier 0.5m from object scores ~1.25
+                # while one 5m away scores ~0.19
+                proximity = 1.0 / (dist_to_obj + 0.3)
+                # Normalize info-gain to [0,1] range as tiebreaker
+                info_norm = min(nearby_unknown / 500.0, 1.0)
+                score = proximity * 10.0 + info_norm
 
             results.append((wx, wy, len(cluster), score))
 
@@ -1129,9 +1124,14 @@ class ExploreAndFind(Node):
         for clearance, label in zip(clearances, labels):
             for wx, wy, size, score in frontiers:
                 if clearance is None:
+                    obj_info = ''
+                    if self.last_detection_pos is not None:
+                        d2o = np.hypot(wx - self.last_detection_pos[0],
+                                       wy - self.last_detection_pos[1])
+                        obj_info = f' dist_obj={d2o:.1f}'
                     self.get_logger().info(
                         f'[SELECT] Trying frontier ({wx:.2f}, {wy:.2f}) '
-                        f'cluster={size} score={score:.0f}')
+                        f'cluster={size} score={score:.1f}{obj_info}')
 
                 goal_gx, goal_gy = self.world_to_grid(wx, wy)
                 path = self._plan_path(robot_gx, robot_gy, goal_gx, goal_gy,
