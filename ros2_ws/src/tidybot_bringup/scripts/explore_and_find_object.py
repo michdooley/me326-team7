@@ -126,7 +126,7 @@ class ExploreAndFind(Node):
     # ── Frontier selection ────────────────────────────────────────────────────
     MIN_FRONTIER_SIZE   = 8
     MIN_FRONTIER_DIST   = 1.0   # m
-    ROBOT_CLEARANCE     = 0.30  # m
+    ROBOT_CLEARANCE     = 0.35  # m
 
     # ── Navigation ────────────────────────────────────────────────────────────
     NAV_TIMEOUT        = 120.0  # s per waypoint
@@ -790,8 +790,8 @@ class ExploreAndFind(Node):
         goal_gx, goal_gy = self.world_to_grid(ox, oy)
 
         # Try cascading inflation levels
-        clearances = [None, self.ROBOT_CLEARANCE * 0.5, 0.0]
-        labels     = ['full', 'half', 'zero']
+        clearances = [None, self.ROBOT_CLEARANCE * 0.5]
+        labels     = ['full', 'half']
 
         for clearance, label in zip(clearances, labels):
             path = self._plan_path(robot_gx, robot_gy, goal_gx, goal_gy,
@@ -1089,8 +1089,8 @@ class ExploreAndFind(Node):
         bx, by, _ = base_pose
         robot_gx, robot_gy = self.world_to_grid(bx, by)
 
-        clearances = [None, self.ROBOT_CLEARANCE * 0.5, 0.0]
-        labels     = ['full', 'half', 'zero']
+        clearances = [None, self.ROBOT_CLEARANCE * 0.5]
+        labels     = ['full', 'half']
 
         for clearance, label in zip(clearances, labels):
             for wx, wy, size, score in frontiers:
@@ -1267,7 +1267,7 @@ class ExploreAndFind(Node):
             # Try re-planning closer
             goal_gx, goal_gy = self.world_to_grid(ox, oy)
             robot_gx, robot_gy = self.world_to_grid(bx, by)
-            for clearance in [None, self.ROBOT_CLEARANCE * 0.5, 0.0]:
+            for clearance in [None, self.ROBOT_CLEARANCE * 0.5]:
                 path = self._plan_path(
                     robot_gx, robot_gy, goal_gx, goal_gy,
                     clearance_m=clearance)
