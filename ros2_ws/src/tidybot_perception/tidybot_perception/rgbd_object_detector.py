@@ -212,6 +212,65 @@ class RGBDObjectDetector:
 
         return base_pt
 
+    # ── Inverse projection (3D → pixel) ─────────────────────────────
+
+    def base_link_to_pixel(self, x, y, z):
+        """
+        Project a 3D point in base_link back to image pixel (u, v).
+
+        Inverse of pixel_to_base_link(). Transforms the point from
+        base_link to camera optical frame, then projects using intrinsics.
+
+        Args:
+            x, y, z: Coordinates in base_link frame.
+
+        Returns:
+            (u, v) pixel coordinates, or None on failure.
+        """
+        if self.camera_info is None:
+            return None
+
+        # Build a PointStamped in base_link
+        pt = PointStamped()
+        pt.header.frame_id = 'base_link'
+        pt.header.stamp = self._node.get_clock().now().to_msg()
+        pt.point.x = float(x)
+        pt.point.y = float(y)
+        pt.point.z = float(z)
+
+        # Transform base_link → camera_color_optical_frame
+        try:
+            import rclpy.time
+            import rclpy.duration
+            transform = self.tf_buffer.lookup_transform(
+                'camera_color_optical_frame',
+                'base_link',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0),
+            )
+            cam_pt = tf2_geometry_msgs.do_transform_point(pt, transform)
+        except Exception as e:
+            self._node.get_logger().error(f'TF transform failed: {e}')
+            return None
+
+        # Camera optical frame: +Z forward, +X right, +Y down
+        cx_cam = cam_pt.point.x
+        cy_cam = cam_pt.point.y
+        cz_cam = cam_pt.point.z
+
+        if cz_cam <= 0.01:
+            return None  # Behind camera
+
+        fx = self.camera_info.k[0]
+        fy = self.camera_info.k[4]
+        cx = self.camera_info.k[2]
+        cy = self.camera_info.k[5]
+
+        u = int(round(fx * cx_cam / cz_cam + cx))
+        v = int(round(fy * cy_cam / cz_cam + cy))
+
+        return (u, v)
+
     # ── Combined detect + localize ──────────────────────────────────
 
     def detect_and_localize(self, color):

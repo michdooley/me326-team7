@@ -31,6 +31,7 @@ def launch_setup(context, *args, **kwargs):
     show_mujoco_viewer = LaunchConfiguration('show_mujoco_viewer')
     use_sim_time = LaunchConfiguration('use_sim_time')
     use_motion_planner = LaunchConfiguration('use_motion_planner')
+    use_grasp_planner = LaunchConfiguration('use_grasp_planner')
 
     # Package paths
     pkg_bringup = FindPackageShare('tidybot_bringup')
@@ -111,6 +112,25 @@ def launch_setup(context, *args, **kwargs):
         }]
     )
 
+    # Grasp planner (GR-ConvNet)
+    grasp_model_path = os.path.join(
+        repo_root, 'ros2_ws', 'src', 'tidybot_perception', 'models',
+        'grconvnet_cornell.pt')
+    grasp_planner = Node(
+        package='tidybot_perception',
+        executable='grasp_planner_node',
+        name='grasp_planner',
+        output='screen',
+        condition=IfCondition(use_grasp_planner),
+        parameters=[{
+            'model_path': grasp_model_path,
+            'approach_offset': 0.10,
+            'default_arm': 'right',
+            'grasp_z_offset': 0.0,
+            'crop_size': 300,
+        }]
+    )
+
     # RViz
     rviz_config = PathJoinSubstitution([pkg_bringup, 'rviz', 'tidybot.rviz'])
     rviz = Node(
@@ -128,6 +148,7 @@ def launch_setup(context, *args, **kwargs):
         right_arm_controller,
         left_arm_controller,
         motion_planner,
+        grasp_planner,
         rviz,
     ]
 
@@ -159,6 +180,11 @@ def generate_launch_description():
         description='Launch motion planner for IK and trajectory planning'
     )
 
+    declare_use_grasp_planner = DeclareLaunchArgument(
+        'use_grasp_planner', default_value='true',
+        description='Launch GR-ConvNet grasp planner for optimized grasping'
+    )
+
     return LaunchDescription([
         # Arguments
         declare_scene,
@@ -166,6 +192,7 @@ def generate_launch_description():
         declare_show_viewer,
         declare_use_sim_time,
         declare_use_planner,
+        declare_use_grasp_planner,
         # Nodes via OpaqueFunction (resolved after arguments)
         OpaqueFunction(function=launch_setup),
     ])

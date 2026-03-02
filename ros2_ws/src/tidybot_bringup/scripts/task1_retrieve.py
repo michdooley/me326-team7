@@ -49,7 +49,7 @@ import tf2_ros
 from geometry_msgs.msg import Pose, Twist, Quaternion, Point
 from std_msgs.msg import Float64MultiArray
 from tidybot_msgs.msg import ArmCommand
-from tidybot_msgs.srv import PlanToTarget
+from tidybot_msgs.srv import PlanToTarget, PlanGrasp
 
 from sensor_msgs.msg import Image, CameraInfo, JointState
 from vision_msgs.msg import Detection2DArray
@@ -199,9 +199,12 @@ class Task1Retrieve(Node):
         self.pan_tilt_pub = self.create_publisher(
             Float64MultiArray, '/camera/pan_tilt_cmd', 10)
 
-        # ── Service client ──
+        # ── Service clients ──
         self.plan_to_target_client = self.create_client(
             PlanToTarget, '/plan_to_target')
+        self.plan_grasp_client = self.create_client(
+            PlanGrasp, '/plan_grasp')
+        self.grasp_planner_available = False
 
         # ── State machine ──
         self.state = Task1State.LISTEN
@@ -239,8 +242,10 @@ class Task1Retrieve(Node):
         self.ik_nudge_count = 0        # how many nudge rotations done
         self.ik_nudge_phase = 0        # 0=rotating, 1=done
 
-        # ── Camera tilt sent flag for PLAN_GRASP ──
+        # ── Grasp planner tracking ──
         self.plan_grasp_camera_sent = False
+        self.plan_grasp_future = None
+        self.plan_grasp_phase = 0  # 0=detect, 1=wait_for_planner
 
         # ── Control loop at 10Hz ──
         self.cb_group = ReentrantCallbackGroup()
@@ -256,6 +261,7 @@ class Task1Retrieve(Node):
         )
         self.get_logger().info(f'Target object: {self.target_object}')
         self.get_logger().info(f'Max grasp retries: {MAX_GRASP_RETRIES}')
+        self.get_logger().info('GR-ConvNet grasp planner will be checked at runtime')
 
     # ═══════════════════════════════════════════════════════════════════
     # Helper methods
@@ -398,6 +404,17 @@ class Task1Retrieve(Node):
             return None
 
         return (centroid, base_pt)
+
+    def _use_default_grasp_orientation(self, ox, oy, oz):
+        """Fallback: use hardcoded ORIENT_FINGERS_DOWN."""
+        grasp_z = oz + GRASP_Z_OFFSET
+        pre_grasp_z = grasp_z + PRE_GRASP_Z_OFFSET
+        qw, qx, qy, qz = ORIENT_FINGERS_DOWN
+        self.pre_grasp_pose = create_pose(ox, oy, pre_grasp_z, qw, qx, qy, qz)
+        self.grasp_pose = create_pose(ox, oy, grasp_z, qw, qx, qy, qz)
+        self.get_logger().info('  Using default fingers-down orientation')
+        self.plan_grasp_camera_sent = False
+        self.transition_to(Task1State.PRE_GRASP)
 
     def _send_plan_to_target(self, target_pose, label):
         """Send async /plan_to_target request. Sets self.plan_future.
@@ -703,45 +720,85 @@ class Task1Retrieve(Node):
                 # Point camera down at the object for close-range detection
                 self._send_pan_tilt(0.0, CAMERA_TILT_GRASP)
                 self.plan_grasp_camera_sent = True
+                self.plan_grasp_phase = 0
+                self.plan_grasp_future = None
+                # Check if grasp planner is available (first time)
+                if not self.grasp_planner_available:
+                    self.grasp_planner_available = \
+                        self.plan_grasp_client.service_is_ready()
                 return
 
             # Wait for camera to reach target and settle (closed-loop)
             if not self._camera_settled():
                 return
 
-            # Re-detect object for grasp planning via classifier
-            result = self._detect_and_localize(self.target_object)
-            if result is None:
-                if elapsed > 8.0:
-                    self.get_logger().error(
-                        'Could not re-detect object for grasp planning')
-                    self.plan_grasp_camera_sent = False
-                    self.transition_to(Task1State.APPROACH)
-                return
+            # Phase 0: Detect object
+            if self.plan_grasp_phase == 0:
+                result = self._detect_and_localize(self.target_object)
+                if result is None:
+                    if elapsed > 8.0:
+                        self.get_logger().error(
+                            'Could not re-detect object for grasp planning')
+                        self.plan_grasp_camera_sent = False
+                        self.transition_to(Task1State.APPROACH)
+                    return
 
-            (u, v), base_pt = result
-            ox = base_pt.point.x
-            oy = base_pt.point.y
-            oz = base_pt.point.z
+                (u, v), base_pt = result
+                ox = base_pt.point.x
+                oy = base_pt.point.y
+                oz = base_pt.point.z
 
-            self.grasp_object_pos = (ox, oy, oz)
-            self.get_logger().info(
-                f'Object at base_link: ({ox:.3f}, {oy:.3f}, {oz:.3f})')
+                self.grasp_object_pos = (ox, oy, oz)
+                self.get_logger().info(
+                    f'Object at base_link: ({ox:.3f}, {oy:.3f}, {oz:.3f})')
 
-            # Compute grasp and pre-grasp poses (top-down)
-            grasp_z = oz + GRASP_Z_OFFSET
-            pre_grasp_z = grasp_z + PRE_GRASP_Z_OFFSET
-            qw, qx, qy, qz = ORIENT_FINGERS_DOWN
+                # Try GR-ConvNet grasp planner
+                if self.grasp_planner_available:
+                    req = PlanGrasp.Request()
+                    req.object_position = base_pt
+                    req.object_class = self.target_object
+                    req.arm_name = self.active_arm
+                    self.plan_grasp_future = \
+                        self.plan_grasp_client.call_async(req)
+                    self.plan_grasp_phase = 1
+                    self.phase_start_time = time.time()
+                    self.get_logger().info(
+                        '  Calling /plan_grasp for optimized grasp...')
+                else:
+                    # Fallback to default orientation
+                    self._use_default_grasp_orientation(ox, oy, oz)
 
-            self.pre_grasp_pose = create_pose(
-                ox, oy, pre_grasp_z, qw, qx, qy, qz)
-            self.grasp_pose = create_pose(
-                ox, oy, grasp_z, qw, qx, qy, qz)
+            # Phase 1: Wait for /plan_grasp response
+            elif self.plan_grasp_phase == 1:
+                if self.plan_grasp_future is not None \
+                        and self.plan_grasp_future.done():
+                    try:
+                        result = self.plan_grasp_future.result()
+                    except Exception as e:
+                        self.get_logger().warn(
+                            f'plan_grasp exception: {e}')
+                        ox, oy, oz = self.grasp_object_pos
+                        self._use_default_grasp_orientation(ox, oy, oz)
+                        return
 
-            self.get_logger().info(
-                f'Pre-grasp z={pre_grasp_z:.3f}, Grasp z={grasp_z:.3f}')
-            self.plan_grasp_camera_sent = False
-            self.transition_to(Task1State.PRE_GRASP)
+                    if result.success:
+                        self.grasp_pose = result.grasp_pose
+                        self.pre_grasp_pose = result.pre_grasp_pose
+                        self.get_logger().info(
+                            f'  Grasp planner: {result.message}')
+                        self.plan_grasp_camera_sent = False
+                        self.transition_to(Task1State.PRE_GRASP)
+                    else:
+                        self.get_logger().warn(
+                            f'  Grasp planner failed: {result.message}')
+                        ox, oy, oz = self.grasp_object_pos
+                        self._use_default_grasp_orientation(ox, oy, oz)
+
+                elif time.time() - self.phase_start_time > 30.0:
+                    self.get_logger().warn(
+                        'Grasp planner timed out — using default')
+                    ox, oy, oz = self.grasp_object_pos
+                    self._use_default_grasp_orientation(ox, oy, oz)
 
         # ==================== PRE_GRASP ====================
         elif self.state == Task1State.PRE_GRASP:

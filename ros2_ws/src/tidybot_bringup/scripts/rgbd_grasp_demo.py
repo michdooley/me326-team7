@@ -30,11 +30,11 @@ import time
 import rclpy
 from rclpy.node import Node
 
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, PointStamped
 from std_msgs.msg import Float64MultiArray, ColorRGBA
 from visualization_msgs.msg import Marker
 from tidybot_msgs.msg import ArmCommand
-from tidybot_msgs.srv import PlanToTarget
+from tidybot_msgs.srv import PlanToTarget, PlanGrasp
 
 from tidybot_perception.rgbd_object_detector import RGBDObjectDetector
 
@@ -101,8 +101,10 @@ class RGBDGraspDemo(Node):
         self.marker_pub = self.create_publisher(Marker, '/grasp_debug_markers', 10)
         self.marker_id = 0
 
-        # Service client
+        # Service clients
         self.plan_client = self.create_client(PlanToTarget, '/plan_to_target')
+        self.grasp_planner_client = self.create_client(PlanGrasp, '/plan_grasp')
+        self.grasp_planner_available = False
 
     # ── Utilities ───────────────────────────────────────────────────
 
@@ -258,7 +260,7 @@ class RGBDGraspDemo(Node):
 
     def _detect_object(self):
         """Point camera at table and localize the target object.
-        Returns (ox, oy, oz) in base_link or None."""
+        Returns (ox, oy, oz, base_pt) in base_link or None."""
         self.get_logger().info('Setting camera tilt')
         self.set_camera(pan=0.0, tilt=self.camera_tilt)
         self.spin_for(2.0)
@@ -274,33 +276,78 @@ class RGBDGraspDemo(Node):
         self.get_logger().info(f'  Detected at pixel ({u}, {v})')
         self.get_logger().info(
             f'  Object in base_link: ({ox:.3f}, {oy:.3f}, {oz:.3f})')
-        return (ox, oy, oz)
+        return (ox, oy, oz, base_pt)
 
-    def _execute_grasp(self, ox, oy, oz):
+    def _call_plan_grasp(self, base_pt):
+        """Call /plan_grasp service to get optimized grasp pose.
+        Returns PlanGrasp.Response or None."""
+        if not self.grasp_planner_available:
+            return None
+
+        req = PlanGrasp.Request()
+        req.object_position = base_pt
+        req.object_class = self.target_color
+        req.arm_name = self.arm_name
+
+        self.get_logger().info('  Calling /plan_grasp for optimized grasp...')
+        future = self.grasp_planner_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=30.0)
+
+        if not future.done() or future.exception():
+            self.get_logger().warn('  /plan_grasp call failed')
+            return None
+
+        result = future.result()
+        if result.success:
+            self.get_logger().info(f'  Grasp planner: {result.message}')
+        else:
+            self.get_logger().warn(f'  Grasp planner failed: {result.message}')
+        return result
+
+    def _execute_grasp(self, ox, oy, oz, base_pt=None):
         """Run the pre-grasp → grasp → close gripper sequence.
-        Returns True if all motions succeeded."""
-        grasp_z = oz + GRASP_Z_OFFSET
-        pre_grasp_z = grasp_z + PRE_GRASP_Z_OFFSET
+        Returns True if all motions succeeded.
 
+        If /plan_grasp is available, uses GR-ConvNet-optimized orientation.
+        Otherwise falls back to hardcoded ORIENT_FINGERS_DOWN.
+        """
+        # Try GR-ConvNet grasp planner
+        grasp_result = None
+        if base_pt is not None:
+            grasp_result = self._call_plan_grasp(base_pt)
+
+        if grasp_result is not None and grasp_result.success:
+            pre_grasp_pose = grasp_result.pre_grasp_pose
+            grasp_pose = grasp_result.grasp_pose
+            self.get_logger().info('  Using GR-ConvNet optimized grasp')
+        else:
+            # Fallback: hardcoded top-down orientation
+            grasp_z = oz + GRASP_Z_OFFSET
+            pre_grasp_z = grasp_z + PRE_GRASP_Z_OFFSET
+            pre_grasp_pose = self.grasp_pose_at(ox, oy, pre_grasp_z)
+            grasp_pose = self.grasp_pose_at(ox, oy, grasp_z)
+            self.get_logger().info('  Using default fingers-down orientation')
+
+        # Debug markers
+        gp = grasp_pose.position
+        pp = pre_grasp_pose.position
         self.publish_marker(ox, oy, oz, 0.0, 1.0, 0.0,
                             label='detected_surface', scale=0.02)
-        self.publish_marker(ox, oy, grasp_z, 1.0, 0.0, 0.0,
+        self.publish_marker(gp.x, gp.y, gp.z, 1.0, 0.0, 0.0,
                             label='grasp_target', scale=0.02)
-        self.publish_marker(ox, oy, pre_grasp_z, 0.0, 0.0, 1.0,
+        self.publish_marker(pp.x, pp.y, pp.z, 0.0, 0.0, 1.0,
                             label='pre_grasp', scale=0.02)
 
         self.get_logger().info('Opening gripper')
         self.set_gripper(0.0)
 
         self.get_logger().info('Moving to pre-grasp')
-        pre_grasp = self.grasp_pose_at(ox, oy, pre_grasp_z)
-        if not self.plan_and_execute(pre_grasp, 'pre-grasp'):
+        if not self.plan_and_execute(pre_grasp_pose, 'pre-grasp'):
             self.get_logger().error('Pre-grasp motion failed')
             return False
 
         self.get_logger().info('Descending to grasp')
-        grasp = self.grasp_pose_at(ox, oy, grasp_z)
-        if not self.plan_and_execute(grasp, 'grasp'):
+        if not self.plan_and_execute(grasp_pose, 'grasp'):
             self.get_logger().error('Grasp motion failed')
             return False
 
@@ -324,6 +371,17 @@ class RGBDGraspDemo(Node):
             self.get_logger().info('  ...waiting')
         self.get_logger().info('Service available.')
 
+        # Check for grasp planner (optional — graceful fallback)
+        self.get_logger().info('Checking for /plan_grasp service (3s timeout)...')
+        self.grasp_planner_available = \
+            self.grasp_planner_client.wait_for_service(timeout_sec=3.0)
+        if self.grasp_planner_available:
+            self.get_logger().info(
+                'GR-ConvNet grasp planner available — using optimized grasps')
+        else:
+            self.get_logger().warn(
+                'Grasp planner not available — using default orientation')
+
         # ── Grasp + verify loop ─────────────────────────────────────
         grasp_confirmed = False
         for attempt in range(1, self.max_retries + 1):
@@ -335,10 +393,10 @@ class RGBDGraspDemo(Node):
             if detection is None:
                 self.get_logger().error('Object detection failed — aborting')
                 return
-            ox, oy, oz = detection
+            ox, oy, oz, base_pt = detection
 
             # Execute grasp (pre-grasp → descend → close gripper)
-            if not self._execute_grasp(ox, oy, oz):
+            if not self._execute_grasp(ox, oy, oz, base_pt):
                 self.get_logger().error('Grasp execution failed — aborting')
                 return
 

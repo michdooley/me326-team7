@@ -1,0 +1,142 @@
+"""
+GR-ConvNet v3 — Generative Residual Convolutional Neural Network
+
+Adapted from: https://github.com/skumra/robotic-grasping/blob/master/inference/models/grconvnet3.py
+License: BSD-2-Clause (original repo)
+
+Architecture:
+    Encoder: 3 conv layers (stride-2 downsampling)
+    Bottleneck: 5 residual blocks
+    Decoder: 3 transposed-conv layers (stride-2 upsampling)
+    Output heads: 4 separate conv layers for pos, cos, sin, width
+
+Input: (B, C, 224, 224) tensor — C=1 for depth-only, C=4 for RGBD
+Output: 4 tensors of shape (B, 1, H', W') — pos, cos, sin, width
+    H', W' are slightly smaller than input due to output head kernel_size=2
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ResidualBlock(nn.Module):
+    """Residual block with two conv layers and skip connection."""
+
+    def __init__(self, in_channels, out_channels, kernel_size=3):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=1)
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.conv2 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=1)
+        self.bn2 = nn.BatchNorm2d(in_channels)
+
+    def forward(self, x_in):
+        x = self.bn1(self.conv1(x_in))
+        x = F.relu(x)
+        x = self.bn2(self.conv2(x))
+        return x + x_in
+
+
+class GenerativeResnet(nn.Module):
+    """
+    GR-ConvNet v3 for antipodal grasp detection.
+
+    Args:
+        input_channels: Number of input channels (1=depth, 4=RGBD)
+        output_channels: Number of output channels per head (default 1)
+        channel_size: Base channel width (default 32)
+        dropout: Whether to apply dropout before output heads
+        prob: Dropout probability
+    """
+
+    def __init__(self, input_channels=1, output_channels=1, channel_size=32,
+                 dropout=False, prob=0.0):
+        super().__init__()
+
+        # Encoder
+        self.conv1 = nn.Conv2d(input_channels, channel_size,
+                               kernel_size=9, stride=1, padding=4)
+        self.bn1 = nn.BatchNorm2d(channel_size)
+
+        self.conv2 = nn.Conv2d(channel_size, channel_size * 2,
+                               kernel_size=4, stride=2, padding=1)
+        self.bn2 = nn.BatchNorm2d(channel_size * 2)
+
+        self.conv3 = nn.Conv2d(channel_size * 2, channel_size * 4,
+                               kernel_size=4, stride=2, padding=1)
+        self.bn3 = nn.BatchNorm2d(channel_size * 4)
+
+        # Residual blocks
+        self.res1 = ResidualBlock(channel_size * 4, channel_size * 4)
+        self.res2 = ResidualBlock(channel_size * 4, channel_size * 4)
+        self.res3 = ResidualBlock(channel_size * 4, channel_size * 4)
+        self.res4 = ResidualBlock(channel_size * 4, channel_size * 4)
+        self.res5 = ResidualBlock(channel_size * 4, channel_size * 4)
+
+        # Decoder
+        self.conv4 = nn.ConvTranspose2d(channel_size * 4, channel_size * 2,
+                                        kernel_size=4, stride=2, padding=1,
+                                        output_padding=1)
+        self.bn4 = nn.BatchNorm2d(channel_size * 2)
+
+        self.conv5 = nn.ConvTranspose2d(channel_size * 2, channel_size,
+                                        kernel_size=4, stride=2, padding=2,
+                                        output_padding=1)
+        self.bn5 = nn.BatchNorm2d(channel_size)
+
+        self.conv6 = nn.ConvTranspose2d(channel_size, channel_size,
+                                        kernel_size=9, stride=1, padding=4)
+
+        # Output heads
+        self.pos_output = nn.Conv2d(channel_size, output_channels, kernel_size=2)
+        self.cos_output = nn.Conv2d(channel_size, output_channels, kernel_size=2)
+        self.sin_output = nn.Conv2d(channel_size, output_channels, kernel_size=2)
+        self.width_output = nn.Conv2d(channel_size, output_channels, kernel_size=2)
+
+        # Dropout
+        self.dropout = dropout
+        self.dropout_pos = nn.Dropout(p=prob)
+        self.dropout_cos = nn.Dropout(p=prob)
+        self.dropout_sin = nn.Dropout(p=prob)
+        self.dropout_wid = nn.Dropout(p=prob)
+
+        # Initialize weights
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.xavier_uniform_(m.weight, gain=1)
+
+    def forward(self, x_in):
+        x = F.relu(self.bn1(self.conv1(x_in)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.res1(x)
+        x = self.res2(x)
+        x = self.res3(x)
+        x = self.res4(x)
+        x = self.res5(x)
+        x = F.relu(self.bn4(self.conv4(x)))
+        x = F.relu(self.bn5(self.conv5(x)))
+        x = self.conv6(x)
+
+        if self.dropout:
+            pos_output = self.pos_output(self.dropout_pos(x))
+            cos_output = self.cos_output(self.dropout_cos(x))
+            sin_output = self.sin_output(self.dropout_sin(x))
+            width_output = self.width_output(self.dropout_wid(x))
+        else:
+            pos_output = self.pos_output(x)
+            cos_output = self.cos_output(x)
+            sin_output = self.sin_output(x)
+            width_output = self.width_output(x)
+
+        return pos_output, cos_output, sin_output, width_output
+
+    def predict(self, xc):
+        """Run inference and return named outputs."""
+        pos_pred, cos_pred, sin_pred, width_pred = self(xc)
+        return {
+            'pos': pos_pred,
+            'cos': cos_pred,
+            'sin': sin_pred,
+            'width': width_pred,
+        }
