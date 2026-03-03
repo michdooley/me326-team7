@@ -197,10 +197,11 @@ class ExploreAndFind(Node):
         # Object detection state (YOLO version)
         self.declare_parameter('target_class_id', 46) # Default to 46 (e.g., banana/apple)
         self.target_class_id = self.get_parameter('target_class_id').get_parameter_value().integer_value
-        self.object_world_pos   = None   # (wx, wy) once confirmed
-        self.detection_times    = []     # timestamps of recent detections
-        self.last_detection_pos = None   # (wx, wy) of most recent detection
-        self.depth_steer_start  = None   # when depth-steering began (stuck detection)
+        self.object_world_pos      = None   # (wx, wy) once confirmed
+        self.detection_times       = []     # timestamps of recent detections
+        self.last_detection_pos    = None   # (wx, wy) of most recent detection
+        self.latest_yolo_detection = None   # most recent matching Detection2D
+        self.depth_steer_start     = None   # when depth-steering began (stuck detection)
 
         # TF
         self.tf_buffer   = tf2_ros.Buffer()
@@ -754,30 +755,68 @@ class ExploreAndFind(Node):
     #     return False
 
     def _yolo_bbox_cb(self, msg: Detection2DArray):
-        """Callback for YOLO detections from the ObjectClassifier node."""
+        """Callback for YOLO detections from the ObjectClassifier node.
+
+        Uses a temporal confirmation window (DETECT_COUNT_REQ detections
+        within DETECT_WINDOW seconds) to avoid false positives from
+        single-frame YOLO misclassifications.
+        """
         if self.state == ExploreState.COMPLETE:
             return
 
         for detection in msg.detections:
-            # Get the class ID (e.g., '0' for person, '46' for apple/bin depending on your model)
+            if not detection.results:
+                continue
             class_id = int(detection.results[0].hypothesis.class_id)
 
-            # Check if this is the object we want
-            if class_id == self.target_class_id:
-                u = int(detection.bbox.center.position.x)
-                v = int(detection.bbox.center.position.y)
+            if class_id != self.target_class_id:
+                continue
 
-                # Estimate world position using existing depth back-projection
-                pos = self._estimate_object_position(u, v)
-                
-                if pos is not None:
-                    self.object_world_pos = pos
-                    self.get_logger().info(f'*** YOLO Object {class_id} CONFIRMED at {pos} ***')
-                    
-                    # Switch state to APPROACHING
-                    if self.state != ExploreState.APPROACHING:
-                        self.state = ExploreState.APPROACHING
-                        self._plan_approach()
+            u = int(detection.bbox.center.position.x)
+            v = int(detection.bbox.center.position.y)
+            pos = self._estimate_object_position(u, v)
+            if pos is None:
+                continue
+
+            # Store latest detection for approach refinement
+            self.latest_yolo_detection = detection
+
+            # If already confirmed, just update position (approach
+            # refinement handled in _state_approaching)
+            if self.object_world_pos is not None:
+                return
+
+            # Check consistency — if position jumped far, reset window
+            if self.last_detection_pos is not None:
+                d = np.hypot(pos[0] - self.last_detection_pos[0],
+                             pos[1] - self.last_detection_pos[1])
+                if d > 1.0:
+                    self.detection_times = []
+
+            now = time.time()
+            self.detection_times.append(now)
+            self.last_detection_pos = pos
+
+            # Prune old detections outside the window
+            cutoff = now - self.DETECT_WINDOW
+            self.detection_times = [
+                t for t in self.detection_times if t >= cutoff]
+
+            self.get_logger().info(
+                f'[DETECT] YOLO class {class_id} candidate at '
+                f'({pos[0]:.2f}, {pos[1]:.2f}) '
+                f'count={len(self.detection_times)}/{self.DETECT_COUNT_REQ} '
+                f'in {self.DETECT_WINDOW}s window')
+
+            if len(self.detection_times) >= self.DETECT_COUNT_REQ:
+                self.object_world_pos = pos
+                self.get_logger().info(
+                    f'[DETECT] *** YOLO class {class_id} CONFIRMED at '
+                    f'({pos[0]:.2f}, {pos[1]:.2f}) ***')
+                if self.state != ExploreState.APPROACHING:
+                    self.state = ExploreState.APPROACHING
+                    self._plan_approach()
+            return
 
     def _estimate_object_position(self, u, v):
         """Estimate world (x, y) of pixel (u, v) using depth + TF."""
