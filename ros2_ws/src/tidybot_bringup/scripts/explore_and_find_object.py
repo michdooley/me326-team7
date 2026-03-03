@@ -242,7 +242,7 @@ class ExploreAndFind(Node):
         self.get_logger().info('=' * 55)
         self.get_logger().info(
             'Explore & Find  (frontier exploration + object detection)')
-        self.get_logger().info(f'  Target : {self.target_color} cube')
+        self.get_logger().info(f'  Target : YOLO class_id={self.target_class_id}')
         self.get_logger().info(
             f'  Grid   : {self.GRID_SIZE}x{self.GRID_SIZE} '
             f'@ {self.GRID_RESOLUTION} m/cell '
@@ -864,7 +864,7 @@ class ExploreAndFind(Node):
         if np.hypot(ox - bx, oy - by) < self.APPROACH_DIST:
             self._stop_base()
             self.get_logger().info(
-                f'[APPROACH] Already at {self.target_color} cube!')
+                f'[APPROACH] Already at target object!')
             self.state = ExploreState.COMPLETE
             return True
 
@@ -887,7 +887,7 @@ class ExploreAndFind(Node):
                 self.publish_nav_path()
                 self.state = ExploreState.APPROACHING
                 self.get_logger().info(
-                    f'[APPROACH] Path to {self.target_color} cube at '
+                    f'[APPROACH] Path to target object at '
                     f'({ox:.2f}, {oy:.2f}): {len(path)} waypoints '
                     f'({label} inflation)')
                 return True
@@ -913,16 +913,7 @@ class ExploreAndFind(Node):
         m.pose.position.z    = 0.05
         m.pose.orientation.w = 1.0
         m.scale.x = 0.15;  m.scale.y = 0.15;  m.scale.z = 0.15
-        color_map = {
-            'red':    ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0),
-            'blue':   ColorRGBA(r=0.0, g=0.3, b=1.0, a=1.0),
-            'yellow': ColorRGBA(r=1.0, g=0.9, b=0.0, a=1.0),
-            'green':  ColorRGBA(r=0.0, g=0.8, b=0.2, a=1.0),
-            'orange': ColorRGBA(r=1.0, g=0.5, b=0.0, a=1.0),
-        }
-        m.color = color_map.get(
-            self.target_color,
-            ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0))
+        m.color = ColorRGBA(r=1.0, g=0.2, b=0.2, a=1.0)
         ma = MarkerArray()
         ma.markers.append(m)
         self.object_marker_pub.publish(ma)
@@ -1500,7 +1491,7 @@ class ExploreAndFind(Node):
         if dist_to_obj < self.APPROACH_DIST:
             self._stop_base()
             self.get_logger().info(
-                f'[APPROACH] Reached {self.target_color} cube! '
+                f'[APPROACH] Reached target object! '
                 f'dist={dist_to_obj:.2f}m')
             self.state = ExploreState.COMPLETE
             return
@@ -1557,7 +1548,7 @@ class ExploreAndFind(Node):
                 if dist_to_obj < self.APPROACH_DIST:
                     self._stop_base()
                     self.get_logger().info(
-                        f'[APPROACH] Reached {self.target_color} cube! '
+                        f'[APPROACH] Reached target object! '
                         f'dist={dist_to_obj:.2f}m')
                     self.state = ExploreState.COMPLETE
                     return
@@ -1617,7 +1608,7 @@ class ExploreAndFind(Node):
         if self.object_world_pos is not None:
             ox, oy = self.object_world_pos
             self.get_logger().info(
-                f'FOUND {self.target_color.upper()} CUBE at '
+                f'FOUND TARGET OBJECT at '
                 f'({ox:.2f}, {oy:.2f})')
         else:
             self.get_logger().info('EXPLORATION COMPLETE — object not found')
@@ -1648,7 +1639,7 @@ class ExploreAndFind(Node):
                     pass
 
         self.get_logger().info(
-            f'Sensors ready — exploring for {self.target_color} cube!')
+            f'Sensors ready — exploring for YOLO class_id={self.target_class_id}!')
         self._start_scan()
 
         while rclpy.ok():
