@@ -9,7 +9,7 @@ def generate_launch_description():
         # This node takes /camera/color/image_raw and outputs /objbbox
         Node(
             package='object_classification', # Your package name
-            executable='object_classifier',   # Your python script/entry point
+            executable='classifier',
             name='classifier',
             output='screen',
             parameters=[{'use_sim_time': False}] # Set to True if in MuJoCo
