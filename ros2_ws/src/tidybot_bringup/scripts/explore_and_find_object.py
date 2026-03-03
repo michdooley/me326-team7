@@ -1304,9 +1304,7 @@ class ExploreAndFind(Node):
             return
         bx, by, btheta = pose
 
-        # ── Check for target object while navigating ──────────────────
-        if self.object_world_pos is None:
-            self._check_for_object()
+        # ── Object detection handled by _yolo_bbox_cb callback ─────────
         if self.object_world_pos is not None:
             if self._plan_approach():
                 return
@@ -1652,11 +1650,7 @@ class ExploreAndFind(Node):
                     self.publish_object_marker()
                 self.last_map_publish = now
 
-            # Object detection runs during scanning (stores position
-            # for use in SELECTING) — doesn't interrupt the scan.
-            if (self.state == ExploreState.SCANNING and
-                    self.object_world_pos is None):
-                self._check_for_object()
+            # Object detection now handled by _yolo_bbox_cb callback.
 
             if   self.state == ExploreState.SCANNING:
                 self._state_scanning()
