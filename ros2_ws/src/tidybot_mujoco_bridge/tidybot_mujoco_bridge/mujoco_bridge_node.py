@@ -116,27 +116,6 @@ class MuJoCoBridgeNode(Node):
             self.model = mujoco.MjModel.from_xml_path(model_path)
             self.data = mujoco.MjData(self.model)
 
-<<<<<<< HEAD
-            # Load home keyframe if available for stable initial state
-            try:
-                home_key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, 'home')
-                mujoco.mj_resetDataKeyframe(self.model, self.data, home_key_id)
-                self.get_logger().info('Loaded home keyframe for stable initial state')
-
-                # Restore freejoint positions from qpos0 — the keyframe only
-                # defines robot DOFs so freejoint objects get zeroed out
-                for i in range(self.model.njnt):
-                    if self.model.jnt_type[i] == mujoco.mjtJoint.mjJNT_FREE:
-                        adr = self.model.jnt_qposadr[i]
-                        self.data.qpos[adr:adr + 7] = self.model.qpos0[adr:adr + 7]
-                        jname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, i)
-                        self.get_logger().info(
-                            f'Restored freejoint {jname!r} to pos='
-                            f'({self.data.qpos[adr]:.3f}, {self.data.qpos[adr+1]:.3f}, {self.data.qpos[adr+2]:.3f})'
-                        )
-            except Exception:
-                self.get_logger().warn('No home keyframe found, using default state')
-=======
             # Load keyframe for stable initial state
             # Prefer scene_home (includes freejoint positions), fall back to home
             keyframe_loaded = False
@@ -152,7 +131,6 @@ class MuJoCoBridgeNode(Node):
                     continue
             if not keyframe_loaded:
                 self.get_logger().warn('No keyframe found, using default state')
->>>>>>> origin/alexander
 
         except Exception as e:
             self.get_logger().error(f'Failed to load MuJoCo model: {e}')
