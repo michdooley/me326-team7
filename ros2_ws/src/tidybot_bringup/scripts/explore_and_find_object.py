@@ -48,13 +48,14 @@ from scipy.ndimage import binary_dilation, label as ndimage_label
 import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Point, Twist
 from nav_msgs.msg import MapMetaData, OccupancyGrid
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
+from vision_msgs.msg import Detection2DArray
 
 import tf2_ros
 
@@ -76,14 +77,14 @@ class ExploreState(Enum):
 # HSV color ranges for cube detection (OpenCV HSV: H=[0,180], S/V=[0,255])
 # Ranges are intentionally wide to handle MuJoCo lighting variation
 # (headlight diffuse + ambient + directional light).
-COLOR_RANGES = {
-    'red':    [((0,   80,  50),  (10,  255, 255)),
-               ((165, 80,  50),  (180, 255, 255))],
-    'blue':   [((95,  50,  40),  (135, 255, 255))],
-    'yellow': [((20,  60,  60),  (45,  255, 255))],
-    'green':  [((35,  40,  40),  (90,  255, 255))],
-    'orange': [((8,   100, 80),  (20,  255, 255))],
-}
+# COLOR_RANGES = {
+#     'red':    [((0,   80,  50),  (10,  255, 255)),
+#                ((165, 80,  50),  (180, 255, 255))],
+#     'blue':   [((95,  50,  40),  (135, 255, 255))],
+#     'yellow': [((20,  60,  60),  (45,  255, 255))],
+#     'green':  [((35,  40,  40),  (90,  255, 255))],
+#     'orange': [((8,   100, 80),  (20,  255, 255))],
+# }
 
 
 class ExploreAndFind(Node):
@@ -122,7 +123,7 @@ class ExploreAndFind(Node):
     MAP_PUBLISH_RATE = 1.0   # Hz
 
     # ── 360 scan ─────────────────────────────────────────────────────────────
-    SCAN_ANGULAR_VEL = 0.4   # rad/s
+    SCAN_ANGULAR_VEL = 0.3   # rad/s
     SCAN_SETTLE_TIME = 0.5   # s
 
     # ── Frontier selection ────────────────────────────────────────────────────
@@ -135,7 +136,7 @@ class ExploreAndFind(Node):
     NO_FRONTIER_LIMIT  = 3
     WAYPOINT_SPACING   = 20
     WAYPOINT_TOLERANCE = 0.3    # m
-    NAV_LINEAR_SPEED   = 0.35   # m/s
+    NAV_LINEAR_SPEED   = 0.2   # m/s
     OBSTACLE_THRESHOLD = 0.8    # m
     DEPTH_STEER_TIMEOUT = 3.0  # s — force re-plan after steering this long
 
@@ -181,16 +182,21 @@ class ExploreAndFind(Node):
         self.nav_waypoints     = []
         self.nav_waypoint_idx  = 0
         self.last_cmd_angular  = 0.0
+        self.last_approach_replan = 0.0
 
         # Object detection state
-        self.declare_parameter('target_color', 'red')
-        self.target_color = (
-            self.get_parameter('target_color')
-            .get_parameter_value().string_value)
-        if self.target_color not in COLOR_RANGES:
-            self.get_logger().error(
-                f'Unknown target_color "{self.target_color}". Using "red".')
-            self.target_color = 'red'
+        # self.declare_parameter('target_color', 'red')
+        # self.target_color = (
+        #     self.get_parameter('target_color')
+        #     .get_parameter_value().string_value)
+        # if self.target_color not in COLOR_RANGES:
+        #     self.get_logger().error(
+        #         f'Unknown target_color "{self.target_color}". Using "red".')
+        #     self.target_color = 'red'
+
+        # Object detection state (YOLO version)
+        self.declare_parameter('target_class_id', 46) # Default to 46 (e.g., banana/apple)
+        self.target_class_id = self.get_parameter('target_class_id').get_parameter_value().integer_value
         self.object_world_pos   = None   # (wx, wy) once confirmed
         self.detection_times    = []     # timestamps of recent detections
         self.last_detection_pos = None   # (wx, wy) of most recent detection
@@ -206,8 +212,14 @@ class ExploreAndFind(Node):
                                  self._depth_cb,       be)
         self.create_subscription(CameraInfo, '/camera/depth/camera_info',
                                  self._camera_info_cb, be)
-        self.create_subscription(Image,      '/camera/color/image_raw',
-                                 self._rgb_cb,         be)
+        # self.create_subscription(Image,      '/camera/color/image_raw',
+        #                          self._rgb_cb,         be)
+        
+        self.bbox_sub = self.create_subscription(
+            Detection2DArray, 
+            '/objbbox', 
+            self._yolo_bbox_cb, 
+            10)
 
         # Publishers
         self.map_pub           = self.create_publisher(
@@ -218,6 +230,14 @@ class ExploreAndFind(Node):
             MarkerArray, '/object_marker', 10)
         self.cmd_vel_pub       = self.create_publisher(
             Twist, '/cmd_vel', 10)
+        latch_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.inflated_map_pub  = self.create_publisher(
+            OccupancyGrid, '/inflated_map', latch_qos)
+        self.nav_path_pub      = self.create_publisher(
+            MarkerArray, '/nav_path', latch_qos)
 
         self.get_logger().info('=' * 55)
         self.get_logger().info(
@@ -249,17 +269,17 @@ class ExploreAndFind(Node):
             if abs(self.last_cmd_angular) <= self.MAX_MAPPING_ANGULAR_VEL:
                 self._integrate_depth()
 
-    def _rgb_cb(self, msg: Image):
-        try:
-            self.latest_rgb = self.cv_bridge.imgmsg_to_cv2(msg, 'bgr8')
-        except Exception as e:
-            self.get_logger().warn(f'RGB conversion failed: {e}')
-            return
-        if not hasattr(self, '_rgb_logged'):
-            self._rgb_logged = True
-            h, w = self.latest_rgb.shape[:2]
-            self.get_logger().info(
-                f'[RGB] First frame: {w}x{h} encoding={msg.encoding}')
+    # def _rgb_cb(self, msg: Image):
+    #     try:
+    #         self.latest_rgb = self.cv_bridge.imgmsg_to_cv2(msg, 'bgr8')
+    #     except Exception as e:
+    #         self.get_logger().warn(f'RGB conversion failed: {e}')
+    #         return
+    #     if not hasattr(self, '_rgb_logged'):
+    #         self._rgb_logged = True
+    #         h, w = self.latest_rgb.shape[:2]
+    #         self.get_logger().info(
+    #             f'[RGB] First frame: {w}x{h} encoding={msg.encoding}')
 
     def _camera_info_cb(self, msg: CameraInfo):
         self.camera_K = np.array(msg.k).reshape(3, 3)
@@ -584,7 +604,10 @@ class ExploreAndFind(Node):
     def _is_path_blocked(self):
         nav_clear = getattr(self, 'nav_clearance', None)
         inflated = self._compute_inflated(nav_clear)
-        for i in range(self.nav_waypoint_idx, len(self.nav_waypoints)):
+        # Only look 3 waypoints ahead — distant map noise should not trigger
+        # a replan; the robot will reroute when it gets closer.
+        lookahead = min(self.nav_waypoint_idx + 3, len(self.nav_waypoints))
+        for i in range(self.nav_waypoint_idx, lookahead):
             gx, gy = self.nav_waypoints[i]
             if self.in_grid(gx, gy) and inflated[gy, gx]:
                 return True
@@ -606,6 +629,7 @@ class ExploreAndFind(Node):
 
         self.nav_waypoints = path
         self.nav_waypoint_idx = 0
+        self.publish_nav_path()
         self.get_logger().info(
             f'[NAV] Re-planned: {len(path)} waypoints from '
             f'({bx:.2f},{by:.2f})')
@@ -620,7 +644,7 @@ class ExploreAndFind(Node):
 
         h, w = depth.shape
         v_start = int(h * 0.3)
-        v_end   = int(h * 0.8)
+        v_end   = int(h * 0.55)  # stop at 55% to avoid floor returns
         margin = int(w * self.DEPTH_H_CROP)
         u_start = margin
         u_end   = w - margin
@@ -631,7 +655,8 @@ class ExploreAndFind(Node):
         right_region  = depth[v_start:v_end, u_start + 2 * third:u_end]
 
         def sector_min_dist(region):
-            valid = region[region > 0].astype(np.float64)
+            min_mm = self.MIN_DEPTH_M * 1000.0
+            valid = region[(region > min_mm)].astype(np.float64)
             if len(valid) == 0:
                 return 999.0
             return float(np.percentile(valid, 10)) / 1000.0
@@ -656,77 +681,104 @@ class ExploreAndFind(Node):
 
     # ── Object detection ──────────────────────────────────────────────────────
 
-    def _check_for_object(self):
-        """Check latest RGB frame for target colored cube.
+    # def _check_for_object(self):
+    #     """Check latest RGB frame for target colored cube.
 
-        Runs HSV color filtering, finds the largest matching blob, and
-        estimates its world position via depth back-projection.  Requires
-        DETECT_COUNT_REQ detections within DETECT_WINDOW seconds to confirm.
+    #     Runs HSV color filtering, finds the largest matching blob, and
+    #     estimates its world position via depth back-projection.  Requires
+    #     DETECT_COUNT_REQ detections within DETECT_WINDOW seconds to confirm.
 
-        Returns True when the object is confirmed.
-        """
-        if self.latest_rgb is None or self.camera_K is None:
-            return False
+    #     Returns True when the object is confirmed.
+    #     """
+    #     if self.latest_rgb is None or self.camera_K is None:
+    #         return False
 
-        hsv = cv2.cvtColor(self.latest_rgb, cv2.COLOR_BGR2HSV)
+    #     hsv = cv2.cvtColor(self.latest_rgb, cv2.COLOR_BGR2HSV)
 
-        # Build color mask from all HSV ranges for the target color
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for lower, upper in COLOR_RANGES.get(self.target_color, []):
-            mask |= cv2.inRange(hsv, np.array(lower), np.array(upper))
+    #     # Build color mask from all HSV ranges for the target color
+    #     mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    #     for lower, upper in COLOR_RANGES.get(self.target_color, []):
+    #         mask |= cv2.inRange(hsv, np.array(lower), np.array(upper))
 
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return False
+    #     contours, _ = cv2.findContours(
+    #         mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    #     if not contours:
+    #         return False
 
-        # Take the largest blob
-        largest = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(largest)
-        if area < self.MIN_DETECTION_AREA:
-            return False
+    #     # Take the largest blob
+    #     largest = max(contours, key=cv2.contourArea)
+    #     area = cv2.contourArea(largest)
+    #     if area < self.MIN_DETECTION_AREA:
+    #         return False
 
-        # Centroid of the blob
-        M = cv2.moments(largest)
-        if M['m00'] == 0:
-            return False
-        cu = int(M['m10'] / M['m00'])
-        cv_pt = int(M['m01'] / M['m00'])
+    #     # Centroid of the blob
+    #     M = cv2.moments(largest)
+    #     if M['m00'] == 0:
+    #         return False
+    #     cu = int(M['m10'] / M['m00'])
+    #     cv_pt = int(M['m01'] / M['m00'])
 
-        # Estimate world position using depth
-        pos = self._estimate_object_position(cu, cv_pt)
-        if pos is None:
-            return False
+    #     # Estimate world position using depth
+    #     pos = self._estimate_object_position(cu, cv_pt)
+    #     if pos is None:
+    #         return False
 
-        # Check consistency — if position jumped far, reset window
-        if self.last_detection_pos is not None:
-            d = np.hypot(pos[0] - self.last_detection_pos[0],
-                         pos[1] - self.last_detection_pos[1])
-            if d > 1.0:
-                self.detection_times = []
+    #     # Check consistency — if position jumped far, reset window
+    #     if self.last_detection_pos is not None:
+    #         d = np.hypot(pos[0] - self.last_detection_pos[0],
+    #                      pos[1] - self.last_detection_pos[1])
+    #         if d > 1.0:
+    #             self.detection_times = []
 
-        now = time.time()
-        self.detection_times.append(now)
-        self.last_detection_pos = pos
+    #     now = time.time()
+    #     self.detection_times.append(now)
+    #     self.last_detection_pos = pos
 
-        # Prune old detections outside the window
-        cutoff = now - self.DETECT_WINDOW
-        self.detection_times = [t for t in self.detection_times if t >= cutoff]
+    #     # Prune old detections outside the window
+    #     cutoff = now - self.DETECT_WINDOW
+    #     self.detection_times = [t for t in self.detection_times if t >= cutoff]
 
-        self.get_logger().info(
-            f'[DETECT] {self.target_color} candidate at '
-            f'({pos[0]:.2f}, {pos[1]:.2f}) area={area:.0f} '
-            f'count={len(self.detection_times)}/{self.DETECT_COUNT_REQ} '
-            f'in {self.DETECT_WINDOW}s window')
+    #     self.get_logger().info(
+    #         f'[DETECT] {self.target_color} candidate at '
+    #         f'({pos[0]:.2f}, {pos[1]:.2f}) area={area:.0f} '
+    #         f'count={len(self.detection_times)}/{self.DETECT_COUNT_REQ} '
+    #         f'in {self.DETECT_WINDOW}s window')
 
-        if len(self.detection_times) >= self.DETECT_COUNT_REQ:
-            self.object_world_pos = pos
-            self.get_logger().info(
-                f'[DETECT] *** {self.target_color} cube CONFIRMED at '
-                f'({pos[0]:.2f}, {pos[1]:.2f}) ***')
-            return True
+    #     if len(self.detection_times) >= self.DETECT_COUNT_REQ:
+    #         self.object_world_pos = pos
+    #         self.get_logger().info(
+    #             f'[DETECT] *** {self.target_color} cube CONFIRMED at '
+    #             f'({pos[0]:.2f}, {pos[1]:.2f}) ***')
+    #         return True
 
-        return False
+    #     return False
+
+    def _yolo_bbox_cb(self, msg: Detection2DArray):
+        """Callback for YOLO detections from the ObjectClassifier node."""
+        if self.state == ExploreState.COMPLETE:
+            return
+
+        for detection in msg.detections:
+            # Get the class ID (e.g., '0' for person, '46' for apple/bin depending on your model)
+            class_id = detection.results[0].hypothesis.class_id
+            
+            # Check if this is the object we want
+            # Note: You'll need to map your YOLO IDs to the 'target_color' logic
+            if class_id == self.target_class_id:  # Example: 46 is 'banana' or your target object
+                u = int(detection.bbox.center.position.x)
+                v = int(detection.bbox.center.position.y)
+
+                # Estimate world position using existing depth back-projection
+                pos = self._estimate_object_position(u, v)
+                
+                if pos is not None:
+                    self.object_world_pos = pos
+                    self.get_logger().info(f'*** YOLO Object {class_id} CONFIRMED at {pos} ***')
+                    
+                    # Switch state to APPROACHING
+                    if self.state != ExploreState.APPROACHING:
+                        self.state = ExploreState.APPROACHING
+                        self._plan_approach()
 
     def _estimate_object_position(self, u, v):
         """Estimate world (x, y) of pixel (u, v) using depth + TF."""
@@ -833,6 +885,7 @@ class ExploreAndFind(Node):
                 self.nav_waypoint_idx = 0
                 self.nav_start_time   = time.time()
                 self.nav_clearance    = clearance
+                self.publish_nav_path()
                 self.state = ExploreState.APPROACHING
                 self.get_logger().info(
                     f'[APPROACH] Path to {self.target_color} cube at '
@@ -1046,6 +1099,8 @@ class ExploreAndFind(Node):
         msg.info.origin.orientation.w = 1.0
         msg.data = grid.ravel().tolist()
         self.map_pub.publish(msg)
+        self.publish_inflated_map()
+        self.publish_nav_path()
 
     def publish_frontiers(self, frontiers):
         ma = MarkerArray()
@@ -1067,6 +1122,60 @@ class ExploreAndFind(Node):
             m.lifetime.sec = 5
             ma.markers.append(m)
         self.frontier_pub.publish(ma)
+
+    def publish_inflated_map(self):
+        """Publish the A*-inflated obstacle layer as a second OccupancyGrid."""
+        inflated = self._compute_inflated()
+        confirmed_occ = ((self.log_odds >= self.LOG_ODDS_OCC_THRESH) &
+                         (self.hit_count >= self.MIN_HIT_COUNT))
+        grid = np.zeros((self.GRID_SIZE, self.GRID_SIZE), dtype=np.int8)
+        grid[inflated] = 50          # inflated zone — grey
+        grid[confirmed_occ] = 100    # real obstacle — black
+        grid[(self.hit_count == 0) & (self.log_odds == 0.0)] = -1  # unknown
+
+        msg = OccupancyGrid()
+        msg.header.stamp              = self.get_clock().now().to_msg()
+        msg.header.frame_id           = 'odom'
+        msg.info                      = MapMetaData()
+        msg.info.resolution           = self.GRID_RESOLUTION
+        msg.info.width                = self.GRID_SIZE
+        msg.info.height               = self.GRID_SIZE
+        msg.info.origin.position.x    = float(self.GRID_ORIGIN_X)
+        msg.info.origin.position.y    = float(self.GRID_ORIGIN_Y)
+        msg.info.origin.position.z    = 0.0
+        msg.info.origin.orientation.w = 1.0
+        msg.data = grid.ravel().tolist()
+        self.inflated_map_pub.publish(msg)
+
+    def publish_nav_path(self):
+        """Publish the current planned waypoints as a LINE_STRIP marker."""
+        ma = MarkerArray()
+        # Clear old path
+        del_m = Marker()
+        del_m.header.stamp    = self.get_clock().now().to_msg()
+        del_m.header.frame_id = 'odom'
+        del_m.ns              = 'nav_path'
+        del_m.action          = Marker.DELETEALL
+        ma.markers.append(del_m)
+
+        if self.nav_waypoints:
+            m = Marker()
+            m.header.stamp    = self.get_clock().now().to_msg()
+            m.header.frame_id = 'odom'
+            m.ns              = 'nav_path'
+            m.id              = 0
+            m.type            = Marker.LINE_STRIP
+            m.action          = Marker.ADD
+            m.scale.x         = 0.06
+            m.color           = ColorRGBA(r=0.0, g=0.6, b=1.0, a=1.0)
+            m.pose.orientation.w = 1.0
+            for gx, gy in self.nav_waypoints:
+                wx, wy = self.grid_to_world(gx, gy)
+                p = Point(); p.x = wx; p.y = wy; p.z = 0.05
+                m.points.append(p)
+            ma.markers.append(m)
+
+        self.nav_path_pub.publish(ma)
 
     # ── State machine ─────────────────────────────────────────────────────────
 
@@ -1183,6 +1292,7 @@ class ExploreAndFind(Node):
                 self.nav_waypoint_idx = 0
                 self.nav_start_time   = time.time()
                 self.nav_clearance    = clearance
+                self.publish_nav_path()
                 self.state = ExploreState.NAVIGATING
                 return
 
@@ -1322,50 +1432,68 @@ class ExploreAndFind(Node):
         # ── Refine object position while approaching ──────────────
         # Re-detect the object to update position estimate as we get closer
         # (depth accuracy improves at shorter range).
-        if self.latest_rgb is not None and self.camera_K is not None:
-            hsv = cv2.cvtColor(self.latest_rgb, cv2.COLOR_BGR2HSV)
-            mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-            for lower, upper in COLOR_RANGES.get(self.target_color, []):
-                mask |= cv2.inRange(hsv, np.array(lower), np.array(upper))
-            contours, _ = cv2.findContours(
-                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if contours:
-                largest = max(contours, key=cv2.contourArea)
-                area = cv2.contourArea(largest)
-                if area >= self.MIN_DETECTION_AREA:
-                    M = cv2.moments(largest)
-                    if M['m00'] > 0:
-                        cu = int(M['m10'] / M['m00'])
-                        cv_pt = int(M['m01'] / M['m00'])
-                        new_pos = self._estimate_object_position(cu, cv_pt)
-                        if new_pos is not None:
-                            old_ox, old_oy = self.object_world_pos
-                            shift = np.hypot(
-                                new_pos[0] - old_ox, new_pos[1] - old_oy)
-                            # Only update if shift is reasonable (< 1.5m)
-                            # to avoid jumping to a different object
-                            if shift < 1.5:
-                                self.object_world_pos = new_pos
-                                if shift > 0.15:
-                                    self.get_logger().info(
-                                        f'[APPROACH] Refined position: '
-                                        f'({new_pos[0]:.2f}, {new_pos[1]:.2f}) '
-                                        f'shift={shift:.2f}m')
-                                    # Re-plan path to updated position
-                                    goal_gx, goal_gy = self.world_to_grid(
-                                        new_pos[0], new_pos[1])
-                                    robot_gx, robot_gy = self.world_to_grid(
-                                        bx, by)
-                                    for cl in [None, self.ROBOT_CLEARANCE * 0.5]:
-                                        path = self._plan_path(
-                                            robot_gx, robot_gy,
-                                            goal_gx, goal_gy,
-                                            clearance_m=cl)
-                                        if path is not None:
-                                            self.nav_waypoints = path
-                                            self.nav_waypoint_idx = 0
-                                            self.nav_clearance = cl
-                                            break
+        # if self.latest_rgb is not None and self.camera_K is not None:
+        #     hsv = cv2.cvtColor(self.latest_rgb, cv2.COLOR_BGR2HSV)
+        #     mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        #     for lower, upper in COLOR_RANGES.get(self.target_color, []):
+        #         mask |= cv2.inRange(hsv, np.array(lower), np.array(upper))
+        #     contours, _ = cv2.findContours(
+        #         mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        #     if contours:
+        #         largest = max(contours, key=cv2.contourArea)
+        #         area = cv2.contourArea(largest)
+                # if area >= self.MIN_DETECTION_AREA:
+                #     M = cv2.moments(largest)
+                #     if M['m00'] > 0:
+                #         cu = int(M['m10'] / M['m00'])
+                #         cv_pt = int(M['m01'] / M['m00'])
+                #         new_pos = self._estimate_object_position(cu, cv_pt)
+        if hasattr(self, 'latest_yolo_detection') and self.latest_yolo_detection is not None:
+            det = self.latest_yolo_detection
+            u = int(det.bbox.center.position.x)
+            v = int(det.bbox.center.position.y)
+            
+            new_pos = self._estimate_object_position(u, v)
+            if new_pos is not None:
+                old_ox, old_oy = self.object_world_pos
+                shift = np.hypot(
+                    new_pos[0] - old_ox, new_pos[1] - old_oy)
+                # Only update if shift is small; depth back-
+                # projection is noisy at range so cap at 0.5m.
+                # Apply EMA smoothing to prevent single noisy
+                # readings from jumping the estimate.
+                if shift < 0.5:
+                    alpha = 0.4  # blend weight for new reading
+                    smoothed = (
+                        alpha * new_pos[0] + (1 - alpha) * old_ox,
+                        alpha * new_pos[1] + (1 - alpha) * old_oy,
+                    )
+                    self.object_world_pos = smoothed
+                    new_pos = smoothed
+                    shift = np.hypot(
+                        smoothed[0] - old_ox,
+                        smoothed[1] - old_oy)
+                    if shift > 0.15:
+                        self.get_logger().info(
+                            f'[APPROACH] Refined position: '
+                            f'({new_pos[0]:.2f}, {new_pos[1]:.2f}) '
+                            f'shift={shift:.2f}m')
+                        # Re-plan path to updated position
+                        goal_gx, goal_gy = self.world_to_grid(
+                            new_pos[0], new_pos[1])
+                        robot_gx, robot_gy = self.world_to_grid(
+                            bx, by)
+                        for cl in [None, self.ROBOT_CLEARANCE * 0.5]:
+                            path = self._plan_path(
+                                robot_gx, robot_gy,
+                                goal_gx, goal_gy,
+                                clearance_m=cl)
+                            if path is not None:
+                                self.nav_waypoints = path
+                                self.nav_waypoint_idx = 0
+                                self.nav_clearance = cl
+                                self.publish_nav_path()
+                                break
 
         # Check distance to object
         ox, oy = self.object_world_pos
@@ -1378,8 +1506,10 @@ class ExploreAndFind(Node):
             self.state = ExploreState.COMPLETE
             return
 
-        # Re-plan if path blocked
-        if self._is_path_blocked():
+        # Re-plan if path blocked — rate-limited to avoid thrashing
+        if (self._is_path_blocked() and
+                now - self.last_approach_replan > 2.0):
+            self.last_approach_replan = now
             self.get_logger().info('[APPROACH] Path blocked — re-planning...')
             if not self._replan_from_here():
                 self._stop_base()
@@ -1406,6 +1536,7 @@ class ExploreAndFind(Node):
                     self.nav_waypoint_idx = 0
                     self.nav_start_time = time.time()
                     self.nav_clearance = clearance
+                    self.publish_nav_path()
                     return
             # Give up
             self._stop_base()
@@ -1454,48 +1585,16 @@ class ExploreAndFind(Node):
         left_dist, center_dist, right_dist = distances
         min_dist = min(left_dist, center_dist, right_dist)
 
-        if not center_clear:
-            if self.depth_steer_start is None:
-                self.depth_steer_start = now
-            elif now - self.depth_steer_start > self.DEPTH_STEER_TIMEOUT:
-                self.get_logger().info(
-                    '[APPROACH] Stuck on depth obstacle — forcing re-plan.')
-                self.depth_steer_start = None
-                self._stop_base()
-                goal_gx, goal_gy = self.world_to_grid(ox, oy)
-                robot_gx, robot_gy = self.world_to_grid(bx, by)
-                replanned = False
-                for cl in [None, self.ROBOT_CLEARANCE * 0.5]:
-                    path = self._plan_path(
-                        robot_gx, robot_gy, goal_gx, goal_gy,
-                        clearance_m=cl)
-                    if path is not None:
-                        self.nav_waypoints = path
-                        self.nav_waypoint_idx = 0
-                        self.nav_start_time = time.time()
-                        self.nav_clearance = cl
-                        replanned = True
-                        break
-                if not replanned:
-                    self.get_logger().warn(
-                        '[APPROACH] Re-plan failed — re-selecting.')
-                    self.state = ExploreState.SELECTING
-                return
-            if left_dist > right_dist:
-                cmd.angular.z = 1.0
-            elif right_dist > left_dist:
-                cmd.angular.z = -1.0
-            else:
-                cmd.angular.z = 1.0
-            cmd.linear.x = 0.0
-        else:
-            self.depth_steer_start = None
-            alignment = max(0.0, np.cos(heading_error))
-            speed = self.NAV_LINEAR_SPEED * alignment
-            if min_dist < 1.5:
-                speed *= min(min_dist / 1.5, 1.0)
-            cmd.linear.x = float(min(speed, dist * 0.5))
-            cmd.angular.z = float(np.clip(2.0 * heading_error, -1.2, 1.2))
+        # During approach, trust the A* path for obstacle avoidance.
+        # Depth steering is skipped here because the floor and the target
+        # object itself cause persistent false "center blocked" readings.
+        # A hard safety stop is kept for truly close obstacles.
+        alignment = max(0.0, np.cos(heading_error))
+        speed = self.NAV_LINEAR_SPEED * alignment
+        if min_dist < 1.5:
+            speed *= min(min_dist / 1.5, 1.0)
+        cmd.linear.x = float(min(speed, dist * 0.5))
+        cmd.angular.z = float(np.clip(2.0 * heading_error, -1.2, 1.2))
 
         if min_dist < 0.35:
             cmd.linear.x = 0.0
