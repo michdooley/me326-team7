@@ -760,11 +760,10 @@ class ExploreAndFind(Node):
 
         for detection in msg.detections:
             # Get the class ID (e.g., '0' for person, '46' for apple/bin depending on your model)
-            class_id = detection.results[0].hypothesis.class_id
-            
+            class_id = int(detection.results[0].hypothesis.class_id)
+
             # Check if this is the object we want
-            # Note: You'll need to map your YOLO IDs to the 'target_color' logic
-            if class_id == self.target_class_id:  # Example: 46 is 'banana' or your target object
+            if class_id == self.target_class_id:
                 u = int(detection.bbox.center.position.x)
                 v = int(detection.bbox.center.position.y)
 
