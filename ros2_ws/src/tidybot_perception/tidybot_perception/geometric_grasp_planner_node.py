@@ -11,16 +11,12 @@ Pipeline:
     2. Get depth image + camera intrinsics from RGBDObjectDetector
     3. Look up TF: camera_color_optical_frame <-> base_link
     4. Convert depth to point cloud, crop around object
-    5. Estimate surface normals (Open3D)
+    5. Estimate surface normals (scipy cKDTree + PCA)
     6. Sample antipodal + top-surface grasp candidates
-    7. Score, sort, and validate IK reachability
-    8. Return grasp_pose + pre_grasp_pose
+    7. Score, sort, return best candidate
 
 Services provided:
     /plan_grasp (tidybot_msgs/PlanGrasp)
-
-Services used:
-    /plan_to_target (tidybot_msgs/PlanToTarget) — IK reachability check
 
 Parameters:
     approach_offset (float): Pre-grasp height above grasp (default 0.10m)
@@ -41,10 +37,10 @@ from rclpy.node import Node
 import tf2_ros
 import tf2_geometry_msgs  # noqa: F401
 
-from geometry_msgs.msg import Pose, Point, Quaternion, PointStamped
+from geometry_msgs.msg import Pose, Point, Quaternion
 from scipy.spatial.transform import Rotation
 
-from tidybot_msgs.srv import PlanGrasp, PlanToTarget
+from tidybot_msgs.srv import PlanGrasp
 
 from tidybot_perception.rgbd_object_detector import RGBDObjectDetector
 from tidybot_perception.grasp_geometry import (
@@ -52,9 +48,6 @@ from tidybot_perception.grasp_geometry import (
     GRIPPER_MAX_OPENING_M,
 )
 from tidybot_perception.geometric_grasp_sampler import GeometricGraspSampler
-
-# Default orientation (no yaw) for fallback
-ORIENT_FINGERS_DOWN = (0.5, 0.5, 0.5, -0.5)
 
 
 class GeometricGraspPlannerNode(Node):
@@ -89,10 +82,6 @@ class GeometricGraspPlannerNode(Node):
         # Service
         self.grasp_srv = self.create_service(
             PlanGrasp, '/plan_grasp', self.plan_grasp_callback)
-
-        # Client for IK reachability validation
-        self.plan_to_target_client = self.create_client(
-            PlanToTarget, '/plan_to_target')
 
         self.get_logger().info('GeometricGraspPlannerNode initialized (CPU-only)')
         self.get_logger().info(f'  approach_offset: {self.approach_offset}m')
@@ -147,34 +136,6 @@ class GeometricGraspPlannerNode(Node):
         pt_cam = tf_base_to_cam @ pt
         return pt_cam[:3]
 
-    # ── IK validation ─────────────────────────────────────────────────
-
-    def _check_ik_reachability(self, pose, arm_name, timeout=10.0):
-        """
-        Call /plan_to_target with execute=False to check if a pose is reachable.
-
-        Returns:
-            PlanToTarget.Response or None on failure.
-        """
-        if not self.plan_to_target_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warn('/plan_to_target service not available')
-            return None
-
-        req = PlanToTarget.Request()
-        req.arm_name = arm_name
-        req.target_pose = pose
-        req.use_orientation = True
-        req.execute = False
-        req.duration = 2.0
-        req.max_condition_number = 100.0
-
-        future = self.plan_to_target_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
-
-        if not future.done() or future.exception():
-            return None
-        return future.result()
-
     # ── Main service callback ─────────────────────────────────────────
 
     def plan_grasp_callback(self, request, response):
@@ -194,8 +155,10 @@ class GeometricGraspPlannerNode(Node):
 
         # Check camera data
         if self.detector.latest_depth is None or self.detector.camera_info is None:
-            self.get_logger().warn('No depth/camera_info — using fallback')
-            return self._fallback_grasp(ox, oy, oz, arm, response)
+            self.get_logger().warn('No depth/camera_info available')
+            response.success = False
+            response.message = 'No depth/camera_info available'
+            return response
 
         # Get camera intrinsics
         K = self.detector.camera_info.k
@@ -205,14 +168,18 @@ class GeometricGraspPlannerNode(Node):
         tf_cam_to_base = self._get_tf_matrix(
             'base_link', 'camera_color_optical_frame')
         if tf_cam_to_base is None:
-            self.get_logger().warn('TF lookup failed — using fallback')
-            return self._fallback_grasp(ox, oy, oz, arm, response)
+            self.get_logger().warn('TF lookup failed')
+            response.success = False
+            response.message = 'TF lookup failed (camera → base_link)'
+            return response
 
         # Transform object center to camera frame for cropping
         obj_cam = self._transform_point_to_camera(ox, oy, oz)
         if obj_cam is None:
-            self.get_logger().warn('Could not transform object to camera frame — using fallback')
-            return self._fallback_grasp(ox, oy, oz, arm, response)
+            self.get_logger().warn('Could not transform object to camera frame')
+            response.success = False
+            response.message = 'TF lookup failed (base_link → camera)'
+            return response
 
         # Run geometric grasp sampler
         candidates = self.sampler.plan_grasp(
@@ -223,131 +190,49 @@ class GeometricGraspPlannerNode(Node):
         )
 
         if not candidates:
-            self.get_logger().warn('No geometric grasp candidates — trying centroid sweep')
-            return self._centroid_sweep_grasp(ox, oy, oz, arm, response)
+            self.get_logger().warn('No geometric grasp candidates found')
+            response.success = False
+            response.message = 'No geometric grasp candidates found'
+            return response
 
         self.get_logger().info(
             f'  Geometric sampler found {len(candidates)} candidates')
 
-        # Try each candidate (best score first)
-        for i, cand in enumerate(candidates):
-            gx, gy = float(cand.center[0]), float(cand.center[1])
-            gz = float(cand.center[2]) + self.grasp_z_offset
+        # Return best candidate (highest score — no IK validation here,
+        # the caller handles IK via plan_and_execute)
+        best = candidates[0]
+        gx, gy = float(best.center[0]), float(best.center[1])
+        gz = float(best.center[2]) + self.grasp_z_offset
 
-            # Build grasp orientation from yaw
-            qw, qx, qy, qz = yaw_to_grasp_quaternion(cand.yaw)
+        # Build grasp orientation from yaw
+        qw, qx, qy, qz = yaw_to_grasp_quaternion(best.yaw)
 
-            self.get_logger().info(
-                f'  Candidate {i}: pos=({gx:.3f}, {gy:.3f}, {gz:.3f}) '
-                f'yaw={np.degrees(cand.yaw):.1f}deg '
-                f'width={cand.width*1000:.0f}mm '
-                f'score={cand.total_score:.3f}')
+        self.get_logger().info(
+            f'  Best: pos=({gx:.3f}, {gy:.3f}, {gz:.3f}) '
+            f'yaw={np.degrees(best.yaw):.1f}deg '
+            f'width={best.width*1000:.0f}mm '
+            f'score={best.total_score:.3f}')
 
-            # Build grasp pose
-            grasp_pose = Pose()
-            grasp_pose.position = Point(x=gx, y=gy, z=gz)
-            grasp_pose.orientation = Quaternion(w=qw, x=qx, y=qy, z=qz)
-
-            # Validate IK
-            ik_result = self._check_ik_reachability(grasp_pose, arm)
-            if ik_result is None or not ik_result.success:
-                msg = ik_result.message if ik_result else 'service error'
-                self.get_logger().info(f'    Skipping: IK failed — {msg}')
-                continue
-
-            self.get_logger().info(
-                f'    Selected! IK_err={ik_result.position_error:.4f}m')
-
-            # Build pre-grasp pose (above grasp)
-            pre_grasp_pose = Pose()
-            pre_grasp_pose.position = Point(
-                x=gx, y=gy, z=gz + self.approach_offset)
-            pre_grasp_pose.orientation = grasp_pose.orientation
-
-            response.success = True
-            response.grasp_pose = grasp_pose
-            response.pre_grasp_pose = pre_grasp_pose
-            response.arm_used = arm
-            response.grasp_width = float(cand.width)
-            response.message = (
-                f'Geometric grasp: yaw={np.degrees(cand.yaw):.1f}deg, '
-                f'width={cand.width*1000:.0f}mm, '
-                f'score={cand.total_score:.3f}')
-            return response
-
-        # All geometric candidates failed IK — try centroid sweep
-        self.get_logger().warn('All geometric candidates failed IK — trying centroid sweep')
-        return self._centroid_sweep_grasp(ox, oy, oz, arm, response)
-
-    # ── Centroid sweep fallback ───────────────────────────────────────
-
-    def _centroid_sweep_grasp(self, ox, oy, oz, arm, response):
-        """
-        Fallback: try evenly-spaced yaw angles at the object center.
-        No point cloud analysis — just brute-force IK checks.
-        """
-        grasp_z = oz + self.grasp_z_offset
-
-        for deg in range(0, 180, 30):
-            yaw = np.radians(deg)
-            qw, qx, qy, qz = yaw_to_grasp_quaternion(yaw)
-
-            grasp_pose = Pose()
-            grasp_pose.position = Point(x=float(ox), y=float(oy), z=float(grasp_z))
-            grasp_pose.orientation = Quaternion(w=qw, x=qx, y=qy, z=qz)
-
-            ik_result = self._check_ik_reachability(grasp_pose, arm)
-            if ik_result is not None and ik_result.success:
-                pre_grasp_pose = Pose()
-                pre_grasp_pose.position = Point(
-                    x=float(ox), y=float(oy),
-                    z=float(grasp_z + self.approach_offset))
-                pre_grasp_pose.orientation = grasp_pose.orientation
-
-                response.success = True
-                response.grasp_pose = grasp_pose
-                response.pre_grasp_pose = pre_grasp_pose
-                response.arm_used = arm
-                response.grasp_width = 0.0
-                response.message = f'Centroid sweep: yaw={deg}deg'
-                self.get_logger().info(f'  Centroid sweep selected yaw={deg}deg')
-                return response
-
-        # All yaw angles failed — last resort
-        self.get_logger().warn('Centroid sweep failed — using default orientation')
-        return self._fallback_grasp(ox, oy, oz, arm, response)
-
-    # ── Last-resort fallback ──────────────────────────────────────────
-
-    def _fallback_grasp(self, ox, oy, oz, arm, response):
-        """Use the hardcoded fingers-down orientation (no yaw)."""
-        grasp_z = oz + self.grasp_z_offset
-        qw, qx, qy, qz = ORIENT_FINGERS_DOWN
-
+        # Build grasp pose
         grasp_pose = Pose()
-        grasp_pose.position = Point(x=float(ox), y=float(oy), z=float(grasp_z))
+        grasp_pose.position = Point(x=gx, y=gy, z=gz)
         grasp_pose.orientation = Quaternion(w=qw, x=qx, y=qy, z=qz)
 
+        # Build pre-grasp pose (above grasp)
         pre_grasp_pose = Pose()
         pre_grasp_pose.position = Point(
-            x=float(ox), y=float(oy),
-            z=float(grasp_z + self.approach_offset))
+            x=gx, y=gy, z=gz + self.approach_offset)
         pre_grasp_pose.orientation = grasp_pose.orientation
-
-        # Validate IK
-        ik_result = self._check_ik_reachability(grasp_pose, arm)
-        if ik_result is not None and not ik_result.success:
-            response.success = False
-            response.message = f'Fallback orientation not reachable: {ik_result.message}'
-            return response
 
         response.success = True
         response.grasp_pose = grasp_pose
         response.pre_grasp_pose = pre_grasp_pose
         response.arm_used = arm
-        response.grasp_width = 0.0
-        response.message = 'Fallback: default fingers-down orientation'
-        self.get_logger().info(f'  {response.message}')
+        response.grasp_width = float(best.width)
+        response.message = (
+            f'Geometric grasp: yaw={np.degrees(best.yaw):.1f}deg, '
+            f'width={best.width*1000:.0f}mm, '
+            f'score={best.total_score:.3f}')
         return response
 
 

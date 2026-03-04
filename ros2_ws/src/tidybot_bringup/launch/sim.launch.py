@@ -32,6 +32,7 @@ def launch_setup(context, *args, **kwargs):
     use_sim_time = LaunchConfiguration('use_sim_time')
     use_motion_planner = LaunchConfiguration('use_motion_planner')
     use_grasp_planner = LaunchConfiguration('use_grasp_planner')
+    use_gpd = LaunchConfiguration('use_gpd')
 
     # Package paths
     pkg_bringup = FindPackageShare('tidybot_bringup')
@@ -128,6 +129,22 @@ def launch_setup(context, *args, **kwargs):
         }]
     )
 
+    # GPD (Grasp Pose Detection) 6-DOF grasp detection server
+    gpd_config_path = os.path.join(
+        repo_root, 'ros2_ws', 'src', 'gpd_ros2', 'config', 'eigen_params.cfg')
+    gpd_server = Node(
+        package='gpd_ros2',
+        executable='gpd_detect_grasps_server',
+        name='gpd_detect_grasps_server',
+        output='screen',
+        condition=IfCondition(use_gpd),
+        parameters=[{
+            'config_file': gpd_config_path,
+            'frame_id': 'base_link',
+            'publish_rviz_markers': True,
+        }]
+    )
+
     # RViz
     rviz_config = PathJoinSubstitution([pkg_bringup, 'rviz', 'tidybot.rviz'])
     rviz = Node(
@@ -146,6 +163,7 @@ def launch_setup(context, *args, **kwargs):
         left_arm_controller,
         motion_planner,
         grasp_planner,
+        gpd_server,
         rviz,
     ]
 
@@ -182,6 +200,11 @@ def generate_launch_description():
         description='Launch geometric grasp planner for optimized grasping'
     )
 
+    declare_use_gpd = DeclareLaunchArgument(
+        'use_gpd', default_value='false',
+        description='Launch GPD (Grasp Pose Detection) 6-DOF grasp detection server'
+    )
+
     return LaunchDescription([
         # Arguments
         declare_scene,
@@ -190,6 +213,7 @@ def generate_launch_description():
         declare_use_sim_time,
         declare_use_planner,
         declare_use_grasp_planner,
+        declare_use_gpd,
         # Nodes via OpaqueFunction (resolved after arguments)
         OpaqueFunction(function=launch_setup),
     ])

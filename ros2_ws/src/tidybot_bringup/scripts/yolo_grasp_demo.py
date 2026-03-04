@@ -16,7 +16,7 @@ Usage:
 
     # Target a specific object/arm:
     ros2 run tidybot_bringup yolo_grasp_demo.py --ros-args \
-        -p target:=apple -p arm:=right -p camera_tilt:=0.5
+        -p target:=apple -p arm:=right
 """
 
 import time
@@ -35,10 +35,16 @@ from std_msgs.msg import Float64MultiArray
 from visualization_msgs.msg import Marker
 from std_msgs.msg import ColorRGBA
 from tidybot_msgs.msg import ArmCommand
-from tidybot_msgs.srv import PlanToTarget, PlanGrasp
+from tidybot_msgs.srv import PlanToTarget
 from cv_bridge import CvBridge
+from scipy.spatial.transform import Rotation
 
 from tidybot_perception.coord_converter import CoordConverter
+from tidybot_perception.geometric_grasp_sampler import GeometricGraspSampler
+from tidybot_perception.grasp_geometry import (
+    yaw_to_grasp_quaternion,
+    GRIPPER_MAX_OPENING_M,
+)
 
 # YOLO COCO class name → string ID (must match classifier.py output)
 YOLO_CLASS_IDS = {
@@ -56,13 +62,6 @@ PRE_GRASP_Z_OFFSET = 0.10
 GRASP_Z_OFFSET = 0.00
 LIFT_HEIGHT = 0.15
 
-# Verification
-MAX_GRASP_RETRIES = 3
-VERIFY_ARM_POSE = [0.0, 0.4, -0.3, 0.0, 0.5, 0.0]
-VERIFY_ARM_DURATION = 2.5
-VERIFY_CAMERA_PAN = 0.0
-VERIFY_CAMERA_TILT = 0.3
-VERIFY_CAMERA_SETTLE_TIME = 1.5
 
 
 class YoloGraspDemo(Node):
@@ -74,15 +73,10 @@ class YoloGraspDemo(Node):
         # Parameters
         self.declare_parameter('target', 'banana')
         self.declare_parameter('arm', 'right')
-        self.declare_parameter('camera_tilt', 0.5)
         self.declare_parameter('duration', 2.0)
-        self.declare_parameter('max_retries', MAX_GRASP_RETRIES)
-
         self.target_object = self.get_parameter('target').value
         self.arm_name = self.get_parameter('arm').value
-        self.camera_tilt = self.get_parameter('camera_tilt').value
         self.move_duration = self.get_parameter('duration').value
-        self.max_retries = self.get_parameter('max_retries').value
 
         # TF2
         self.tf_buffer = tf2_ros.Buffer()
@@ -107,8 +101,6 @@ class YoloGraspDemo(Node):
             CameraInfo, '/camera/color/camera_info', self._info_cb, 10)
 
         # Publishers
-        self.pan_tilt_pub = self.create_publisher(
-            Float64MultiArray, '/camera/pan_tilt_cmd', 10)
         self.gripper_pub = self.create_publisher(
             Float64MultiArray, f'/{self.arm_name}_gripper/cmd', 10)
         self.arm_pub = self.create_publisher(
@@ -118,8 +110,13 @@ class YoloGraspDemo(Node):
 
         # Service clients
         self.plan_client = self.create_client(PlanToTarget, '/plan_to_target')
-        self.grasp_planner_client = self.create_client(PlanGrasp, '/plan_grasp')
-        self.grasp_planner_available = False
+
+        # In-process geometric grasp sampler (no service call needed)
+        self.grasp_sampler = GeometricGraspSampler(
+            gripper_max_width=GRIPPER_MAX_OPENING_M,
+            crop_radius=0.06,
+            num_antipodal_samples=200,
+        )
 
     # ── Callbacks ─────────────────────────────────────────────────────
 
@@ -139,15 +136,6 @@ class YoloGraspDemo(Node):
         deadline = time.time() + seconds
         while time.time() < deadline:
             rclpy.spin_once(self, timeout_sec=0.05)
-
-    def set_camera(self, pan=0.0, tilt=0.65):
-        """Publish camera pan/tilt and wait for it to settle."""
-        msg = Float64MultiArray()
-        msg.data = [pan, tilt]
-        for _ in range(5):
-            self.pan_tilt_pub.publish(msg)
-            rclpy.spin_once(self, timeout_sec=0.05)
-        self.spin_for(1.5)
 
     def set_gripper(self, position):
         """Set gripper (0.0 = open, 1.0 = closed)."""
@@ -261,7 +249,6 @@ class YoloGraspDemo(Node):
 
         future = self.plan_client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=15.0)
-
         if not future.done() or future.exception():
             self.get_logger().error(f'  [{label}] service call failed')
             return False
@@ -296,38 +283,11 @@ class YoloGraspDemo(Node):
         qw, qx, qy, qz = ORIENT_FINGERS_DOWN
         return self.make_pose(x, y, z, qw, qx, qy, qz)
 
-    # ── Post-grasp verification ───────────────────────────────────────
-
-    def verify_grasp(self) -> bool:
-        """Present gripper to camera and check YOLO sees the target."""
-        self.get_logger().info('  [verify] Moving arm to present pose...')
-        self.set_arm_joints(VERIFY_ARM_POSE, VERIFY_ARM_DURATION)
-
-        self.get_logger().info('  [verify] Aiming camera at gripper...')
-        self.set_camera(pan=VERIFY_CAMERA_PAN, tilt=VERIFY_CAMERA_TILT)
-        self.spin_for(VERIFY_CAMERA_SETTLE_TIME)
-
-        self.get_logger().info(
-            f'  [verify] Checking for "{self.target_object}" via YOLO...')
-        centroid = self.detect(self.target_object)
-
-        if centroid is not None:
-            u, v = centroid
-            self.get_logger().info(
-                f'  [verify] Object detected at pixel ({u}, {v}) — grasp confirmed')
-            return True
-        else:
-            self.get_logger().warn(
-                f'  [verify] Target "{self.target_object}" not found — grasp failed')
-            return False
-
     # ── Main pipeline ─────────────────────────────────────────────────
 
     def _detect_object(self):
-        """Point camera at table and localize the target via YOLO."""
-        self.get_logger().info('Setting camera tilt')
-        self.set_camera(pan=0.0, tilt=self.camera_tilt)
-        self.spin_for(2.0)
+        """Localize the target via YOLO (camera angle set by keyframe)."""
+        self.spin_for(1.0)
 
         self.get_logger().info(f'Detecting "{self.target_object}" via YOLO classifier')
 
@@ -350,47 +310,86 @@ class YoloGraspDemo(Node):
             f'  Object in base_link: ({ox:.3f}, {oy:.3f}, {oz:.3f})')
         return (ox, oy, oz, base_pt)
 
-    def _call_plan_grasp(self, base_pt):
-        """Call /plan_grasp service. Returns PlanGrasp.Response or None."""
-        if not self.grasp_planner_available:
+    def _get_tf_matrix(self, target_frame, source_frame):
+        """Look up TF and return as a 4x4 numpy matrix, or None."""
+        try:
+            import rclpy.time
+            import rclpy.duration
+            transform = self.tf_buffer.lookup_transform(
+                target_frame, source_frame,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=1.0))
+            t = transform.transform.translation
+            q = transform.transform.rotation
+            rot = Rotation.from_quat([q.x, q.y, q.z, q.w])
+            mat = np.eye(4, dtype=np.float32)
+            mat[:3, :3] = rot.as_matrix().astype(np.float32)
+            mat[:3, 3] = [t.x, t.y, t.z]
+            return mat
+        except Exception as e:
+            self.get_logger().error(f'TF lookup failed: {e}')
             return None
 
-        req = PlanGrasp.Request()
-        req.object_position = base_pt
-        req.object_class = self.target_object
-        req.arm_name = self.arm_name
-
-        self.get_logger().info('  Calling /plan_grasp for geometric grasp...')
-        future = self.grasp_planner_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=30.0)
-
-        if not future.done() or future.exception():
-            self.get_logger().warn('  /plan_grasp call failed')
+    def _plan_grasp_local(self, ox, oy, oz):
+        """Run geometric grasp sampler in-process. Returns (grasp_pose, pre_grasp_pose) or None."""
+        if self.latest_depth is None or self.camera_info is None:
+            self.get_logger().warn('No depth/camera_info for grasp planning')
             return None
 
-        result = future.result()
-        if result.success:
-            self.get_logger().info(f'  Grasp planner: {result.message}')
-        else:
-            self.get_logger().warn(f'  Grasp planner failed: {result.message}')
-        return result
+        K = self.camera_info.k
+        fx, fy, cx, cy = K[0], K[4], K[2], K[5]
+
+        tf_cam_to_base = self._get_tf_matrix('base_link', 'camera_color_optical_frame')
+        if tf_cam_to_base is None:
+            return None
+
+        # Transform object to camera frame for cropping
+        tf_base_to_cam = self._get_tf_matrix('camera_color_optical_frame', 'base_link')
+        if tf_base_to_cam is None:
+            return None
+        obj_cam = (tf_base_to_cam @ np.array([ox, oy, oz, 1.0], dtype=np.float32))[:3]
+
+        self.get_logger().info('  Running geometric grasp sampler...')
+        candidates = self.grasp_sampler.plan_grasp(
+            self.latest_depth, (fx, fy, cx, cy), obj_cam, tf_cam_to_base)
+
+        if not candidates:
+            self.get_logger().warn('  No grasp candidates found')
+            return None
+
+        best = candidates[0]
+        gx, gy = float(best.center[0]), float(best.center[1])
+        gz = float(best.center[2]) + GRASP_Z_OFFSET
+
+        qw, qx, qy, qz = yaw_to_grasp_quaternion(best.yaw)
+
+        self.get_logger().info(
+            f'  Best grasp: pos=({gx:.3f}, {gy:.3f}, {gz:.3f}) '
+            f'yaw={np.degrees(best.yaw):.1f}deg '
+            f'width={best.width*1000:.0f}mm '
+            f'score={best.total_score:.3f}')
+
+        grasp_pose = Pose()
+        grasp_pose.position = Point(x=gx, y=gy, z=gz)
+        grasp_pose.orientation = Quaternion(w=qw, x=qx, y=qy, z=qz)
+
+        pre_grasp_pose = Pose()
+        pre_grasp_pose.position = Point(x=gx, y=gy, z=gz + PRE_GRASP_Z_OFFSET)
+        pre_grasp_pose.orientation = grasp_pose.orientation
+
+        return (grasp_pose, pre_grasp_pose)
 
     def _execute_grasp(self, ox, oy, oz, base_pt=None):
         """Run pre-grasp → grasp → close sequence. Returns True on success."""
-        grasp_result = None
-        if base_pt is not None:
-            grasp_result = self._call_plan_grasp(base_pt)
+        result = self._plan_grasp_local(ox, oy, oz)
 
-        if grasp_result is not None and grasp_result.success:
-            pre_grasp_pose = grasp_result.pre_grasp_pose
-            grasp_pose = grasp_result.grasp_pose
+        if result is not None:
+            grasp_pose, pre_grasp_pose = result
             self.get_logger().info('  Using geometric grasp planner')
         else:
-            grasp_z = oz + GRASP_Z_OFFSET
-            pre_grasp_z = grasp_z + PRE_GRASP_Z_OFFSET
-            pre_grasp_pose = self.grasp_pose_at(ox, oy, pre_grasp_z)
-            grasp_pose = self.grasp_pose_at(ox, oy, grasp_z)
-            self.get_logger().info('  Using default fingers-down orientation')
+            self.get_logger().error(
+                '  Geometric grasp planner failed — aborting grasp')
+            return False
 
         # Debug markers
         gp = grasp_pose.position
@@ -425,8 +424,6 @@ class YoloGraspDemo(Node):
         self.get_logger().info('YOLO Grasp Demo (geometric planner)')
         self.get_logger().info(f'  Target       : {self.target_object}')
         self.get_logger().info(f'  Arm          : {self.arm_name}')
-        self.get_logger().info(f'  Camera tilt  : {self.camera_tilt}')
-        self.get_logger().info(f'  Max retries  : {self.max_retries}')
         self.get_logger().info('=' * 50)
 
         # Wait for motion planner
@@ -435,16 +432,7 @@ class YoloGraspDemo(Node):
             self.get_logger().info('  ...waiting')
         self.get_logger().info('Service available.')
 
-        # Check for grasp planner
-        self.get_logger().info('Checking for /plan_grasp service (3s timeout)...')
-        self.grasp_planner_available = \
-            self.grasp_planner_client.wait_for_service(timeout_sec=3.0)
-        if self.grasp_planner_available:
-            self.get_logger().info(
-                'Geometric grasp planner available — using optimized grasps')
-        else:
-            self.get_logger().warn(
-                'Grasp planner not available — using default orientation')
+        self.get_logger().info('Geometric grasp sampler ready (in-process, no service)')
 
         # Wait for YOLO detections to start flowing
         self.get_logger().info('Waiting for YOLO classifier (/objbbox)...')
@@ -457,43 +445,19 @@ class YoloGraspDemo(Node):
                 'No YOLO detections received — is classifier running? '
                 '(ros2 run object_classification classifier)')
 
-        # ── Grasp + verify loop ───────────────────────────────────────
-        grasp_confirmed = False
-        for attempt in range(1, self.max_retries + 1):
-            self.get_logger().info('')
-            self.get_logger().info(f'=== Grasp attempt {attempt}/{self.max_retries} ===')
+        # ── Detect + grasp ────────────────────────────────────────────
+        detection = self._detect_object()
+        if detection is None:
+            self.get_logger().error('Object detection failed — aborting')
+            return
+        ox, oy, oz, base_pt = detection
 
-            detection = self._detect_object()
-            if detection is None:
-                self.get_logger().error('Object detection failed — aborting')
-                return
-            ox, oy, oz, base_pt = detection
-
-            if not self._execute_grasp(ox, oy, oz, base_pt):
-                self.get_logger().error('Grasp execution failed — aborting')
-                return
-
-            self.get_logger().info('Verifying grasp...')
-            if self.verify_grasp():
-                grasp_confirmed = True
-                break
-
-            self.get_logger().warn(
-                f'Grasp verification failed (attempt {attempt}/{self.max_retries})')
-            self.set_gripper(0.0)
-            time.sleep(0.5)
-            self.go_home()
-
-        if not grasp_confirmed:
-            self.get_logger().error(
-                f'Grasp failed after {self.max_retries} attempts — giving up')
+        if not self._execute_grasp(ox, oy, oz, base_pt):
+            self.get_logger().error('Grasp execution failed — aborting')
             self.go_home()
             return
 
-        # ── Grasp confirmed — lift and place ──────────────────────────
-        self.get_logger().info('')
-        self.get_logger().info('Grasp confirmed — proceeding to lift')
-
+        # ── Lift and place ────────────────────────────────────────────
         grasp_z = oz + GRASP_Z_OFFSET
         pre_grasp_z = grasp_z + PRE_GRASP_Z_OFFSET
 

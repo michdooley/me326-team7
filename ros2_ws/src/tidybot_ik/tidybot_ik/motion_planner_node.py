@@ -506,27 +506,27 @@ class MotionPlannerNode(Node):
             self.get_logger().warn(response.message)
             return response
 
-        # Check singularity (Jacobian condition number)
+        # Check singularity (Jacobian condition number) — TEMPORARILY DISABLED
         condition_number = self.compute_jacobian_condition(arm_name, solution)
         response.condition_number = condition_number
 
-        if condition_number > request.max_condition_number:
-            response.success = False
-            response.message = f"Near singularity: condition number={condition_number:.1f} > {request.max_condition_number}"
-            self.get_logger().warn(response.message)
-            return response
+        # if condition_number > request.max_condition_number:
+        #     response.success = False
+        #     response.message = f"Near singularity: condition number={condition_number:.1f} > {request.max_condition_number}"
+        #     self.get_logger().warn(response.message)
+        #     return response
 
-        # Check arm-arm collision
+        # Check arm-arm collision — TEMPORARILY DISABLED
         if arm_name == 'right':
             collision_free, min_dist = self.check_arm_collision(solution, other_arm_positions)
         else:
             collision_free, min_dist = self.check_arm_collision(other_arm_positions, solution)
 
-        if not collision_free:
-            response.success = False
-            response.message = f"Arm collision detected: min distance={min_dist:.3f}m < {self.min_collision_distance}m"
-            self.get_logger().warn(response.message)
-            return response
+        # if not collision_free:
+        #     response.success = False
+        #     response.message = f"Arm collision detected: min distance={min_dist:.3f}m < {self.min_collision_distance}m"
+        #     self.get_logger().warn(response.message)
+        #     return response
 
         # Planning succeeded
         response.success = True

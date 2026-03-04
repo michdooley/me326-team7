@@ -32,6 +32,16 @@ class ArmControllerNode(Node):
         'wrist_rotate': (-3.14159, 3.14159),
     }
 
+    # Indices of joints that span full +-pi and can wrap around
+    # waist=0, forearm_roll=3, wrist_rotate=5
+    WRAPPING_JOINT_INDICES = [0, 3, 5]
+
+    @staticmethod
+    def shortest_angular_delta(start, target):
+        """Compute shortest-path delta for an angle, wrapping through +-pi."""
+        delta = target - start
+        return (delta + np.pi) % (2 * np.pi) - np.pi
+
     def __init__(self):
         super().__init__('arm_controller')
 
@@ -58,6 +68,7 @@ class ArmControllerNode(Node):
         self.start_positions = np.zeros(6)
         self.trajectory_duration = 0.0
         self.trajectory_time = 0.0
+        self.trajectory_deltas = np.zeros(6)
         self.in_trajectory = False
 
         # Publishers
@@ -110,6 +121,13 @@ class ArmControllerNode(Node):
             # Start interpolated trajectory
             self.start_positions = self.current_positions.copy()
             self.target_positions = target
+
+            # Precompute deltas with shortest-path for wrapping joints
+            self.trajectory_deltas = target - self.start_positions
+            for idx in self.WRAPPING_JOINT_INDICES:
+                self.trajectory_deltas[idx] = self.shortest_angular_delta(
+                    self.start_positions[idx], target[idx])
+
             self.trajectory_duration = msg.duration
             self.trajectory_time = 0.0
             self.in_trajectory = True
@@ -139,7 +157,7 @@ class ArmControllerNode(Node):
         # Cosine easing: slow start and end, fast middle
         alpha = (1 - np.cos(t * np.pi)) / 2
 
-        interpolated = self.start_positions + alpha * (self.target_positions - self.start_positions)
+        interpolated = self.start_positions + alpha * self.trajectory_deltas
         self.publish_command(interpolated)
 
     def publish_command(self, positions: np.ndarray):

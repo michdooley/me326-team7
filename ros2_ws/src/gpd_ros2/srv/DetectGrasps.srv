@@ -1,0 +1,9 @@
+# Request
+sensor_msgs/PointCloud2 cloud
+geometry_msgs/Point view_point         # camera position in cloud frame
+float64[] workspace                    # [x_min, x_max, y_min, y_max, z_min, z_max] crop bounds
+---
+# Response
+gpd_ros2/GraspConfigList grasps
+bool success
+string message
