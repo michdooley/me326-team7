@@ -813,7 +813,10 @@ class ExploreAndFind(Node):
                 self.get_logger().info(
                     f'[DETECT] *** YOLO class {class_id} CONFIRMED at '
                     f'({pos[0]:.2f}, {pos[1]:.2f}) ***')
-                if self.state != ExploreState.APPROACHING:
+                # Don't interrupt scanning — the state machine will
+                # pick up object_world_pos after the scan completes.
+                if (self.state not in
+                        (ExploreState.SCANNING, ExploreState.APPROACHING)):
                     self.state = ExploreState.APPROACHING
                     self._plan_approach()
             return
