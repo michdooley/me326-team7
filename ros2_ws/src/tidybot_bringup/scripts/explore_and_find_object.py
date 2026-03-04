@@ -682,144 +682,73 @@ class ExploreAndFind(Node):
 
     # ── Object detection ──────────────────────────────────────────────────────
 
-    # def _check_for_object(self):
-    #     """Check latest RGB frame for target colored cube.
-
-    #     Runs HSV color filtering, finds the largest matching blob, and
-    #     estimates its world position via depth back-projection.  Requires
-    #     DETECT_COUNT_REQ detections within DETECT_WINDOW seconds to confirm.
-
-    #     Returns True when the object is confirmed.
-    #     """
-    #     if self.latest_rgb is None or self.camera_K is None:
-    #         return False
-
-    #     hsv = cv2.cvtColor(self.latest_rgb, cv2.COLOR_BGR2HSV)
-
-    #     # Build color mask from all HSV ranges for the target color
-    #     mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-    #     for lower, upper in COLOR_RANGES.get(self.target_color, []):
-    #         mask |= cv2.inRange(hsv, np.array(lower), np.array(upper))
-
-    #     contours, _ = cv2.findContours(
-    #         mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    #     if not contours:
-    #         return False
-
-    #     # Take the largest blob
-    #     largest = max(contours, key=cv2.contourArea)
-    #     area = cv2.contourArea(largest)
-    #     if area < self.MIN_DETECTION_AREA:
-    #         return False
-
-    #     # Centroid of the blob
-    #     M = cv2.moments(largest)
-    #     if M['m00'] == 0:
-    #         return False
-    #     cu = int(M['m10'] / M['m00'])
-    #     cv_pt = int(M['m01'] / M['m00'])
-
-    #     # Estimate world position using depth
-    #     pos = self._estimate_object_position(cu, cv_pt)
-    #     if pos is None:
-    #         return False
-
-    #     # Check consistency — if position jumped far, reset window
-    #     if self.last_detection_pos is not None:
-    #         d = np.hypot(pos[0] - self.last_detection_pos[0],
-    #                      pos[1] - self.last_detection_pos[1])
-    #         if d > 1.0:
-    #             self.detection_times = []
-
-    #     now = time.time()
-    #     self.detection_times.append(now)
-    #     self.last_detection_pos = pos
-
-    #     # Prune old detections outside the window
-    #     cutoff = now - self.DETECT_WINDOW
-    #     self.detection_times = [t for t in self.detection_times if t >= cutoff]
-
-    #     self.get_logger().info(
-    #         f'[DETECT] {self.target_color} candidate at '
-    #         f'({pos[0]:.2f}, {pos[1]:.2f}) area={area:.0f} '
-    #         f'count={len(self.detection_times)}/{self.DETECT_COUNT_REQ} '
-    #         f'in {self.DETECT_WINDOW}s window')
-
-    #     if len(self.detection_times) >= self.DETECT_COUNT_REQ:
-    #         self.object_world_pos = pos
-    #         self.get_logger().info(
-    #             f'[DETECT] *** {self.target_color} cube CONFIRMED at '
-    #             f'({pos[0]:.2f}, {pos[1]:.2f}) ***')
-    #         return True
-
-    #     return False
-
     def _yolo_bbox_cb(self, msg: Detection2DArray):
-        """Callback for YOLO detections from the ObjectClassifier node.
+        """Store the latest YOLO detection that matches our target class.
 
-        Uses a temporal confirmation window (DETECT_COUNT_REQ detections
-        within DETECT_WINDOW seconds) to avoid false positives from
-        single-frame YOLO misclassifications.
+        This callback only caches the detection; the temporal-confirmation
+        logic lives in _check_for_object(), which is polled from the main
+        loop exactly like the old HSV version.
         """
-        if self.state == ExploreState.COMPLETE:
-            return
-
         for detection in msg.detections:
             if not detection.results:
                 continue
             class_id = int(detection.results[0].hypothesis.class_id)
-
-            if class_id != self.target_class_id:
-                continue
-
-            u = int(detection.bbox.center.position.x)
-            v = int(detection.bbox.center.position.y)
-            pos = self._estimate_object_position(u, v)
-            if pos is None:
-                continue
-
-            # Store latest detection for approach refinement
-            self.latest_yolo_detection = detection
-
-            # If already confirmed, just update position (approach
-            # refinement handled in _state_approaching)
-            if self.object_world_pos is not None:
+            if class_id == self.target_class_id:
+                self.latest_yolo_detection = detection
                 return
 
-            # Check consistency — if position jumped far, reset window
-            if self.last_detection_pos is not None:
-                d = np.hypot(pos[0] - self.last_detection_pos[0],
-                             pos[1] - self.last_detection_pos[1])
-                if d > 1.0:
-                    self.detection_times = []
+    def _check_for_object(self):
+        """Check latest YOLO detection for target object.
 
-            now = time.time()
-            self.detection_times.append(now)
-            self.last_detection_pos = pos
+        Uses the bbox centre from the YOLO classifier and estimates
+        world position via depth back-projection.  Requires
+        DETECT_COUNT_REQ detections within DETECT_WINDOW seconds to
+        confirm.  Returns True when the object is confirmed.
+        """
+        det = self.latest_yolo_detection
+        if det is None or self.camera_K is None:
+            return False
 
-            # Prune old detections outside the window
-            cutoff = now - self.DETECT_WINDOW
-            self.detection_times = [
-                t for t in self.detection_times if t >= cutoff]
+        # Consume the detection so we don't re-process the same frame
+        self.latest_yolo_detection = None
 
+        u = int(det.bbox.center.position.x)
+        v = int(det.bbox.center.position.y)
+
+        pos = self._estimate_object_position(u, v)
+        if pos is None:
+            return False
+
+        # Check consistency — if position jumped far, reset window
+        if self.last_detection_pos is not None:
+            d = np.hypot(pos[0] - self.last_detection_pos[0],
+                         pos[1] - self.last_detection_pos[1])
+            if d > 1.0:
+                self.detection_times = []
+
+        now = time.time()
+        self.detection_times.append(now)
+        self.last_detection_pos = pos
+
+        # Prune old detections outside the window
+        cutoff = now - self.DETECT_WINDOW
+        self.detection_times = [t for t in self.detection_times if t >= cutoff]
+
+        class_id = int(det.results[0].hypothesis.class_id)
+        self.get_logger().info(
+            f'[DETECT] YOLO class {class_id} candidate at '
+            f'({pos[0]:.2f}, {pos[1]:.2f}) '
+            f'count={len(self.detection_times)}/{self.DETECT_COUNT_REQ} '
+            f'in {self.DETECT_WINDOW}s window')
+
+        if len(self.detection_times) >= self.DETECT_COUNT_REQ:
+            self.object_world_pos = pos
             self.get_logger().info(
-                f'[DETECT] YOLO class {class_id} candidate at '
-                f'({pos[0]:.2f}, {pos[1]:.2f}) '
-                f'count={len(self.detection_times)}/{self.DETECT_COUNT_REQ} '
-                f'in {self.DETECT_WINDOW}s window')
+                f'[DETECT] *** YOLO class {class_id} CONFIRMED at '
+                f'({pos[0]:.2f}, {pos[1]:.2f}) ***')
+            return True
 
-            if len(self.detection_times) >= self.DETECT_COUNT_REQ:
-                self.object_world_pos = pos
-                self.get_logger().info(
-                    f'[DETECT] *** YOLO class {class_id} CONFIRMED at '
-                    f'({pos[0]:.2f}, {pos[1]:.2f}) ***')
-                # Don't interrupt scanning — the state machine will
-                # pick up object_world_pos after the scan completes.
-                if (self.state not in
-                        (ExploreState.SCANNING, ExploreState.APPROACHING)):
-                    self.state = ExploreState.APPROACHING
-                    self._plan_approach()
-            return
+        return False
 
     def _estimate_object_position(self, u, v):
         """Estimate world (x, y) of pixel (u, v) using depth + TF."""
@@ -1346,7 +1275,9 @@ class ExploreAndFind(Node):
             return
         bx, by, btheta = pose
 
-        # ── Object detection handled by _yolo_bbox_cb callback ─────────
+        # ── Check for target object while navigating ──────────────────
+        if self.object_world_pos is None:
+            self._check_for_object()
         if self.object_world_pos is not None:
             if self._plan_approach():
                 return
@@ -1462,47 +1393,20 @@ class ExploreAndFind(Node):
         # ── Refine object position while approaching ──────────────
         # Re-detect the object to update position estimate as we get closer
         # (depth accuracy improves at shorter range).
-        # if self.latest_rgb is not None and self.camera_K is not None:
-        #     hsv = cv2.cvtColor(self.latest_rgb, cv2.COLOR_BGR2HSV)
-        #     mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        #     for lower, upper in COLOR_RANGES.get(self.target_color, []):
-        #         mask |= cv2.inRange(hsv, np.array(lower), np.array(upper))
-        #     contours, _ = cv2.findContours(
-        #         mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        #     if contours:
-        #         largest = max(contours, key=cv2.contourArea)
-        #         area = cv2.contourArea(largest)
-                # if area >= self.MIN_DETECTION_AREA:
-                #     M = cv2.moments(largest)
-                #     if M['m00'] > 0:
-                #         cu = int(M['m10'] / M['m00'])
-                #         cv_pt = int(M['m01'] / M['m00'])
-                #         new_pos = self._estimate_object_position(cu, cv_pt)
-        if hasattr(self, 'latest_yolo_detection') and self.latest_yolo_detection is not None:
+        if self.latest_yolo_detection is not None:
             det = self.latest_yolo_detection
+            self.latest_yolo_detection = None
             u = int(det.bbox.center.position.x)
             v = int(det.bbox.center.position.y)
-            
             new_pos = self._estimate_object_position(u, v)
             if new_pos is not None:
                 old_ox, old_oy = self.object_world_pos
                 shift = np.hypot(
                     new_pos[0] - old_ox, new_pos[1] - old_oy)
-                # Only update if shift is small; depth back-
-                # projection is noisy at range so cap at 0.5m.
-                # Apply EMA smoothing to prevent single noisy
-                # readings from jumping the estimate.
-                if shift < 0.5:
-                    alpha = 0.4  # blend weight for new reading
-                    smoothed = (
-                        alpha * new_pos[0] + (1 - alpha) * old_ox,
-                        alpha * new_pos[1] + (1 - alpha) * old_oy,
-                    )
-                    self.object_world_pos = smoothed
-                    new_pos = smoothed
-                    shift = np.hypot(
-                        smoothed[0] - old_ox,
-                        smoothed[1] - old_oy)
+                # Only update if shift is reasonable (< 1.5m)
+                # to avoid jumping to a different object
+                if shift < 1.5:
+                    self.object_world_pos = new_pos
                     if shift > 0.15:
                         self.get_logger().info(
                             f'[APPROACH] Refined position: '
@@ -1692,7 +1596,11 @@ class ExploreAndFind(Node):
                     self.publish_object_marker()
                 self.last_map_publish = now
 
-            # Object detection now handled by _yolo_bbox_cb callback.
+            # Object detection runs during scanning (stores position
+            # for use in SELECTING) — doesn't interrupt the scan.
+            if (self.state == ExploreState.SCANNING and
+                    self.object_world_pos is None):
+                self._check_for_object()
 
             if   self.state == ExploreState.SCANNING:
                 self._state_scanning()
