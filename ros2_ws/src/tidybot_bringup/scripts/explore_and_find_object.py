@@ -1604,7 +1604,16 @@ class ExploreAndFind(Node):
         self._dbg_yolo_count = 0
 
         while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.05)
+            # Process ALL pending callbacks (depth, YOLO, camera_info)
+            # before doing state-machine work.  A single spin_once only
+            # handles one callback and can starve depth if other topics
+            # also have pending messages.
+            deadline = time.time() + 0.05
+            while time.time() < deadline:
+                rclpy.spin_once(self, timeout_sec=0)
+                # spin_once with timeout=0 returns immediately if nothing
+                # is ready — give CPU back so the bridge can publish.
+                time.sleep(0.002)
 
             now = time.time()
 
