@@ -216,11 +216,13 @@ class ExploreAndFind(Node):
         # self.create_subscription(Image,      '/camera/color/image_raw',
         #                          self._rgb_cb,         be)
         
+        yolo_qos = QoSProfile(
+            depth=1, reliability=ReliabilityPolicy.RELIABLE)
         self.bbox_sub = self.create_subscription(
-            Detection2DArray, 
-            '/objbbox', 
-            self._yolo_bbox_cb, 
-            10)
+            Detection2DArray,
+            '/objbbox',
+            self._yolo_bbox_cb,
+            yolo_qos)
 
         # Publishers
         self.map_pub           = self.create_publisher(
@@ -266,8 +268,12 @@ class ExploreAndFind(Node):
             return
         self.latest_depth       = depth
         self.latest_depth_stamp = msg.header.stamp
+        if hasattr(self, '_dbg_depth_count'):
+            self._dbg_depth_count += 1
         if self.camera_K is not None:
             if abs(self.last_cmd_angular) <= self.MAX_MAPPING_ANGULAR_VEL:
+                if hasattr(self, '_dbg_integrate_count'):
+                    self._dbg_integrate_count += 1
                 self._integrate_depth()
 
     # def _rgb_cb(self, msg: Image):
@@ -689,6 +695,8 @@ class ExploreAndFind(Node):
         logic lives in _check_for_object(), which is polled from the main
         loop exactly like the old HSV version.
         """
+        if hasattr(self, '_dbg_yolo_count'):
+            self._dbg_yolo_count += 1
         for detection in msg.detections:
             if not detection.results:
                 continue
@@ -1586,10 +1594,30 @@ class ExploreAndFind(Node):
             f'Sensors ready — exploring for YOLO class_id={self.target_class_id}!')
         self._start_scan()
 
+        self._dbg_last = 0.0
+        self._dbg_depth_count = 0
+        self._dbg_integrate_count = 0
+        self._dbg_yolo_count = 0
+
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.05)
 
             now = time.time()
+
+            # ── periodic debug heartbeat (every 3 s) ──────────────
+            if now - self._dbg_last >= 3.0:
+                self.get_logger().info(
+                    f'[DBG] state={self.state.name} '
+                    f'depth_cb={self._dbg_depth_count} '
+                    f'integrate={self._dbg_integrate_count} '
+                    f'yolo_cb={self._dbg_yolo_count} '
+                    f'cmd_ang={self.last_cmd_angular:.2f} '
+                    f'obj={self.object_world_pos}')
+                self._dbg_depth_count = 0
+                self._dbg_integrate_count = 0
+                self._dbg_yolo_count = 0
+                self._dbg_last = now
+
             if now - self.last_map_publish >= 1.0 / self.MAP_PUBLISH_RATE:
                 self.publish_map()
                 if self.object_world_pos is not None:
