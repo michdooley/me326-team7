@@ -20,7 +20,7 @@ from ultralytics import YOLO
 import cv2
 
 class ObjectClassifier(Node):
-    INFERENCE_RATE = 2.0  # Hz — max YOLO inferences per second
+    INFERENCE_RATE = 1.0  # Hz — max YOLO inferences per second
 
     def __init__(self):
         super().__init__('object_classifier')
