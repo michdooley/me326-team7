@@ -506,6 +506,21 @@ class MotionPlannerNode(Node):
             self.get_logger().warn(response.message)
             return response
 
+        # Check max joint change from seed (prevents wild joint swings)
+        MAX_JOINT_DELTA = 1.5  # ~86 degrees — reject solutions requiring large jumps
+        joint_deltas = np.abs(solution - seed)
+        max_delta_idx = np.argmax(joint_deltas)
+        max_delta = joint_deltas[max_delta_idx]
+        if max_delta > MAX_JOINT_DELTA:
+            joint_names = list(self.JOINT_LIMITS.keys())
+            response.success = False
+            response.message = (
+                f"IK solution requires too-large joint change: "
+                f"{joint_names[max_delta_idx]} delta={np.degrees(max_delta):.1f}deg "
+                f"(limit={np.degrees(MAX_JOINT_DELTA):.0f}deg)")
+            self.get_logger().warn(response.message)
+            return response
+
         # Check singularity (Jacobian condition number) — TEMPORARILY DISABLED
         condition_number = self.compute_jacobian_condition(arm_name, solution)
         response.condition_number = condition_number
