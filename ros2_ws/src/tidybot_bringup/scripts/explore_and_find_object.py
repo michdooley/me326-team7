@@ -1357,9 +1357,13 @@ class ExploreAndFind(Node):
                 self.get_logger().warn('[NAV] Re-plan failed — re-selecting.')
                 self.state = ExploreState.SELECTING
                 return
-            self.get_logger().info(
-                f'[NAV] Depth obstacle: L={left_dist:.2f} C={center_dist:.2f} '
-                f'R={right_dist:.2f} — steering')
+            if not hasattr(self, '_steer_last_log') or now - self._steer_last_log > 1.0:
+                self._steer_last_log = now
+                self.get_logger().info(
+                    f'[NAV] Depth obstacle: L={left_dist:.2f} C={center_dist:.2f} '
+                    f'R={right_dist:.2f} — steering '
+                    f'({now - self.depth_steer_start:.1f}s/'
+                    f'{self.DEPTH_STEER_TIMEOUT:.1f}s)')
             if left_dist > right_dist:
                 cmd.angular.z = 1.0
             elif right_dist > left_dist:
