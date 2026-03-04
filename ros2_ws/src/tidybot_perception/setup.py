@@ -23,7 +23,8 @@ setup(
         'console_scripts': [
             'detector_node = tidybot_perception.detector_node:main',
             'object_localizer_node = tidybot_perception.object_localizer_node:main',
-            'grasp_planner_node = tidybot_perception.grasp_planner_node:main',
+            'grasp_planner_node = tidybot_perception.geometric_grasp_planner_node:main',
+            'grasp_planner_node_grconvnet = tidybot_perception.grasp_planner_node:main',
         ],
     },
 )
