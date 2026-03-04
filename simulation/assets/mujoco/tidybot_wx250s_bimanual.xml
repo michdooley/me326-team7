@@ -345,8 +345,8 @@
     <position class="small_actuator" name="right_wrist_rotate" joint="right_wrist_rotate"/>
 
     <!-- Right WX250s gripper actuators (prismatic fingers) -->
-    <position name="right_left_finger" joint="right_left_finger" kp="100" kv="10" ctrlrange="0.015 0.037"/>
-    <position name="right_right_finger" joint="right_right_finger" kp="100" kv="10" ctrlrange="0.015 0.037"/>
+    <position name="right_left_finger" joint="right_left_finger" kp="500" kv="20" ctrlrange="0.015 0.037"/>
+    <position name="right_right_finger" joint="right_right_finger" kp="500" kv="20" ctrlrange="0.015 0.037"/>
 
     <!-- Left WX250s arm actuators (6-DOF) -->
     <position class="small_actuator" name="left_waist" joint="left_waist"/>
@@ -357,8 +357,8 @@
     <position class="small_actuator" name="left_wrist_rotate" joint="left_wrist_rotate"/>
 
     <!-- Left WX250s gripper actuators (prismatic fingers) -->
-    <position name="left_left_finger" joint="left_left_finger" kp="100" kv="10" ctrlrange="0.015 0.037"/>
-    <position name="left_right_finger" joint="left_right_finger" kp="100" kv="10" ctrlrange="0.015 0.037"/>
+    <position name="left_left_finger" joint="left_left_finger" kp="500" kv="20" ctrlrange="0.015 0.037"/>
+    <position name="left_right_finger" joint="left_right_finger" kp="500" kv="20" ctrlrange="0.015 0.037"/>
   </actuator>
 
   <keyframe>

@@ -10,7 +10,7 @@ import cv2
 class ObjectClassifier(Node):
     def __init__(self):
         super().__init__('object_classifier')
-        self.model = YOLO('yolov8n.pt')
+        self.model = YOLO('yolov8s.pt')
         self.bridge = CvBridge()
 
         # Publisher for bounding boxes
@@ -24,7 +24,7 @@ class ObjectClassifier(Node):
 
     def listener_callback(self, msg):
         frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-        results = self.model(frame, classes=[0, 46, 47], conf=0.5, verbose=False)
+        results = self.model(frame, classes=[0, 46, 47, 49], conf=0.5, verbose=False)
 
         # Initialize the array message
         detection_array = Detection2DArray()

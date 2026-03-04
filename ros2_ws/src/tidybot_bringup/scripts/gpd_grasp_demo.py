@@ -418,7 +418,7 @@ class GpdGraspDemo(Node):
     # ── Main pipeline ─────────────────────────────────────────────────
 
     def _detect_object(self):
-        """Detect target via YOLO and return 3D position in base_link."""
+        """Detect target via YOLO and return (3D pos, bbox_info) in base_link."""
         self.spin_for(1.0)
         self.get_logger().info(f'Detecting "{self.target_object}" via YOLO classifier')
 
@@ -431,21 +431,51 @@ class GpdGraspDemo(Node):
         if det is None:
             self.get_logger().error(
                 f'Could not find "{self.target_object}" in camera view!')
-            return None
+            return None, None
 
         u = int(det.bbox.center.position.x)
         v = int(det.bbox.center.position.y)
-        self.get_logger().info(f'  Detected at pixel ({u}, {v})')
+        bbox_w = float(det.bbox.size_x)
+        bbox_h = float(det.bbox.size_y)
+        self.get_logger().info(
+            f'  Detected at pixel ({u}, {v}), bbox {bbox_w:.0f}x{bbox_h:.0f}')
 
         pt_base = self.pixel_to_base_link(u, v)
         if pt_base is None:
             self.get_logger().error('  Depth back-projection failed')
-            return None
+            return None, None
 
         ox, oy, oz = float(pt_base[0]), float(pt_base[1]), float(pt_base[2])
         self.get_logger().info(
             f'  Object in base_link: ({ox:.3f}, {oy:.3f}, {oz:.3f})')
-        return (ox, oy, oz)
+
+        # Compute object major axis direction in base_link using bbox corners
+        major_axis_base = None
+        aspect = max(bbox_w, bbox_h) / max(min(bbox_w, bbox_h), 1.0)
+        if aspect > 1.5:
+            # Object is elongated — determine major axis in base_link
+            # Back-project two points along the longer bbox dimension
+            if bbox_w > bbox_h:
+                # Wider than tall — major axis is horizontal in image
+                p1 = self.pixel_to_base_link(int(u - bbox_w / 2), v)
+                p2 = self.pixel_to_base_link(int(u + bbox_w / 2), v)
+            else:
+                # Taller than wide — major axis is vertical in image
+                p1 = self.pixel_to_base_link(u, int(v - bbox_h / 2))
+                p2 = self.pixel_to_base_link(u, int(v + bbox_h / 2))
+
+            if p1 is not None and p2 is not None:
+                axis = p2 - p1
+                axis[2] = 0.0  # project to horizontal plane
+                norm = np.linalg.norm(axis)
+                if norm > 0.001:
+                    major_axis_base = axis / norm
+                    self.get_logger().info(
+                        f'  Elongated object (aspect {aspect:.1f}), '
+                        f'major axis in base_link: [{major_axis_base[0]:.2f}, '
+                        f'{major_axis_base[1]:.2f}]')
+
+        return (ox, oy, oz), major_axis_base
 
     def _call_gpd(self, object_pos):
         """Generate point cloud, call GPD, return list of GraspConfig."""
@@ -563,13 +593,41 @@ class GpdGraspDemo(Node):
         result = future.result()
         return result.success, result.message
 
-    def _select_and_execute_grasp(self, grasps, object_pos):
+    @staticmethod
+    def _compute_top_down_quat(major_axis=None):
+        """Compute a top-down gripper quaternion, optionally perpendicular to major_axis.
+
+        Default (no major_axis): fingers-down along base_link convention.
+        With major_axis: rotates the gripper so fingers open perpendicular to
+        the object's long axis (grabs across the narrow dimension).
+        """
+        if major_axis is None:
+            return Quaternion(w=0.5, x=0.5, y=0.5, z=-0.5)
+
+        # Build rotation: Z points down, Y (finger opening) perpendicular to major_axis
+        z_axis = np.array([0.0, 0.0, -1.0])  # approach: straight down
+        # Gripper Y axis (opening direction) should be perpendicular to the object's major axis
+        # Project major_axis to horizontal, then rotate 90 degrees
+        perp = np.array([-major_axis[1], major_axis[0], 0.0])
+        perp_norm = np.linalg.norm(perp)
+        if perp_norm < 0.001:
+            return Quaternion(w=0.5, x=0.5, y=0.5, z=-0.5)
+        y_axis = perp / perp_norm
+        x_axis = np.cross(y_axis, z_axis)
+        x_axis = x_axis / np.linalg.norm(x_axis)
+
+        R = np.column_stack([x_axis, y_axis, z_axis])
+        rot = Rotation.from_matrix(R)
+        qx, qy, qz, qw = rot.as_quat()
+        return Quaternion(w=float(qw), x=float(qx), y=float(qy), z=float(qz))
+
+    def _select_and_execute_grasp(self, grasps, object_pos, major_axis=None):
         """Try GPD grasps in score order until one succeeds IK.
 
         Strategy:
-        1. Filter out infeasible grasps (below table, upward approach)
-        2. Try each grasp with full 6-DOF orientation
-        3. If 6-DOF fails, try position-only with a top-down orientation fallback
+        1. Filter out infeasible grasps (below table, non-vertical approach)
+        2. For elongated objects, prefer grasps that grab across the narrow dimension
+        3. Try each grasp with full 6-DOF orientation, then top-down fallback
         """
         ox, oy, oz = object_pos
 
@@ -579,8 +637,34 @@ class GpdGraspDemo(Node):
             self.get_logger().error('  No feasible grasps after filtering')
             return None
 
-        # Fingers-down orientation (from yolo_grasp_demo.py)
-        top_down_quat = Quaternion(w=0.5, x=0.5, y=0.5, z=-0.5)
+        # For elongated objects, filter out grasps that try to grab along the long axis
+        if major_axis is not None:
+            pre_count = len(grasps)
+            good_grasps = []
+            for g in grasps:
+                # GPD axis = finger opening direction (projected to horizontal)
+                grip_axis = np.array([g.axis.x, g.axis.y, 0.0])
+                grip_norm = np.linalg.norm(grip_axis)
+                if grip_norm > 0.001:
+                    grip_axis = grip_axis / grip_norm
+                    # Dot product: 1.0 = parallel (bad), 0.0 = perpendicular (good)
+                    alignment = abs(np.dot(grip_axis[:2], major_axis[:2]))
+                    if alignment > 0.7:  # within ~45 deg of long axis
+                        self.get_logger().info(
+                            f'    SKIP grasp (alignment={alignment:.2f} with long axis)')
+                        continue
+                good_grasps.append(g)
+            if good_grasps:
+                self.get_logger().info(
+                    f'  Orientation filter: {len(good_grasps)}/{pre_count} '
+                    f'grasps grab across narrow dimension')
+                grasps = good_grasps
+            else:
+                self.get_logger().warn(
+                    '  All grasps aligned with long axis — keeping all')
+
+        # Compute top-down quaternion (oriented for elongated objects if applicable)
+        top_down_quat = self._compute_top_down_quat(major_axis)
 
         for i, grasp in enumerate(grasps):
             self.get_logger().info(
@@ -697,7 +781,7 @@ class GpdGraspDemo(Node):
                 '(ros2 run object_classification classifier)')
 
         # ── Detect ────────────────────────────────────────────────────
-        detection = self._detect_object()
+        detection, major_axis = self._detect_object()
         if detection is None:
             self.get_logger().error('Object detection failed — aborting')
             return
@@ -710,7 +794,7 @@ class GpdGraspDemo(Node):
             return
 
         # ── Execute best grasp ────────────────────────────────────────
-        grasp_pose = self._select_and_execute_grasp(grasps, detection)
+        grasp_pose = self._select_and_execute_grasp(grasps, detection, major_axis)
         if grasp_pose is None:
             self.get_logger().error('Grasp execution failed — aborting')
             self.go_home()
