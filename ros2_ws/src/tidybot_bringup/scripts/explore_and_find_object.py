@@ -30,11 +30,26 @@ Subscribes:
   /camera/depth/camera_info  — depth camera intrinsics
   /camera/color/image_raw    — RGB frames for object detection
 
-Prerequisites:
-    ros2 launch tidybot_bringup sim.launch.py scene:=scene_obstacles.xml
+Prerequisites (terminal 1):
+    source ros2_ws/setup_env.bash
+    ros2 launch tidybot_bringup sim.launch.py scene:=scene_banana_test.xml show_mujoco_viewer:=false
+
 
 Usage:
-    ros2 run tidybot_bringup explore_and_find_object.py --ros-args -p target_color:=red
+    (Note: skip_voice=True is the default in nav.launch.py)
+
+    ros2 launch tidybot_bringup nav.launch.py target_object:=banana
+
+For voice:
+    terminal 2: 
+        ros2 run tidybot_bringup explore_and_find_object.py --ros-args -p skip_voice:=false
+
+    terminal 3 -- will prompt you to press enter, record 5s, transcribe, and publish. You can record again for sequential commands:
+        to test real voice command: 
+            ros2 run tidybot_bringup voice_command.py
+        to manually publish voice command:
+            ros2 topic pub --once /user_command std_msgs/msg/String "data: 'get'"
+            ros2 topic pub --once /target_object std_msgs/msg/String "data: 'banana'"
 """
 
 import heapq
