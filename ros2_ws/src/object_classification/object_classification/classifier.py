@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
+import time
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
 from cv_bridge import CvBridge
@@ -8,10 +10,13 @@ from ultralytics import YOLO
 import cv2
 
 class ObjectClassifier(Node):
+    INFERENCE_RATE = 2.0  # Hz — max YOLO inferences per second
+
     def __init__(self):
         super().__init__('object_classifier')
         self.model = YOLO('yolov8n.pt')
         self.bridge = CvBridge()
+        self.last_inference_time = 0.0
 
         # Publisher for bounding boxes
         self.bbox_pub = self.create_publisher(Detection2DArray, '/objbbox', 10)
@@ -19,10 +24,18 @@ class ObjectClassifier(Node):
         # Publisher for annotated image (viewable in RViz)
         self.yolo_image_pub = self.create_publisher(Image, '/camera/color/image_yolo', 10)
 
+        # Subscribe with depth=1 to only keep latest frame
+        be = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.subscription = self.create_subscription(
-            Image, '/camera/color/image_raw', self.listener_callback, 10)
+            Image, '/camera/color/image_raw', self.listener_callback, be)
 
     def listener_callback(self, msg):
+        # Rate-limit inference to avoid starving other nodes of CPU
+        now = time.monotonic()
+        if now - self.last_inference_time < 1.0 / self.INFERENCE_RATE:
+            return
+        self.last_inference_time = now
+
         frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         results = self.model(frame, classes=[0, 46, 47], conf=0.5, verbose=False)
 
