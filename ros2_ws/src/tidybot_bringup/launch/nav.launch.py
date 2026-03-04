@@ -23,7 +23,9 @@ def generate_launch_description():
             name='explorer',
             output='screen',
             parameters=[
-                {'target_class_id': 46}, # 46 is 'banana' in YOLOv8
+                {'skip_voice': True},        # True = hardcode target, no mic needed
+                {'target_object': 'banana'}, # object name (used when skip_voice=True)
+                {'user_command': 'get'},     # action verb  (used when skip_voice=True)
                 {'use_sim_time': False}
             ]
         )

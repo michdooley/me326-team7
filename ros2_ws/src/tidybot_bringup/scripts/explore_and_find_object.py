@@ -53,7 +53,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Point, Twist
 from nav_msgs.msg import MapMetaData, OccupancyGrid
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import ColorRGBA
+from std_msgs.msg import ColorRGBA, String
 from visualization_msgs.msg import Marker, MarkerArray
 from vision_msgs.msg import Detection2DArray
 
@@ -67,6 +67,7 @@ except ImportError:
 
 
 class ExploreState(Enum):
+    WAITING_FOR_COMMAND = -1
     SCANNING    = 0
     SELECTING   = 1
     NAVIGATING  = 2
@@ -85,6 +86,29 @@ class ExploreState(Enum):
 #     'green':  [((35,  40,  40),  (90,  255, 255))],
 #     'orange': [((8,   100, 80),  (20,  255, 255))],
 # }
+
+# YOLO class name -> ID mapping (COCO dataset)
+YOLO_CLASS_MAP = {
+    'person': 0, 'bicycle': 1, 'car': 2, 'motorcycle': 3, 'airplane': 4,
+    'bus': 5, 'train': 6, 'truck': 7, 'boat': 8, 'traffic light': 9,
+    'fire hydrant': 10, 'stop sign': 11, 'parking meter': 12, 'bench': 13,
+    'bird': 14, 'cat': 15, 'dog': 16, 'horse': 17, 'sheep': 18, 'cow': 19,
+    'elephant': 20, 'bear': 21, 'zebra': 22, 'giraffe': 23,
+    'backpack': 24, 'umbrella': 25, 'handbag': 26, 'tie': 27, 'suitcase': 28,
+    'frisbee': 29, 'skis': 30, 'snowboard': 31, 'sports ball': 32,
+    'kite': 33, 'baseball bat': 34, 'baseball glove': 35, 'skateboard': 36,
+    'surfboard': 37, 'tennis racket': 38,
+    'bottle': 39, 'wine glass': 40, 'cup': 41, 'fork': 42, 'knife': 43,
+    'spoon': 44, 'bowl': 45, 'banana': 46, 'apple': 47, 'sandwich': 48,
+    'orange': 49, 'broccoli': 50, 'carrot': 51, 'hot dog': 52, 'pizza': 53,
+    'donut': 54, 'cake': 55,
+    'chair': 56, 'couch': 57, 'potted plant': 58, 'bed': 59,
+    'dining table': 60, 'toilet': 61, 'tv': 62, 'laptop': 63, 'mouse': 64,
+    'remote': 65, 'keyboard': 66, 'cell phone': 67, 'microwave': 68,
+    'oven': 69, 'toaster': 70, 'sink': 71, 'refrigerator': 72, 'book': 73,
+    'clock': 74, 'vase': 75, 'scissors': 76, 'teddy bear': 77,
+    'hair drier': 78, 'toothbrush': 79,
+}
 
 
 class ExploreAndFind(Node):
@@ -170,7 +194,7 @@ class ExploreAndFind(Node):
         self.cv_bridge          = CvBridge()
 
         # State machine
-        self.state             = ExploreState.SCANNING
+        self.state             = ExploreState.WAITING_FOR_COMMAND
         self.scan_accumulated  = 0.0
         self.scan_last_heading = None
         self.scan_settle_start = None
@@ -194,9 +218,22 @@ class ExploreAndFind(Node):
         #         f'Unknown target_color "{self.target_color}". Using "red".')
         #     self.target_color = 'red'
 
-        # Object detection state (YOLO version)
-        self.declare_parameter('target_class_id', 46) # Default to 46 (e.g., banana/apple)
-        self.target_class_id = self.get_parameter('target_class_id').get_parameter_value().integer_value
+        # Voice command parameters
+        self.declare_parameter('skip_voice', False)
+        self.skip_voice = (
+            self.get_parameter('skip_voice')
+            .get_parameter_value().bool_value)
+        self.declare_parameter('target_object', 'banana')
+        self.declare_parameter('user_command', 'get')
+
+        # Command queue for sequential voice targets
+        self.command_queue       = deque()
+        self.current_object_name = ''
+        self.current_action      = ''
+        self.target_class_id     = -1   # set when a command is received
+        self._last_voice_action  = 'get'
+
+        # Object detection state
         self.object_world_pos      = None   # (wx, wy) once confirmed
         self.detection_times       = []     # timestamps of recent detections
         self.last_detection_pos    = None   # (wx, wy) of most recent detection
@@ -224,6 +261,24 @@ class ExploreAndFind(Node):
             self._yolo_bbox_cb,
             yolo_qos)
 
+        # Voice command subscriptions (latched to match voice_command.py)
+        # Subscribe to action first so it's stored before target triggers queue
+        voice_qos = QoSProfile(
+            depth=1, reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(
+            String, '/user_command', self._user_command_cb, voice_qos)
+        self.create_subscription(
+            String, '/target_object', self._target_object_cb, voice_qos)
+
+        # If skip_voice, queue the hardcoded command immediately
+        if self.skip_voice:
+            obj = (self.get_parameter('target_object')
+                   .get_parameter_value().string_value)
+            act = (self.get_parameter('user_command')
+                   .get_parameter_value().string_value)
+            self.command_queue.append((act, obj))
+
         # Publishers
         self.map_pub           = self.create_publisher(
             OccupancyGrid, '/map', 10)
@@ -244,8 +299,17 @@ class ExploreAndFind(Node):
 
         self.get_logger().info('=' * 55)
         self.get_logger().info(
-            'Explore & Find  (frontier exploration + object detection)')
-        self.get_logger().info(f'  Target : YOLO class_id={self.target_class_id}')
+            'Explore & Find  (frontier exploration + voice commands)')
+        if self.skip_voice:
+            obj = (self.get_parameter('target_object')
+                   .get_parameter_value().string_value)
+            act = (self.get_parameter('user_command')
+                   .get_parameter_value().string_value)
+            self.get_logger().info(
+                f'  Mode   : skip_voice (hardcoded: {act} {obj})')
+        else:
+            self.get_logger().info(
+                f'  Mode   : voice commands via /target_object')
         self.get_logger().info(
             f'  Grid   : {self.GRID_SIZE}x{self.GRID_SIZE} '
             f'@ {self.GRID_RESOLUTION} m/cell '
@@ -757,6 +821,63 @@ class ExploreAndFind(Node):
             return True
 
         return False
+
+    # ── Voice command callbacks ───────────────────────────────────────────
+
+    def _user_command_cb(self, msg: String):
+        if self.skip_voice:
+            return
+        action = msg.data.strip().lower()
+        if action:
+            self._last_voice_action = action
+            self.get_logger().info(f'[VOICE] Action received: {action}')
+
+    def _target_object_cb(self, msg: String):
+        if self.skip_voice:
+            return
+        obj = msg.data.strip().lower()
+        if not obj:
+            return
+        action = self._last_voice_action
+        self.command_queue.append((action, obj))
+        self.get_logger().info(f'[VOICE] Queued command: {action} {obj}')
+
+    def _start_next_command(self):
+        """Pop the next command from the queue and begin exploring for it."""
+        if not self.command_queue:
+            self.state = ExploreState.WAITING_FOR_COMMAND
+            self.get_logger().info(
+                '[CMD] No more commands — waiting for voice input...')
+            return
+
+        action, obj_name = self.command_queue.popleft()
+        self.current_action = action
+        self.current_object_name = obj_name
+
+        class_id = YOLO_CLASS_MAP.get(obj_name.lower())
+        if class_id is None:
+            self.get_logger().warn(
+                f'[CMD] Unknown object "{obj_name}" — not in YOLO class map. '
+                f'Skipping.')
+            self._start_next_command()
+            return
+
+        self.target_class_id = class_id
+        self._reset_detection_state()
+        self.get_logger().info('=' * 55)
+        self.get_logger().info(
+            f'NEW COMMAND: {action} {obj_name} (YOLO class {class_id})')
+        self.get_logger().info('=' * 55)
+        self._start_scan()
+
+    def _reset_detection_state(self):
+        """Clear detection state for a new target (keeps the map)."""
+        self.object_world_pos = None
+        self.detection_times = []
+        self.last_detection_pos = None
+        self.latest_yolo_detection = None
+        self.depth_steer_start = None
+        self.no_frontier_count = 0
 
     def _estimate_object_position(self, u, v):
         """Estimate world (x, y) of pixel (u, v) using depth + TF."""
@@ -1560,24 +1681,21 @@ class ExploreAndFind(Node):
             (self.hit_count >= self.MIN_HIT_COUNT)))
         total    = self.GRID_SIZE ** 2
 
+        name = self.current_object_name.upper() or 'TARGET'
         self.get_logger().info('=' * 55)
         if self.object_world_pos is not None:
             ox, oy = self.object_world_pos
             self.get_logger().info(
-                f'FOUND TARGET OBJECT at '
-                f'({ox:.2f}, {oy:.2f})')
+                f'FOUND {name} at ({ox:.2f}, {oy:.2f})')
         else:
-            self.get_logger().info('EXPLORATION COMPLETE — object not found')
+            self.get_logger().info(f'{name} NOT FOUND')
         self.get_logger().info(f'  Coverage : {(free+occupied)/total*100:.1f}%')
         self.get_logger().info(f'  Free     : {free}')
         self.get_logger().info(f'  Confirmed occupied : {occupied}')
         self.get_logger().info('=' * 55)
 
-        while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=1.0)
-            self.publish_map()
-            if self.object_world_pos is not None:
-                self.publish_object_marker()
+        # Transition to next command (or wait for one)
+        self._start_next_command()
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -1594,9 +1712,14 @@ class ExploreAndFind(Node):
                 except Exception:
                     pass
 
-        self.get_logger().info(
-            f'Sensors ready — exploring for YOLO class_id={self.target_class_id}!')
-        self._start_scan()
+        self.get_logger().info('Sensors ready!')
+
+        # If a command is already queued (skip_voice), start immediately
+        if self.command_queue:
+            self._start_next_command()
+        else:
+            self.get_logger().info(
+                'Waiting for voice command on /target_object ...')
 
         self._dbg_last = 0.0
         self._dbg_depth_count = 0
@@ -1643,7 +1766,11 @@ class ExploreAndFind(Node):
                     self.object_world_pos is None):
                 self._check_for_object()
 
-            if   self.state == ExploreState.SCANNING:
+            if self.state == ExploreState.WAITING_FOR_COMMAND:
+                # Check if a new command arrived via voice callback
+                if self.command_queue:
+                    self._start_next_command()
+            elif self.state == ExploreState.SCANNING:
                 self._state_scanning()
             elif self.state == ExploreState.SELECTING:
                 self._state_selecting()
@@ -1653,7 +1780,6 @@ class ExploreAndFind(Node):
                 self._state_approaching()
             elif self.state == ExploreState.COMPLETE:
                 self._state_complete()
-                break
 
 
 def main(args=None):
