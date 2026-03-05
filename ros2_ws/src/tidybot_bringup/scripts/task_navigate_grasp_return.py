@@ -233,6 +233,16 @@ class NavigateGraspReturnNode(NavigationTaskNode):
             f'voice_cmd={self.use_voice_command}')
 
     # ------------------------------------------------------------------
+    # Disable depth-based obstacle avoidance — on real hardware the depth
+    # image picks up the target, table edges, arms, etc. as "obstacles"
+    # causing the robot to freeze or swerve.  YOLO approach already stops
+    # at the right distance via depth-to-target.
+    # ------------------------------------------------------------------
+
+    def is_obstacle_blocking(self) -> bool:
+        return False
+
+    # ------------------------------------------------------------------
     # Additional callbacks
     # ------------------------------------------------------------------
 
