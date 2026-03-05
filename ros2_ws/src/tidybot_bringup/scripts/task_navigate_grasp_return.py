@@ -3,10 +3,12 @@
 Navigate to YOLO target, grasp it, then return to initial odometry pose.
 
 Extends NavigateAndReturnNode by inserting a top-down grasp sequence
-between arriving at the target and returning home.
+between arriving at the target and returning home.  Optionally accepts
+a voice command (via microphone + Gemini) to select the target object.
 
 State machine:
-    INIT -> NAVIGATE_TO_TARGET (seek banana via YOLO)
+    INIT -> VOICE_COMMAND      (optional: listen, transcribe, set target)
+         -> NAVIGATE_TO_TARGET (seek target via YOLO)
          -> GRASPING           (stop base, run grasp pipeline)
          -> RETURNING_HOME     (drive back with object)
          -> DONE               (open gripper, stow arm, hold)
@@ -14,15 +16,25 @@ State machine:
 Requires:
     - ros2 launch tidybot_bringup sim.launch.py  (or real.launch.py use_planner:=true)
     - ros2 run object_classification classifier
+    - (voice mode) ros2 run tidybot_control microphone_node
+    - (voice mode) GEMINI_API_KEY env var or gemini_api_key param
 
 Usage:
     ros2 run tidybot_bringup task_navigate_grasp_return.py
     ros2 run tidybot_bringup task_navigate_grasp_return.py --ros-args -p sim:=false
     ros2 run tidybot_bringup task_navigate_grasp_return.py --ros-args \
         -p target_class_id:=46 -p grasp_arm:=right
+
+    # With voice command:
+    ros2 run tidybot_bringup task_navigate_grasp_return.py --ros-args \
+        -p use_voice_command:=true -p gemini_api_key:=YOUR_KEY
 """
 
+import os
+import tempfile
 import time
+import wave
+
 import numpy as np
 import rclpy
 from rclpy.qos import QoSProfile, ReliabilityPolicy  # noqa: F401
@@ -36,7 +48,7 @@ from sensor_msgs.msg import Image, CameraInfo, JointState
 from geometry_msgs.msg import Pose, Quaternion
 from std_msgs.msg import Float64MultiArray
 from tidybot_msgs.msg import ArmCommand
-from tidybot_msgs.srv import PlanToTarget
+from tidybot_msgs.srv import PlanToTarget, AudioRecord
 
 from task_navigate_with_avoidance import NavigationTaskNode
 
@@ -199,9 +211,26 @@ class NavigateGraspReturnNode(NavigationTaskNode):
         # Store raw YOLO detections for the grasp pipeline
         self._raw_yolo_detections = None
 
+        # --- voice command ---
+        self.use_voice_command = bool(
+            self.declare_parameter('use_voice_command', False).value)
+        self.voice_record_duration = float(
+            self.declare_parameter('voice_record_duration', 5.0).value)
+        self.gemini_api_key = str(
+            self.declare_parameter('gemini_api_key', '').value)
+        if not self.gemini_api_key:
+            self.gemini_api_key = os.environ.get('GEMINI_API_KEY', '')
+        self.voice_command_received = not self.use_voice_command
+
+        if self.use_voice_command:
+            self.mic_client = self.create_client(
+                AudioRecord, '/microphone/record',
+                callback_group=self._service_cb_group)
+
         self.get_logger().info(
             f'NavigateGraspReturn: arm={self.grasp_arm}, '
-            f'target={self.grasp_target_name}, sim={self.is_sim}')
+            f'target={self.grasp_target_name}, sim={self.is_sim}, '
+            f'voice_cmd={self.use_voice_command}')
 
     # ------------------------------------------------------------------
     # Additional callbacks
@@ -251,10 +280,142 @@ class NavigateGraspReturnNode(NavigationTaskNode):
         super().handle_init(current_time)
 
     # ------------------------------------------------------------------
+    # Voice command pipeline
+    # ------------------------------------------------------------------
+
+    def _run_voice_command(self):
+        """Record audio via microphone service, then parse with Gemini."""
+        self.get_logger().info('=' * 50)
+        self.get_logger().info('VOICE COMMAND: Waiting for microphone service...')
+        self.get_logger().info('=' * 50)
+
+        if not self.mic_client.wait_for_service(timeout_sec=10.0):
+            self.get_logger().warn(
+                'Microphone service not available — using default target.')
+            self.voice_command_received = True
+            return
+
+        # Start recording
+        req = AudioRecord.Request()
+        req.start = True
+        future = self.mic_client.call_async(req)
+        if not self._wait_for_future(future, 5.0):
+            self.get_logger().error('Failed to start recording.')
+            self.voice_command_received = True
+            return
+        resp = future.result()
+        if not resp.success:
+            self.get_logger().error(f'Mic start failed: {resp.message}')
+            self.voice_command_received = True
+            return
+
+        self.get_logger().info(
+            f'Recording for {self.voice_record_duration:.0f}s — speak now!')
+        self._spin_for(self.voice_record_duration)
+
+        # Stop recording
+        req = AudioRecord.Request()
+        req.start = False
+        future = self.mic_client.call_async(req)
+        if not self._wait_for_future(future, 10.0):
+            self.get_logger().error('Failed to stop recording.')
+            self.voice_command_received = True
+            return
+        resp = future.result()
+        if not resp.success or len(resp.audio_data) == 0:
+            self.get_logger().warn('No audio recorded — using default target.')
+            self.voice_command_received = True
+            return
+
+        self.get_logger().info(
+            f'Recorded {resp.duration:.2f}s of audio. Sending to Gemini...')
+
+        target = self._parse_voice_with_gemini(
+            resp.audio_data, resp.sample_rate)
+        if target and target != 'unknown':
+            self._set_target_from_voice(target)
+        else:
+            self.get_logger().warn(
+                f'Could not parse target ("{target}") — keeping default: '
+                f'{self.grasp_target_name}')
+
+        self.voice_command_received = True
+
+    def _parse_voice_with_gemini(self, audio_data, sample_rate):
+        """Convert audio to WAV, send to Gemini for transcription + parsing."""
+        try:
+            import google.generativeai as genai
+
+            if not self.gemini_api_key:
+                self.get_logger().error('No Gemini API key set.')
+                return None
+
+            genai.configure(api_key=self.gemini_api_key)
+
+            # Save float32 PCM -> int16 WAV temp file
+            wav_path = os.path.join(tempfile.gettempdir(), 'tidybot_voice.wav')
+            audio_int16 = (np.array(audio_data, dtype=np.float32) * 32767
+                           ).clip(-32768, 32767).astype(np.int16)
+            with wave.open(wav_path, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(int(sample_rate))
+                wf.writeframes(audio_int16.tobytes())
+
+            audio_file = genai.upload_file(wav_path)
+            model = genai.GenerativeModel('gemini-2.0-flash')
+
+            known_objects = ', '.join(YOLO_CLASS_IDS.keys())
+            prompt = (
+                'Listen to this audio clip. The user is telling a robot which '
+                'object to pick up. The known objects are: '
+                f'{known_objects}. '
+                'Respond with ONLY the object name in lowercase '
+                "(e.g. 'banana'). If you cannot determine the object, "
+                "respond with 'unknown'."
+            )
+
+            response = model.generate_content([prompt, audio_file])
+            target = response.text.strip().lower().strip("'\".")
+            self.get_logger().info(f'Gemini response: "{target}"')
+
+            # Clean up
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+
+            return target
+
+        except Exception as e:
+            self.get_logger().error(f'Gemini voice parsing failed: {e}')
+            return None
+
+    def _set_target_from_voice(self, target_name):
+        """Update YOLO target class based on voice command."""
+        if target_name in YOLO_CLASS_IDS:
+            self.grasp_target_name = target_name
+            new_id = int(YOLO_CLASS_IDS[target_name])
+            self.target_class_id = new_id
+            self.get_logger().info(
+                f'Voice command: target set to "{target_name}" '
+                f'(class_id={new_id})')
+        else:
+            self.get_logger().warn(
+                f'Unknown object "{target_name}" — keeping default: '
+                f'{self.grasp_target_name}')
+
+    # ------------------------------------------------------------------
     # State machine override: intercept target-reached -> grasp -> return
     # ------------------------------------------------------------------
 
     def handle_seek_target(self, current_time):
+        # Phase 0: voice command (blocking — runs once before navigation)
+        if not self.voice_command_received:
+            self.publish_hold_position()
+            self._run_voice_command()
+            return
+
         # Phase 3: returning home after grasp
         if self.return_home_active:
             self._handle_return_home()
