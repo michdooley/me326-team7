@@ -45,6 +45,7 @@ install(PROGRAMS
   scripts/yolo_grasp_demo.py
   scripts/gpd_grasp_demo.py
   scripts/topdown_grasp_demo.py
+  scripts/test_grasp_validation.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
