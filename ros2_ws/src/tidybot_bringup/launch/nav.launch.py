@@ -51,14 +51,9 @@ def generate_launch_description():
             ]
         ),
 
-        # 3. Voice Command Node (The "Ears")
-        # Only launched when skip_voice is false.
-        # Publishes /target_object and /user_command from mic input.
-        Node(
-            package='tidybot_bringup',
-            executable='voice_command.py',
-            name='voice_command',
-            output='screen',
-            condition=UnlessCondition(skip_voice),
-        ),
+        # 3. Voice Command Node — run in a separate interactive terminal:
+        #   ros2 run tidybot_bringup voice_command.py
+        # Or manually publish:
+        #   ros2 topic pub --once /user_command std_msgs/msg/String "data: 'get'"
+        #   ros2 topic pub --once /target_object std_msgs/msg/String "data: 'banana'"
     ])

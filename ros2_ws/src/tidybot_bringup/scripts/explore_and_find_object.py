@@ -37,7 +37,10 @@ Terminal 1 — sim:
 Terminal 2 — nav (hardcoded target, no mic):
     ros2 launch tidybot_bringup nav.launch.py target_object:=banana
 
-Terminal 2 — nav (voice mode, launches voice_command node automatically):
+Terminal 2 — nav (voice mode, wait for voice command):
+    ros2 launch tidybot_bringup nav.launch.py skip_voice:=false
+
+Terminal 3 - interactive voice command script that will start nav
     ros2 launch tidybot_bringup nav.launch.py skip_voice:=false
 
 To manually publish a voice command instead of using the mic:
