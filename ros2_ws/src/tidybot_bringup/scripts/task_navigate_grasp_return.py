@@ -110,11 +110,11 @@ class NavigateGraspReturnNode(NavigationTaskNode):
 
     # Wider center tolerance so the robot drives forward more and turns less.
     # Prevents swerving from YOLO bbox jitter on real hardware.
-    APPROACH_CENTER_TOLERANCE = 0.25
-    APPROACH_CENTER_HYSTERESIS = 0.10
-    SEEK_HEADING_GAIN = 0.25          # gentler heading correction
-    SIMPLE_CENTER_TURN_STEP_RAD = 0.05  # smaller turn steps
-    SIMPLE_FORWARD_STEP_M = 0.15     # bigger forward steps when centered
+    # APPROACH_CENTER_TOLERANCE = 0.25
+    # APPROACH_CENTER_HYSTERESIS = 0.10
+    # SEEK_HEADING_GAIN = 0.25          # gentler heading correction
+    # SIMPLE_CENTER_TURN_STEP_RAD = 0.05  # smaller turn steps
+    # SIMPLE_FORWARD_STEP_M = 0.15     # bigger forward steps when centered
 
     # Grasp parameters
     GRASP_ARM = 'right'
@@ -249,6 +249,59 @@ class NavigateGraspReturnNode(NavigationTaskNode):
 
     def is_obstacle_blocking(self) -> bool:
         return False
+
+    def _handle_simple_yolo_approach(self):
+        """Dead-simple approach: see banana → turn toward it → drive straight."""
+        now = self.get_clock().now()
+        target_visible = self.red_target_visible and self.red_bbox_color is not None
+
+        if not target_visible:
+            # Lost sight — hold position briefly, memory will keep us in approach mode
+            self.publish_hold_position()
+            return
+
+        # Compute horizontal error from bbox center
+        rx, _, rw, _ = self.red_bbox_color
+        img_w = float(max(self.latest_color_shape[1], 1)) if self.latest_color_shape is not None else 640.0
+        x_error = ((rx + 0.5 * rw) / img_w - 0.5) * 2.0  # -1..+1
+
+        distance_m = self.red_target_distance_m
+        if distance_m is not None:
+            self.last_target_distance_m = distance_m
+        else:
+            distance_m = self.last_target_distance_m
+
+        # Check if we're close enough to stop
+        stop_dist = self.seek_target_stop_distance_m + self.approach_stop_distance_buffer_m
+        if distance_m is not None and distance_m <= stop_dist:
+            self.publish_hold_position()
+            if not self.red_target_reached_logged:
+                self.get_logger().info(f'Target reached at {distance_m:.2f}m. Stopping.')
+                self.red_target_reached_logged = True
+            return
+        self.red_target_reached_logged = False
+
+        # Compute heading toward the banana
+        bearing = self.approach_turn_sign * 0.3 * x_error
+        target_theta = self.current_theta + np.clip(bearing, -0.15, 0.15)
+
+        # Always drive forward while correcting heading (no separate rotate step)
+        step = 0.12
+        if distance_m is not None:
+            step = float(np.clip(distance_m - self.seek_target_stop_distance_m, 0.04, 0.15))
+        target_x = self.current_x + step * np.cos(target_theta)
+        target_y = self.current_y + step * np.sin(target_theta)
+        self.publish_pose_target(target_x, target_y, target_theta)
+
+        # Auto-tilt camera to keep banana in view
+        if self.auto_tilt_enable and self.latest_color_shape is not None:
+            _, by, _, bh = self.red_bbox_color
+            img_h = float(max(self.latest_color_shape[0], 1))
+            y_frac = (by + 0.5 * bh) / img_h
+            if y_frac > 0.8:
+                self._nudge_tilt(down=True, scale=0.5)
+            elif y_frac < 0.4:
+                self._nudge_tilt(down=False, scale=0.5)
 
     # ------------------------------------------------------------------
     # Additional callbacks
