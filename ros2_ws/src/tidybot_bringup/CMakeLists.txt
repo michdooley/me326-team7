@@ -38,6 +38,12 @@ install(PROGRAMS
   scripts/example_state_machine.py
   scripts/trajectory_tracking.py
   scripts/drop_item_sim.py
+  scripts/drop_item_in_bin.py
+  scripts/test_drop_item_in_bin.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+# Install drop_verification as module (same dir as scripts for import)
+install(FILES scripts/drop_verification.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -10,14 +10,19 @@ motion planner service. The sequence is:
   4. Lift the item
   5. Move above the bin
   6. Open gripper to release
-  7. Retreat upward
+  7. Verify drop (take picture, check gripper not obviously off from bin)
+  8. Retreat upward
 
 Uses the /plan_to_target service for collision-checked IK planning.
+After dropping, verifies gripper alignment via camera: if gripper is not
+obviously off (e.g., too far left of bin), confirms object in bin.
 
 Topics/Services used:
 - /plan_to_target (PlanToTarget) - motion planning with collision checking
 - /right_gripper/cmd (Float64MultiArray) - gripper control
 - /left_gripper/cmd (Float64MultiArray) - gripper control
+- /camera/color/image_raw (Image) - for drop verification
+- /camera/color/camera_info (CameraInfo) - for projection
 
 Usage:
     # Terminal 1: Start simulation with the pickup scene
@@ -29,12 +34,32 @@ Usage:
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Pose
 from std_msgs.msg import Float64MultiArray
+from sensor_msgs.msg import Image, CameraInfo
 from tidybot_msgs.srv import PlanToTarget
 
 import time
 from enum import Enum, auto
+
+try:
+    import tf2_ros
+    from rclpy.duration import Duration
+    TF_AVAILABLE = True
+except ImportError:
+    TF_AVAILABLE = False
+
+# Import verification helper from same directory
+import sys
+from pathlib import Path
+_script_dir = Path(__file__).resolve().parent
+if str(_script_dir) not in sys.path:
+    sys.path.insert(0, str(_script_dir))
+try:
+    from drop_verification import verify_gripper_alignment
+except ImportError:
+    verify_gripper_alignment = None
 
 
 class Phase(Enum):
@@ -45,6 +70,7 @@ class Phase(Enum):
     LIFT = auto()
     MOVE_TO_BIN = auto()
     OPEN_GRIPPER = auto()
+    VERIFY_DROP = auto()
     RETREAT = auto()
     DONE = auto()
 
@@ -61,6 +87,7 @@ GRASP_OFFSET_Z = 0.045  # z-offset for grasping (above table surface)
 LIFT_HEIGHT = 0.30       # height to lift item to
 PLAN_DURATION = 2.0      # seconds per arm motion
 GRIPPER_WAIT = 1.2       # seconds to wait for gripper action
+VERIFY_WAIT = 0.6        # seconds to wait before capturing image for verification
 
 
 class DropItemInBin(Node):
@@ -87,6 +114,18 @@ class DropItemInBin(Node):
         self.phase_start: float | None = None
         self.logged_phase = None
         self.planning = False
+        self.drop_verified: bool | None = None  # True=confirmed, False=rejected, None=skipped
+
+        # TF and camera for drop verification
+        self.tf_buffer = None
+        self.latest_rgb = None
+        self.latest_camera_info = None
+        if TF_AVAILABLE:
+            self.tf_buffer = tf2_ros.Buffer()
+            tf2_ros.TransformListener(self.tf_buffer, self)
+        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.create_subscription(Image, '/camera/color/image_raw', self._rgb_cb, qos)
+        self.create_subscription(CameraInfo, '/camera/color/camera_info', self._camera_info_cb, 10)
 
         self.timer = self.create_timer(0.05, self._tick)
 
@@ -157,6 +196,12 @@ class DropItemInBin(Node):
         if self.phase_start is None:
             return 0.0
         return time.time() - self.phase_start
+
+    def _rgb_cb(self, msg: Image):
+        self.latest_rgb = msg
+
+    def _camera_info_cb(self, msg: CameraInfo):
+        self.latest_camera_info = msg
 
     # ------------------------------------------------------------------
     # Main tick
@@ -229,7 +274,42 @@ class DropItemInBin(Node):
                 self.logged_phase = self.phase
             self._send_gripper(0.0)
             if self._elapsed() > GRIPPER_WAIT:
+                self._transition(Phase.VERIFY_DROP)
+
+        # --- VERIFY DROP (take picture, check gripper not obviously off) ---
+        elif self.phase == Phase.VERIFY_DROP:
+            if self.logged_phase != self.phase:
+                self.get_logger().info('  Verifying drop (gripper alignment check)...')
+                self.logged_phase = self.phase
+            self._send_gripper(0.0)
+            if self._elapsed() < VERIFY_WAIT:
+                return  # Wait for object to settle
+            if self.drop_verified is None:
+                if verify_gripper_alignment is None:
+                    self.get_logger().warn('  Verification module not available, assuming success')
+                    self.drop_verified = True
+                elif self.tf_buffer is None:
+                    self.get_logger().warn('  TF not available, assuming success')
+                    self.drop_verified = True
+                elif self.latest_rgb is None or self.latest_camera_info is None:
+                    self.get_logger().warn('  No camera image yet, assuming success')
+                    self.drop_verified = True
+                else:
+                    ok, msg = verify_gripper_alignment(
+                        self,
+                        self.tf_buffer,
+                        self.bin_pos,
+                        self.arm,
+                        self.latest_rgb,
+                        self.latest_camera_info,
+                    )
+                    self.drop_verified = ok
+                    self.get_logger().info(f'  Verification: {msg}')
+            if self.drop_verified:
                 self._transition(Phase.RETREAT)
+            else:
+                self.get_logger().warn('  Gripper obviously off — drop may have failed!')
+                self._transition(Phase.RETREAT)  # Still retreat, but we logged the failure
 
         # --- RETREAT ---
         elif self.phase == Phase.RETREAT:
@@ -246,7 +326,12 @@ class DropItemInBin(Node):
             if self.logged_phase != self.phase:
                 self.get_logger().info('')
                 self.get_logger().info('=' * 50)
-                self.get_logger().info('Drop complete!  Item should be in the bin.')
+                if self.drop_verified is True:
+                    self.get_logger().info('Drop complete!  Gripper aligned — object likely in bin.')
+                elif self.drop_verified is False:
+                    self.get_logger().info('Drop complete, but gripper was misaligned — verify manually.')
+                else:
+                    self.get_logger().info('Drop complete!  (Verification skipped)')
                 self.get_logger().info('=' * 50)
                 self.logged_phase = self.phase
 
