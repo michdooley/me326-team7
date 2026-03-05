@@ -250,6 +250,30 @@ class NavigateGraspReturnNode(NavigationTaskNode):
     def is_obstacle_blocking(self) -> bool:
         return False
 
+    def handle_seek_target(self, current_time):
+        """Skip search_scan spin — hold still until YOLO sees banana, then approach."""
+        if self.red_target_reached_logged:
+            self.publish_hold_position()
+            return
+
+        target_visible = self.red_target_visible and self.red_bbox_color is not None
+
+        if target_visible:
+            if self.seek_mode != 'approach':
+                self.seek_mode = 'approach'
+                self.approach_avoid_active = False
+                self.approach_centered_locked = False
+                self.approach_reached_visible_streak = 0
+                self.get_logger().info('Banana detected — driving toward it.')
+        else:
+            if self.seek_mode != 'approach':
+                # No banana yet — just wait, don't spin
+                self.publish_hold_position()
+                return
+
+        if self.seek_mode == 'approach':
+            self._handle_simple_yolo_approach()
+
     def _handle_simple_yolo_approach(self):
         """Dead-simple approach: see banana → turn toward it → drive straight."""
         now = self.get_clock().now()
