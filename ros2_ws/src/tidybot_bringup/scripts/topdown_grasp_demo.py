@@ -153,11 +153,20 @@ class TopdownGraspDemo(Node):
             self.create_subscription(
                 JointState, '/joint_states', self._js_callback, 10)
 
-            # Import depth alignment utility
-            sys.path.insert(
-                0, str(Path(__file__).resolve().parent.parent / 'utilities'))
-            from align_depth_to_rgb import align_depth  # noqa: E402
-            self._align_depth_fn = align_depth
+            # Import RGB-to-depth alignment utility
+            _script_dir = Path(__file__).resolve().parent
+            for _p in [_script_dir / 'utilities', _script_dir.parent / 'utilities']:
+                if _p.is_dir():
+                    sys.path.insert(0, str(_p))
+                    break
+            from align_rgb_to_depth import align_rgb  # noqa: E402
+            self._align_rgb_fn = align_rgb
+
+            # Subscribe to depth camera info for back-projection
+            self.depth_camera_info = None
+            self.create_subscription(
+                CameraInfo, '/camera/depth/camera_info',
+                self._depth_info_cb, 10)
 
         # Service clients
         self.plan_client = self.create_client(PlanToTarget, '/plan_to_target')
@@ -175,6 +184,10 @@ class TopdownGraspDemo(Node):
 
     def _info_cb(self, msg):
         self.camera_info = msg
+
+    def _depth_info_cb(self, msg):
+        """Store depth camera info (real hardware only)."""
+        self.depth_camera_info = msg
 
     def _js_callback(self, msg):
         """Track joint states (real hardware only)."""
@@ -270,12 +283,32 @@ class TopdownGraspDemo(Node):
             if i < num_steps:
                 time.sleep(dt)
 
-    def _align_depth(self):
-        """Align depth image to RGB frame (real hardware D435 only)."""
-        if self.latest_depth is not None and self.latest_rgb is not None:
-            self.latest_depth = self._align_depth_fn(
-                self.latest_depth, self.latest_rgb)
-            self.get_logger().info('  Depth image aligned to RGB frame')
+    def _align_rgb_to_depth(self):
+        """Align RGB image to depth frame (real hardware D435 only).
+
+        Preserves depth data untouched; only warps the RGB image.
+        """
+        if self.latest_rgb is not None and self.latest_depth is not None:
+            self.latest_rgb = self._align_rgb_fn(
+                self.latest_rgb, self.latest_depth)
+            self.get_logger().info('  RGB image aligned to depth frame')
+
+    def _rgb_pixel_to_depth_pixel(self, u_rgb, v_rgb):
+        """Transform pixel coordinates from RGB frame to depth frame.
+
+        Uses intrinsic matrices from both cameras. Real hardware only.
+        Returns (u_depth, v_depth) as floats.
+        """
+        if self.camera_info is None or self.depth_camera_info is None:
+            return u_rgb, v_rgb  # fallback: assume same frame
+
+        K_rgb = np.array(self.camera_info.k).reshape(3, 3)
+        K_depth = np.array(self.depth_camera_info.k).reshape(3, 3)
+
+        pt = np.array([u_rgb, v_rgb, 1.0])
+        pt_norm = np.linalg.inv(K_rgb) @ pt  # unproject from RGB
+        pt_depth = K_depth @ pt_norm           # reproject to depth
+        return float(pt_depth[0]), float(pt_depth[1])
 
     def publish_marker(self, x, y, z, r, g, b, label='', scale=0.03):
         m = Marker()
@@ -400,14 +433,23 @@ class TopdownGraspDemo(Node):
 
         Returns (depth_roi, u_offset, v_offset) or (None, None, None).
         """
+        cx = int(detection.bbox.center.position.x)
+        cy = int(detection.bbox.center.position.y)
+        bbox_w = float(detection.bbox.size_x)
+        bbox_h = float(detection.bbox.size_y)
+        return self._crop_depth_to_bbox_coords(cx, cy, bbox_w, bbox_h)
+
+    def _crop_depth_to_bbox_coords(self, cx, cy, bbox_w, bbox_h):
+        """Crop depth image to padded bounding box given explicit coordinates.
+
+        Returns (depth_roi, u_offset, v_offset) or (None, None, None).
+        """
         if self.latest_depth is None:
             return None, None, None
 
         h, w = self.latest_depth.shape
-        cx = int(detection.bbox.center.position.x)
-        cy = int(detection.bbox.center.position.y)
-        half_w = int(detection.bbox.size_x * self.bbox_pad / 2)
-        half_h = int(detection.bbox.size_y * self.bbox_pad / 2)
+        half_w = int(bbox_w * self.bbox_pad / 2)
+        half_h = int(bbox_h * self.bbox_pad / 2)
 
         u0 = max(0, cx - half_w)
         v0 = max(0, cy - half_h)
@@ -420,12 +462,21 @@ class TopdownGraspDemo(Node):
     def _depth_roi_to_points_base(self, depth_roi, u_offset, v_offset):
         """Back-project depth ROI to 3D point cloud in base_link frame.
 
+        On real hardware, uses depth camera intrinsics and depth optical frame.
+        In simulation, uses RGB camera intrinsics (same virtual camera).
+
         Returns (N, 3) numpy array or None.
         """
-        if self.camera_info is None:
-            return None
+        # Select intrinsics: depth on real hw, RGB (same camera) in sim
+        if not self.is_sim and self.depth_camera_info is not None:
+            K = self.depth_camera_info.k
+            tf_frame = 'camera_depth_optical_frame'
+        else:
+            if self.camera_info is None:
+                return None
+            K = self.camera_info.k
+            tf_frame = 'camera_color_optical_frame'
 
-        K = self.camera_info.k
         fx, fy, cx, cy = K[0], K[4], K[2], K[5]
 
         depth_m = depth_roi.astype(np.float32) / 1000.0
@@ -450,7 +501,7 @@ class TopdownGraspDemo(Node):
         points_cam = np.stack([x_cam, y_cam, z], axis=1)
 
         # Transform to base_link
-        tf_mat = self._get_tf_matrix('base_link', 'camera_color_optical_frame')
+        tf_mat = self._get_tf_matrix('base_link', tf_frame)
         if tf_mat is None:
             return None
 
@@ -614,11 +665,18 @@ class TopdownGraspDemo(Node):
         self.get_logger().info('Waiting for depth + camera info...')
         for _ in range(50):
             rclpy.spin_once(self, timeout_sec=0.2)
-            if self.latest_depth is not None and self.camera_info is not None:
+            has_basics = (self.latest_depth is not None
+                          and self.camera_info is not None)
+            has_depth_info = self.is_sim or self.depth_camera_info is not None
+            if has_basics and has_depth_info:
                 break
         if self.latest_depth is None or self.camera_info is None:
             self.get_logger().error('No depth/camera_info received -- aborting')
             return False
+        if not self.is_sim and self.depth_camera_info is None:
+            self.get_logger().warn(
+                'No depth camera_info received -- '
+                'falling back to RGB intrinsics for back-projection')
 
         # -- Step 1: YOLO detection ----------------------------------------
         self.spin_for(1.0)  # let data flow
@@ -645,13 +703,27 @@ class TopdownGraspDemo(Node):
             f'bbox {bbox_w:.0f}x{bbox_h:.0f}')
 
         # -- Step 2: Depth point cloud from bbox ROI -----------------------
-        # Align depth to RGB on real hardware (D435 sensor offset)
         if not self.is_sim:
-            self.get_logger().info('Aligning depth to RGB (real hardware)...')
-            self._align_depth()
+            # Transform YOLO bbox from RGB pixel space to depth pixel space
+            self.get_logger().info(
+                'Transforming bbox from RGB to depth pixel space...')
+            u, v = self._rgb_pixel_to_depth_pixel(u, v)
+            u, v = int(round(u)), int(round(v))
+            # Scale bbox size by focal length ratio (RGB→depth)
+            K_rgb = np.array(self.camera_info.k).reshape(3, 3)
+            K_depth = np.array(self.depth_camera_info.k).reshape(3, 3)
+            scale_x = K_depth[0, 0] / K_rgb[0, 0]
+            scale_y = K_depth[1, 1] / K_rgb[1, 1]
+            bbox_w = bbox_w * scale_x
+            bbox_h = bbox_h * scale_y
+            self.get_logger().info(
+                f'  Depth-frame bbox: center=({u}, {v}), '
+                f'size={bbox_w:.0f}x{bbox_h:.0f}')
 
         self.get_logger().info('Generating point cloud from depth ROI...')
-        depth_roi, u_off, v_off = self._crop_depth_to_bbox(det)
+        # Crop depth using (transformed) bbox coordinates
+        depth_roi, u_off, v_off = self._crop_depth_to_bbox_coords(
+            u, v, bbox_w, bbox_h)
         if depth_roi is None:
             self.get_logger().error('Failed to crop depth image')
             return False
