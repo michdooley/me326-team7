@@ -11,7 +11,7 @@ State machine:
   1. SCANNING    — 360 rotation scan, mapping depth into occupancy grid.
   2. SELECTING   — pick best frontier (or approach known object).
   3. NAVIGATING  — follow A* waypoints to frontier, checking for target.
-  4. APPROACHING — navigate to detected object's world position.
+  4. APPROACHING — navigate to detected object's worros2 launch tidybot_bringup sim.launch.py scene:=scene_banana_test.xml show_mujoco_viewer:=falseld position.
   5. COMPLETE    — object found and reached.
 
 Object detection uses HSV color filtering on the RGB camera feed.
@@ -30,26 +30,19 @@ Subscribes:
   /camera/depth/camera_info  — depth camera intrinsics
   /camera/color/image_raw    — RGB frames for object detection
 
-Prerequisites (terminal 1):
+Terminal 1 — sim:
     source ros2_ws/setup_env.bash
     ros2 launch tidybot_bringup sim.launch.py scene:=scene_banana_test.xml show_mujoco_viewer:=false
 
-
-Usage:
-    (Note: skip_voice=True is the default in nav.launch.py)
-
+Terminal 2 — nav (hardcoded target, no mic):
     ros2 launch tidybot_bringup nav.launch.py target_object:=banana
 
-For voice:
-    terminal 2: 
-        ros2 run tidybot_bringup explore_and_find_object.py --ros-args -p skip_voice:=false
+Terminal 2 — nav (voice mode, launches voice_command node automatically):
+    ros2 launch tidybot_bringup nav.launch.py skip_voice:=false
 
-    terminal 3 -- will prompt you to press enter, record 5s, transcribe, and publish. You can record again for sequential commands:
-        to test real voice command: 
-            ros2 run tidybot_bringup voice_command.py
-        to manually publish voice command:
-            ros2 topic pub --once /user_command std_msgs/msg/String "data: 'get'"
-            ros2 topic pub --once /target_object std_msgs/msg/String "data: 'banana'"
+To manually publish a voice command instead of using the mic:
+    ros2 topic pub --once /user_command std_msgs/msg/String "data: 'get'"
+    ros2 topic pub --once /target_object std_msgs/msg/String "data: 'banana'"
 """
 
 import heapq
@@ -259,12 +252,12 @@ class ExploreAndFind(Node):
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # Subscriptions
-        be = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        # Subscriptions — use RELIABLE to match the MuJoCo bridge publisher QoS
+        sensor_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
         self.create_subscription(Image,      '/camera/depth/image_raw',
-                                 self._depth_cb,       be)
+                                 self._depth_cb,       sensor_qos)
         self.create_subscription(CameraInfo, '/camera/depth/camera_info',
-                                 self._camera_info_cb, be)
+                                 self._camera_info_cb, sensor_qos)
         # self.create_subscription(Image,      '/camera/color/image_raw',
         #                          self._rgb_cb,         be)
         
@@ -1295,6 +1288,16 @@ class ExploreAndFind(Node):
         self.last_cmd_angular = 0.0
         self.cmd_vel_pub.publish(Twist())
 
+    def _nudge_forward(self, duration: float = 0.5):
+        """Drive forward briefly so re-scan gets a new vantage point."""
+        twist = Twist()
+        twist.linear.x = 0.15
+        end = time.time() + duration
+        while time.time() < end and rclpy.ok():
+            self.cmd_vel_pub.publish(twist)
+            rclpy.spin_once(self, timeout_sec=0.05)
+        self._stop_base()
+
     def _state_scanning(self):
         if self.scan_settle_start is not None:
             if time.time() - self.scan_settle_start >= self.SCAN_SETTLE_TIME:
@@ -1355,7 +1358,8 @@ class ExploreAndFind(Node):
                 self.get_logger().info(
                     f'[SELECT] No frontiers '
                     f'({self.no_frontier_count}/{self.NO_FRONTIER_LIMIT}) '
-                    f'— re-scanning.')
+                    f'— nudging forward then re-scanning.')
+                self._nudge_forward(0.5)
                 self._start_scan()
             return
 
@@ -1402,7 +1406,9 @@ class ExploreAndFind(Node):
                 return
 
         self.get_logger().warn(
-            '[SELECT] No path to any frontier at any clearance — re-scanning.')
+            '[SELECT] No path to any frontier at any clearance '
+            '— nudging forward then re-scanning.')
+        self._nudge_forward(0.5)
         self._start_scan()
 
     def _state_navigating(self):

@@ -45,6 +45,8 @@ install(PROGRAMS
   scripts/pick_up_block_real.py
   scripts/frontier_exploration.py
   scripts/explore_and_find_object.py
+  scripts/voice_command.py
+  scripts/speech_to_text.py
   scripts/objective1_task.py
   DESTINATION lib/${PROJECT_NAME}
 )

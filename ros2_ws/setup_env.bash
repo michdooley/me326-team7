@@ -61,14 +61,17 @@ else
     fi
 fi
 
-# 2.5. Check for required ROS2 apt packages (not managed by uv)
-MISSING_PKGS=()
+# 2.5. Check for required system packages (not managed by uv)
+MISSING_APT=()
 if ! python3 -c "import vision_msgs" 2>/dev/null; then
-    MISSING_PKGS+=("ros-${ROS_DISTRO}-vision-msgs")
+    MISSING_APT+=("ros-${ROS_DISTRO}-vision-msgs")
 fi
-if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
-    echo "⚠ Missing ROS2 packages: ${MISSING_PKGS[*]}"
-    echo "  Install with: sudo apt install -y ${MISSING_PKGS[*]}"
+if ! dpkg -s libportaudio2 >/dev/null 2>&1; then
+    MISSING_APT+=("libportaudio2")
+fi
+if [ ${#MISSING_APT[@]} -gt 0 ]; then
+    echo "⚠ Missing system packages: ${MISSING_APT[*]}"
+    echo "  Install with: sudo apt install -y ${MISSING_APT[*]}"
 fi
 
 # 3. Set repo root for finding simulation assets

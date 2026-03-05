@@ -34,6 +34,10 @@ dependencies = [
     "modern-robotics>=1.1.0",
     # Object detection
     "ultralytics>=8.0.0",
+    # Voice commands
+    "sounddevice>=0.4.0",
+    "google-generativeai>=0.5.0",
+    "google-cloud-speech>=2.20.0",
 ]
 
 # =============================================================================

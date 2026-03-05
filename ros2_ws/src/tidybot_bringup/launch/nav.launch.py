@@ -1,32 +1,64 @@
 import os
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.conditions import UnlessCondition
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 def generate_launch_description():
+    # Launch arguments
+    skip_voice_arg = DeclareLaunchArgument(
+        'skip_voice', default_value='true',
+        description='Skip voice commands and use hardcoded target')
+    target_object_arg = DeclareLaunchArgument(
+        'target_object', default_value='banana',
+        description='Object name when skip_voice is true')
+    user_command_arg = DeclareLaunchArgument(
+        'user_command', default_value='get',
+        description='Action verb when skip_voice is true')
+
+    skip_voice = LaunchConfiguration('skip_voice')
+    target_object = LaunchConfiguration('target_object')
+    user_command = LaunchConfiguration('user_command')
+
     return LaunchDescription([
+        skip_voice_arg,
+        target_object_arg,
+        user_command_arg,
+
         # 1. The YOLO Object Classifier (The "Eyes")
-        # This node takes /camera/color/image_raw and outputs /objbbox
+        # Subscribes /camera/color/image_raw, publishes /objbbox
         Node(
-            package='object_classification', # Your package name
+            package='object_classification',
             executable='classifier',
             name='classifier',
             output='screen',
-            parameters=[{'use_sim_time': False}] # Set to True if in MuJoCo
+            parameters=[{'use_sim_time': False}]
         ),
 
         # 2. The Explore and Find Node (The "Brain")
-        # This node takes /objbbox and /camera/depth/image_raw to move the robot
+        # Subscribes /objbbox + depth, publishes /cmd_vel
         Node(
             package='tidybot_bringup',
             executable='explore_and_find_object.py',
             name='explorer',
             output='screen',
             parameters=[
-                {'skip_voice': True},        # True = hardcode target, no mic needed
-                {'target_object': 'banana'}, # object name (used when skip_voice=True)
-                {'user_command': 'get'},     # action verb  (used when skip_voice=True)
+                {'skip_voice': skip_voice},
+                {'target_object': target_object},
+                {'user_command': user_command},
                 {'use_sim_time': False}
             ]
-        )
+        ),
+
+        # 3. Voice Command Node (The "Ears")
+        # Only launched when skip_voice is false.
+        # Publishes /target_object and /user_command from mic input.
+        Node(
+            package='tidybot_bringup',
+            executable='voice_command.py',
+            name='voice_command',
+            output='screen',
+            condition=UnlessCondition(skip_voice),
+        ),
     ])

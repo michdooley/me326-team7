@@ -35,9 +35,10 @@ class ObjectClassifier(Node):
         self.yolo_image_pub = self.create_publisher(Image, '/camera/color/image_yolo', 10)
 
         # Subscribe with depth=1 to only keep latest frame
-        be = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        # Use RELIABLE to match the MuJoCo bridge publisher QoS
+        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
         self.subscription = self.create_subscription(
-            Image, '/camera/color/image_raw', self.listener_callback, be)
+            Image, '/camera/color/image_raw', self.listener_callback, qos)
 
     def listener_callback(self, msg):
         # Rate-limit inference to avoid starving other nodes of CPU
