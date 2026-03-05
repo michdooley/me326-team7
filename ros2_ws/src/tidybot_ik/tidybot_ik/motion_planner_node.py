@@ -499,17 +499,19 @@ class MotionPlannerNode(Node):
         response.position_error = pos_error
         response.orientation_error = ori_error
 
-        # For wrapping joints (forearm_roll idx=3, wrist_rotate idx=5),
-        # the gripper is symmetric so ±π gives the same end-effector pose.
-        # Pick the solution closer to seed to avoid unnecessary 180° flips.
-        for idx in [3, 5]:
-            delta = solution[idx] - seed[idx]
-            if abs(delta) > np.pi / 2:
-                alt = solution[idx] - np.sign(delta) * np.pi
-                # Check alt is within joint limits
-                limits = list(self.JOINT_LIMITS.values())[idx]
-                if limits[0] <= alt <= limits[1]:
-                    solution[idx] = alt
+        # When orientation is unconstrained, normalize wrapping joints
+        # (forearm_roll idx=3, wrist_rotate idx=5) to stay near seed,
+        # avoiding unnecessary 180° flips during motion.
+        # When orientation IS constrained, the IK solution's joint values
+        # are needed to achieve the target orientation — don't modify them.
+        if not request.use_orientation:
+            for idx in [3, 5]:
+                delta = solution[idx] - seed[idx]
+                if abs(delta) > np.pi / 2:
+                    alt = solution[idx] - np.sign(delta) * np.pi
+                    limits = list(self.JOINT_LIMITS.values())[idx]
+                    if limits[0] <= alt <= limits[1]:
+                        solution[idx] = alt
 
         response.joint_positions = solution.tolist()
 
