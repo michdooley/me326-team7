@@ -475,6 +475,7 @@ class TopdownGraspDemo(Node):
     # -- Main pipeline -----------------------------------------------------
 
     def run(self):
+        """Execute top-down grasp. Returns True if holding object, False on failure."""
         self.get_logger().info('=' * 50)
         self.get_logger().info('Top-Down Grasp Demo')
         self.get_logger().info(f'  Target          : {self.target_object}')
@@ -508,7 +509,7 @@ class TopdownGraspDemo(Node):
                 break
         if self.latest_depth is None or self.camera_info is None:
             self.get_logger().error('No depth/camera_info received -- aborting')
-            return
+            return False
 
         # -- Step 1: YOLO detection ----------------------------------------
         self.spin_for(1.0)  # let data flow
@@ -524,7 +525,7 @@ class TopdownGraspDemo(Node):
         if det is None:
             self.get_logger().error(
                 f'Could not find "{self.target_object}" in camera view!')
-            return
+            return False
 
         u = int(det.bbox.center.position.x)
         v = int(det.bbox.center.position.y)
@@ -539,13 +540,13 @@ class TopdownGraspDemo(Node):
         depth_roi, u_off, v_off = self._crop_depth_to_bbox(det)
         if depth_roi is None:
             self.get_logger().error('Failed to crop depth image')
-            return
+            return False
 
         pts_base = self._depth_roi_to_points_base(depth_roi, u_off, v_off)
         if pts_base is None:
             self.get_logger().error(
                 f'Insufficient points in depth ROI (need >= {MIN_POINTS})')
-            return
+            return False
 
         self.get_logger().info(f'  Point cloud: {len(pts_base)} points')
 
@@ -566,7 +567,7 @@ class TopdownGraspDemo(Node):
         if result is None:
             self.get_logger().error('Grasp pose computation failed -- aborting')
             self.go_home()
-            return
+            return False
         grasp_pose, pre_grasp_pose, info = result
         self.get_logger().info(f'  Grasp params: {info}')
 
@@ -598,7 +599,7 @@ class TopdownGraspDemo(Node):
                 self.get_logger().error(
                     f'  Position-only IK also failed: {msg} -- aborting')
                 self.go_home()
-                return
+                return False
         else:
             self.get_logger().info('  IK OK')
 
@@ -611,7 +612,7 @@ class TopdownGraspDemo(Node):
                 pre_grasp_pose, 'pre-grasp', use_orientation=use_orientation):
             self.get_logger().error('Pre-grasp failed -- aborting')
             self.go_home()
-            return
+            return False
 
         self.get_logger().info('Settling at pre-grasp...')
         time.sleep(SETTLE_TIME)
@@ -621,7 +622,7 @@ class TopdownGraspDemo(Node):
                 grasp_pose, 'grasp', use_orientation=use_orientation):
             self.get_logger().error('Grasp descent failed -- aborting')
             self.go_home()
-            return
+            return False
 
         self.get_logger().info('Settling at grasp position...')
         time.sleep(SETTLE_TIME)
@@ -639,22 +640,31 @@ class TopdownGraspDemo(Node):
                 lift_pose, 'lift', use_orientation=use_orientation):
             self.get_logger().warn('Lift failed, but continuing...')
 
-        # -- Done ----------------------------------------------------------
-        self.get_logger().info('Returning home and releasing')
-        self.go_home()
-        self.set_gripper(0.0)
-
+        # -- Done (holding object) -----------------------------------------
         self.get_logger().info('')
         self.get_logger().info('=' * 50)
-        self.get_logger().info('Top-Down Grasp Demo complete!')
+        self.get_logger().info('Grasp complete — holding object.')
+        self.get_logger().info('Call release() or set_gripper(0.0) to let go.')
         self.get_logger().info('=' * 50)
+        return True
+
+    def release(self):
+        """Open gripper and return arm to home. Call this when done holding."""
+        self.get_logger().info('Releasing object')
+        self.set_gripper(0.0)
+        time.sleep(0.5)
+        self.go_home()
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = TopdownGraspDemo()
     try:
-        node.run()
+        success = node.run()
+        if success:
+            node.get_logger().info('Holding for 3s then releasing (standalone mode)')
+            time.sleep(3.0)
+            node.release()
     except KeyboardInterrupt:
         pass
     finally:

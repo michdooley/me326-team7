@@ -218,7 +218,7 @@
                             <inertial pos="0.01382 0 0" mass="0.016246" diaginertia="0.00000473 0.00000155 0.00000375"/>
                             <joint name="right_left_finger" type="slide" axis="0 1 0" range="0.015 0.037" damping="0.1"/>
                             <geom type="mesh" mesh="wx250s_gripper_finger" pos="0 0.005 0" euler="3.14159 3.14159 0"
-                                  contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1" friction="1 0.5 0.001"/>
+                                  contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1" friction="2.0 1.0 0.1"/>
                           </body>
 
                           <!-- Right finger (mirrors left) -->
@@ -226,7 +226,7 @@
                             <inertial pos="0.01382 0 0" mass="0.016246" diaginertia="0.00000473 0.00000155 0.00000375"/>
                             <joint name="right_right_finger" type="slide" axis="0 -1 0" range="0.015 0.037" damping="0.1"/>
                             <geom type="mesh" mesh="wx250s_gripper_finger" pos="0 -0.005 0" euler="0 3.14159 0"
-                                  contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1" friction="1 0.5 0.001"/>
+                                  contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1" friction="2.0 1.0 0.1"/>
                           </body>
 
                           <site name="right_pinch_site" pos="0.027575 0 0"/>
@@ -299,7 +299,7 @@
                             <inertial pos="0.01382 0 0" mass="0.016246" diaginertia="0.00000473 0.00000155 0.00000375"/>
                             <joint name="left_left_finger" type="slide" axis="0 1 0" range="0.015 0.037" damping="0.1"/>
                             <geom type="mesh" mesh="wx250s_gripper_finger" pos="0 0.005 0" euler="3.14159 3.14159 0"
-                                  contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1" friction="1 0.5 0.001"/>
+                                  contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1" friction="2.0 1.0 0.1"/>
                           </body>
 
                           <!-- Right finger (mirrors left) -->
@@ -307,7 +307,7 @@
                             <inertial pos="0.01382 0 0" mass="0.016246" diaginertia="0.00000473 0.00000155 0.00000375"/>
                             <joint name="left_right_finger" type="slide" axis="0 -1 0" range="0.015 0.037" damping="0.1"/>
                             <geom type="mesh" mesh="wx250s_gripper_finger" pos="0 -0.005 0" euler="0 3.14159 0"
-                                  contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1" friction="1 0.5 0.001"/>
+                                  contype="1" conaffinity="1" group="2" rgba="0.3 0.3 0.3 1" friction="2.0 1.0 0.1"/>
                           </body>
 
                           <site name="left_pinch_site" pos="0.027575 0 0"/>
@@ -345,8 +345,8 @@
     <position class="small_actuator" name="right_wrist_rotate" joint="right_wrist_rotate"/>
 
     <!-- Right WX250s gripper actuators (prismatic fingers) -->
-    <position name="right_left_finger" joint="right_left_finger" kp="500" kv="20" ctrlrange="0.015 0.037"/>
-    <position name="right_right_finger" joint="right_right_finger" kp="500" kv="20" ctrlrange="0.015 0.037"/>
+    <position name="right_left_finger" joint="right_left_finger" kp="1500" kv="20" ctrlrange="0.015 0.037"/>
+    <position name="right_right_finger" joint="right_right_finger" kp="1500" kv="20" ctrlrange="0.015 0.037"/>
 
     <!-- Left WX250s arm actuators (6-DOF) -->
     <position class="small_actuator" name="left_waist" joint="left_waist"/>
@@ -357,8 +357,8 @@
     <position class="small_actuator" name="left_wrist_rotate" joint="left_wrist_rotate"/>
 
     <!-- Left WX250s gripper actuators (prismatic fingers) -->
-    <position name="left_left_finger" joint="left_left_finger" kp="500" kv="20" ctrlrange="0.015 0.037"/>
-    <position name="left_right_finger" joint="left_right_finger" kp="500" kv="20" ctrlrange="0.015 0.037"/>
+    <position name="left_left_finger" joint="left_left_finger" kp="1500" kv="20" ctrlrange="0.015 0.037"/>
+    <position name="left_right_finger" joint="left_right_finger" kp="1500" kv="20" ctrlrange="0.015 0.037"/>
   </actuator>
 
   <keyframe>
