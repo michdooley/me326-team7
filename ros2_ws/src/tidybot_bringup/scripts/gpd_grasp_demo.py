@@ -20,9 +20,13 @@ Usage:
         -p target:=apple -p arm:=right
 """
 
+import json
+import os
 import struct
 import time
+from datetime import datetime
 
+import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -74,11 +78,13 @@ class GpdGraspDemo(Node):
         self.declare_parameter('duration', 2.0)
         self.declare_parameter('crop_radius', 0.08)
         self.declare_parameter('approach_offset', 0.10)
+        self.declare_parameter('save_debug', False)
         self.target_object = self.get_parameter('target').value
         self.arm_name = self.get_parameter('arm').value
         self.move_duration = self.get_parameter('duration').value
         self.crop_radius = self.get_parameter('crop_radius').value
         self.approach_offset = self.get_parameter('approach_offset').value
+        self.save_debug = self.get_parameter('save_debug').value
 
         # TF2
         self.tf_buffer = tf2_ros.Buffer()
@@ -89,6 +95,7 @@ class GpdGraspDemo(Node):
 
         # Camera state
         self.latest_depth = None
+        self.latest_rgb = None
         self.camera_info = None
         self.latest_detections = None
 
@@ -99,7 +106,21 @@ class GpdGraspDemo(Node):
         self.create_subscription(
             Image, '/camera/depth/image_raw', self._depth_cb, qos_be)
         self.create_subscription(
+            Image, '/camera/color/image_raw', self._rgb_cb, qos_be)
+        self.create_subscription(
             CameraInfo, '/camera/color/camera_info', self._info_cb, 10)
+
+        # Debug capture state
+        self._debug_session_dir = None
+        self._debug_capture_index = 0
+        self._debug_capture = {}
+        if self.save_debug:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self._debug_session_dir = os.path.join(
+                'gpd_debug_captures', f'session_{ts}')
+            os.makedirs(self._debug_session_dir, exist_ok=True)
+            self.get_logger().info(
+                f'Debug capture enabled → {self._debug_session_dir}')
 
         # Publishers
         self.gripper_pub = self.create_publisher(
@@ -120,6 +141,9 @@ class GpdGraspDemo(Node):
 
     def _depth_cb(self, msg):
         self.latest_depth = self._bridge.imgmsg_to_cv2(msg, '16UC1')
+
+    def _rgb_cb(self, msg):
+        self.latest_rgb = self._bridge.imgmsg_to_cv2(msg, 'bgr8')
 
     def _info_cb(self, msg):
         self.camera_info = msg
@@ -415,6 +439,68 @@ class GpdGraspDemo(Node):
             self.get_logger().warn(f'  [{label}] FAILED: {result.message}')
             return False
 
+    # ── Debug capture helpers ─────────────────────────────────────────
+
+    def _debug_find_grasp(self, g):
+        """Find debug grasp entry by matching position."""
+        if not self.save_debug:
+            return None
+        for dg in self._debug_capture.get('grasps', []):
+            if (abs(dg['position'][0] - g.position.x) < 1e-6 and
+                    abs(dg['position'][1] - g.position.y) < 1e-6 and
+                    abs(dg['position'][2] - g.position.z) < 1e-6):
+                return dg
+        return None
+
+    def _save_debug_capture(self):
+        """Save accumulated debug data to disk."""
+        if not self.save_debug or not self._debug_capture:
+            return
+
+        capture_dir = os.path.join(
+            self._debug_session_dir,
+            f'capture_{self._debug_capture_index:04d}')
+        os.makedirs(capture_dir, exist_ok=True)
+
+        # Save RGB image
+        if self.latest_rgb is not None:
+            cv2.imwrite(os.path.join(capture_dir, 'rgb.png'), self.latest_rgb)
+
+        # Save depth
+        if self.latest_depth is not None:
+            np.save(os.path.join(capture_dir, 'depth.npy'), self.latest_depth)
+
+        # Save point clouds
+        if 'point_cloud' in self._debug_capture:
+            np.save(os.path.join(capture_dir, 'point_cloud.npy'),
+                    self._debug_capture['point_cloud'])
+        if 'point_cloud_full' in self._debug_capture:
+            np.save(os.path.join(capture_dir, 'point_cloud_full.npy'),
+                    self._debug_capture['point_cloud_full'])
+
+        # Save metadata
+        meta = {
+            'target': self.target_object,
+            'arm': self.arm_name,
+            'crop_radius': self.crop_radius,
+            'approach_offset': self.approach_offset,
+        }
+        for key in ['object_pos', 'intrinsics', 'major_axis', 'workspace',
+                     'view_point']:
+            if key in self._debug_capture:
+                meta[key] = self._debug_capture[key]
+        with open(os.path.join(capture_dir, 'meta.json'), 'w') as f:
+            json.dump(meta, f, indent=2)
+
+        # Save grasps with filter annotations
+        if 'grasps' in self._debug_capture:
+            with open(os.path.join(capture_dir, 'grasps.json'), 'w') as f:
+                json.dump(self._debug_capture['grasps'], f, indent=2)
+
+        self.get_logger().info(f'Debug data saved to {capture_dir}')
+        self._debug_capture_index += 1
+        self._debug_capture = {}
+
     # ── Main pipeline ─────────────────────────────────────────────────
 
     def _detect_object(self):
@@ -494,6 +580,22 @@ class GpdGraspDemo(Node):
 
         self.get_logger().info(f'  Cropped point cloud: {len(points)} points')
 
+        # Save debug: point clouds
+        if self.save_debug:
+            full_points = self.depth_to_pointcloud(crop_center=None)
+            if full_points is not None and len(full_points) > 50000:
+                full_points = full_points[::len(full_points) // 50000]
+            self._debug_capture['point_cloud'] = points
+            self._debug_capture['point_cloud_full'] = full_points
+            self._debug_capture['object_pos'] = [ox, oy, oz]
+            K = self.camera_info.k
+            self._debug_capture['intrinsics'] = {
+                'fx': float(K[0]), 'fy': float(K[4]),
+                'cx': float(K[2]), 'cy': float(K[5]),
+                'width': int(self.latest_depth.shape[1]),
+                'height': int(self.latest_depth.shape[0]),
+            }
+
         cloud_msg = self.numpy_to_pointcloud2(points, 'base_link')
 
         # Get camera position in base_link
@@ -517,6 +619,12 @@ class GpdGraspDemo(Node):
             oy - margin, oy + margin,
             max(0.0, oz - margin), oz + margin,
         ]
+
+        # Save debug: GPD request params
+        if self.save_debug:
+            self._debug_capture['view_point'] = [
+                float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2])]
+            self._debug_capture['workspace'] = list(req.workspace)
 
         # Call GPD service
         self.get_logger().info('  Calling GPD /detect_grasps service...')
@@ -542,6 +650,30 @@ class GpdGraspDemo(Node):
                 f'{g.position.z:.3f}) approach=({g.approach.x:.2f}, {g.approach.y:.2f}, '
                 f'{g.approach.z:.2f}) score={g.score:.3f} width={g.width*1000:.0f}mm')
 
+        # Save debug: serialize all GPD grasps
+        if self.save_debug:
+            self._debug_capture['grasps'] = []
+            for i, g in enumerate(grasps):
+                self._debug_capture['grasps'].append({
+                    'index': i,
+                    'position': [float(g.position.x), float(g.position.y),
+                                 float(g.position.z)],
+                    'approach': [float(g.approach.x), float(g.approach.y),
+                                 float(g.approach.z)],
+                    'binormal': [float(g.binormal.x), float(g.binormal.y),
+                                 float(g.binormal.z)],
+                    'axis': [float(g.axis.x), float(g.axis.y),
+                             float(g.axis.z)],
+                    'width': float(g.width),
+                    'score': float(g.score),
+                    'sample': [float(g.sample.x), float(g.sample.y),
+                               float(g.sample.z)],
+                    'filter_z': None, 'filter_cone': None,
+                    'filter_orient': None,
+                    'ik_6dof': None, 'ik_topdown': None,
+                    'ik_posonly': None, 'selected': False,
+                })
+
         return grasps
 
     def _filter_grasps(self, grasps, object_pos):
@@ -555,20 +687,32 @@ class GpdGraspDemo(Node):
         ox, oy, oz = object_pos
         filtered = []
         for i, g in enumerate(grasps):
+            dg = self._debug_capture['grasps'][i] if self.save_debug else None
+
             # Skip grasps at/below table
             if g.position.z < 0.01:
+                if dg:
+                    dg['filter_z'] = {'pass': False, 'value': float(g.position.z)}
                 self.get_logger().info(
                     f'    Grasp {i}: SKIP z={g.position.z:.3f} < 0.01 (below table)')
                 continue
+            if dg:
+                dg['filter_z'] = {'pass': True, 'value': float(g.position.z)}
+
             # Skip grasps not within 45deg cone of straight down
-            # Straight down = (0,0,-1); cos(45deg) = 0.707
-            # dot(approach, (0,0,-1)) = -approach_z >= 0.707 => approach_z <= -0.707
             approach_z = g.approach.z
             if approach_z > -0.707:
+                if dg:
+                    dg['filter_cone'] = {'pass': False,
+                                         'approach_z': float(approach_z)}
                 self.get_logger().info(
                     f'    Grasp {i}: SKIP approach_z={approach_z:.2f} > -0.707 '
                     f'(not within 45deg of vertical)')
                 continue
+            if dg:
+                dg['filter_cone'] = {'pass': True,
+                                     'approach_z': float(approach_z)}
+
             filtered.append(g)
         self.get_logger().info(
             f'  Filtered: {len(filtered)}/{len(grasps)} grasps pass feasibility check')
@@ -642,6 +786,7 @@ class GpdGraspDemo(Node):
             pre_count = len(grasps)
             good_grasps = []
             for g in grasps:
+                dg = self._debug_find_grasp(g)
                 # GPD axis = finger opening direction (projected to horizontal)
                 grip_axis = np.array([g.axis.x, g.axis.y, 0.0])
                 grip_norm = np.linalg.norm(grip_axis)
@@ -650,9 +795,18 @@ class GpdGraspDemo(Node):
                     # Dot product: 1.0 = parallel (bad), 0.0 = perpendicular (good)
                     alignment = abs(np.dot(grip_axis[:2], major_axis[:2]))
                     if alignment > 0.7:  # within ~45 deg of long axis
+                        if dg:
+                            dg['filter_orient'] = {
+                                'pass': False, 'alignment': float(alignment)}
                         self.get_logger().info(
                             f'    SKIP grasp (alignment={alignment:.2f} with long axis)')
                         continue
+                    if dg:
+                        dg['filter_orient'] = {
+                            'pass': True, 'alignment': float(alignment)}
+                else:
+                    if dg:
+                        dg['filter_orient'] = {'pass': True, 'alignment': 0.0}
                 good_grasps.append(g)
             if good_grasps:
                 self.get_logger().info(
@@ -662,6 +816,12 @@ class GpdGraspDemo(Node):
             else:
                 self.get_logger().warn(
                     '  All grasps aligned with long axis — keeping all')
+        elif self.save_debug:
+            # No major axis — mark all as orient-passed
+            for g in grasps:
+                dg = self._debug_find_grasp(g)
+                if dg:
+                    dg['filter_orient'] = {'pass': True, 'alignment': None}
 
         # Compute top-down quaternion (oriented for elongated objects if applicable)
         top_down_quat = self._compute_top_down_quat(major_axis)
@@ -675,9 +835,13 @@ class GpdGraspDemo(Node):
             pre_grasp_pose = self.compute_pre_grasp_pose(
                 grasp_pose, grasp, self.approach_offset)
 
+            dg = self._debug_find_grasp(grasp)
+
             # Try 1: Full 6-DOF IK with GPD orientation
             ok, msg = self._try_ik(grasp_pose, use_orientation=True)
             use_orientation = True
+            if dg:
+                dg['ik_6dof'] = {'pass': ok, 'msg': msg}
             if not ok:
                 self.get_logger().info(f'    6-DOF IK failed: {msg}')
                 # Try 2: Top-down orientation at GPD grasp position
@@ -685,6 +849,8 @@ class GpdGraspDemo(Node):
                 fallback_pose.position = grasp_pose.position
                 fallback_pose.orientation = top_down_quat
                 ok, msg = self._try_ik(fallback_pose, use_orientation=True)
+                if dg:
+                    dg['ik_topdown'] = {'pass': ok, 'msg': msg}
                 if ok:
                     self.get_logger().info(f'    Fallback top-down IK OK!')
                     grasp_pose = fallback_pose
@@ -697,6 +863,8 @@ class GpdGraspDemo(Node):
                     self.get_logger().info(f'    Top-down fallback also failed: {msg}')
                     # Try 3: Position-only (no orientation constraint)
                     ok, msg = self._try_ik(grasp_pose, use_orientation=False)
+                    if dg:
+                        dg['ik_posonly'] = {'pass': ok, 'msg': msg}
                     if ok:
                         self.get_logger().info(f'    Position-only IK OK!')
                         use_orientation = False
@@ -709,6 +877,8 @@ class GpdGraspDemo(Node):
                         self.get_logger().info(f'    Position-only also failed: {msg}')
                         continue
 
+            if dg:
+                dg['selected'] = True
             self.get_logger().info(f'    Grasp {i} IK OK! Executing...')
 
             # Debug markers
@@ -751,11 +921,15 @@ class GpdGraspDemo(Node):
         return None
 
     def run(self):
+        if self.save_debug:
+            self._debug_capture = {}
+
         self.get_logger().info('=' * 50)
         self.get_logger().info('GPD Grasp Demo (6-DOF)')
         self.get_logger().info(f'  Target       : {self.target_object}')
         self.get_logger().info(f'  Arm          : {self.arm_name}')
         self.get_logger().info(f'  Crop radius  : {self.crop_radius}m')
+        self.get_logger().info(f'  Save debug   : {self.save_debug}')
         self.get_logger().info('=' * 50)
 
         # Wait for services
@@ -784,12 +958,16 @@ class GpdGraspDemo(Node):
         detection, major_axis = self._detect_object()
         if detection is None:
             self.get_logger().error('Object detection failed — aborting')
+            self._save_debug_capture()
             return
+        if self.save_debug and major_axis is not None:
+            self._debug_capture['major_axis'] = major_axis.tolist()
 
         # ── GPD grasp planning ────────────────────────────────────────
         grasps = self._call_gpd(detection)
         if grasps is None or len(grasps) == 0:
             self.get_logger().error('GPD found no grasps — aborting')
+            self._save_debug_capture()
             self.go_home()
             return
 
@@ -797,6 +975,7 @@ class GpdGraspDemo(Node):
         grasp_pose = self._select_and_execute_grasp(grasps, detection, major_axis)
         if grasp_pose is None:
             self.get_logger().error('Grasp execution failed — aborting')
+            self._save_debug_capture()
             self.go_home()
             return
 
@@ -820,6 +999,8 @@ class GpdGraspDemo(Node):
         time.sleep(0.5)
 
         self.go_home()
+
+        self._save_debug_capture()
 
         self.get_logger().info('')
         self.get_logger().info('=' * 50)

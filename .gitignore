@@ -56,6 +56,9 @@ ros2_ws/log/
 # Captured images from demos
 **/captures/
 
+# GPD debug captures (large binary data)
+gpd_debug_captures/
+
 # Audio recordings from microphone tests
 **/recordings/
 ros2_ws/MUJOCO_LOG.TXT

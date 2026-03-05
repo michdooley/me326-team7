@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GPD Debug Visualizer</title>
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>GPD Debug Visualizer</h1>
+    <div class="controls">
+      <label>Session:
+        <select id="session-select"></select>
+      </label>
+      <label>Capture:
+        <select id="capture-select"></select>
+      </label>
+      <button id="load-btn">Load</button>
+    </div>
+  </header>
+
+  <div class="main-layout">
+    <div class="viewport-panel">
+      <div id="plot3d"></div>
+    </div>
+
+    <div class="side-panel">
+      <div class="section">
+        <h3>Filter Toggles</h3>
+        <label><input type="checkbox" id="show-passed" checked> Passed (green)</label>
+        <label><input type="checkbox" id="show-ik-fail" checked> IK failed (yellow)</label>
+        <label><input type="checkbox" id="show-orient-fail" checked> Orient failed (orange)</label>
+        <label><input type="checkbox" id="show-filter-fail" checked> Z/Cone failed (red)</label>
+      </div>
+
+      <div class="section">
+        <h3>Grasps</h3>
+        <div id="grasp-list"></div>
+      </div>
+
+      <div class="section">
+        <h3>Details</h3>
+        <pre id="grasp-detail">Click a grasp to see details</pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="image-strip">
+    <div class="img-container">
+      <h4>RGB</h4>
+      <img id="rgb-img" alt="No RGB data">
+    </div>
+    <div class="img-container">
+      <h4>Depth</h4>
+      <img id="depth-img" alt="No depth data">
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

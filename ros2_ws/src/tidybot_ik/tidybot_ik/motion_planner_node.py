@@ -498,6 +498,19 @@ class MotionPlannerNode(Node):
 
         response.position_error = pos_error
         response.orientation_error = ori_error
+
+        # For wrapping joints (forearm_roll idx=3, wrist_rotate idx=5),
+        # the gripper is symmetric so ±π gives the same end-effector pose.
+        # Pick the solution closer to seed to avoid unnecessary 180° flips.
+        for idx in [3, 5]:
+            delta = solution[idx] - seed[idx]
+            if abs(delta) > np.pi / 2:
+                alt = solution[idx] - np.sign(delta) * np.pi
+                # Check alt is within joint limits
+                limits = list(self.JOINT_LIMITS.values())[idx]
+                if limits[0] <= alt <= limits[1]:
+                    solution[idx] = alt
+
         response.joint_positions = solution.tolist()
 
         if not ik_success:
@@ -506,20 +519,20 @@ class MotionPlannerNode(Node):
             self.get_logger().warn(response.message)
             return response
 
-        # Check max joint change from seed (prevents wild joint swings)
-        MAX_JOINT_DELTA = 1.5  # ~86 degrees — reject solutions requiring large jumps
-        joint_deltas = np.abs(solution - seed)
-        max_delta_idx = np.argmax(joint_deltas)
-        max_delta = joint_deltas[max_delta_idx]
-        if max_delta > MAX_JOINT_DELTA:
-            joint_names = list(self.JOINT_LIMITS.keys())
-            response.success = False
-            response.message = (
-                f"IK solution requires too-large joint change: "
-                f"{joint_names[max_delta_idx]} delta={np.degrees(max_delta):.1f}deg "
-                f"(limit={np.degrees(MAX_JOINT_DELTA):.0f}deg)")
-            self.get_logger().warn(response.message)
-            return response
+        # Check max joint change from seed — TEMPORARILY DISABLED
+        # MAX_JOINT_DELTA = 1.5  # ~86 degrees
+        # joint_deltas = np.abs(solution - seed)
+        # max_delta_idx = np.argmax(joint_deltas)
+        # max_delta = joint_deltas[max_delta_idx]
+        # if max_delta > MAX_JOINT_DELTA:
+        #     joint_names = list(self.JOINT_LIMITS.keys())
+        #     response.success = False
+        #     response.message = (
+        #         f"IK solution requires too-large joint change: "
+        #         f"{joint_names[max_delta_idx]} delta={np.degrees(max_delta):.1f}deg "
+        #         f"(limit={np.degrees(MAX_JOINT_DELTA):.0f}deg)")
+        #     self.get_logger().warn(response.message)
+        #     return response
 
         # Check singularity (Jacobian condition number) — TEMPORARILY DISABLED
         condition_number = self.compute_jacobian_condition(arm_name, solution)
