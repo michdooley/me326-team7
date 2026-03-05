@@ -1,28 +1,40 @@
 #!/usr/bin/env python3
 """
-Top-Down Grasp Demo — Simple depth-PCA-based top-down grasping
+Top-Down Grasp Demo — Simple depth-based top-down grasping
 
 Detects objects using the external YOLO classifier node (/objbbox),
-uses depth point cloud + PCA to accurately localize the object and
-determine its orientation, then executes a simple top-down grasp.
+uses depth point cloud + min-width sweep to accurately localize the object
+and determine optimal grasp orientation, then executes a simple top-down grasp.
 
-For elongated objects (e.g. banana), the gripper is oriented perpendicular
-to the object's major axis so it grips across the narrow dimension.
+For elongated objects (e.g. banana), the gripper is oriented to grip across
+the narrowest dimension of the object.
+
+Works on both simulation and real hardware via the `sim` parameter.
 
 Requires:
-    - ros2 launch tidybot_bringup sim.launch.py
-    - ros2 run object_classification classifier
+    Simulation:
+        - ros2 launch tidybot_bringup sim.launch.py
+        - ros2 run object_classification classifier
+
+    Real Hardware:
+        - ros2 launch tidybot_bringup real.launch.py use_planner:=true
+        - ros2 run object_classification classifier
 
 Usage:
-    # Default: grasp a banana with right arm
+    # Simulation (default):
     ros2 run tidybot_bringup topdown_grasp_demo.py
+
+    # Real hardware:
+    ros2 run tidybot_bringup topdown_grasp_demo.py --ros-args -p sim:=false
 
     # Target a specific object/arm:
     ros2 run tidybot_bringup topdown_grasp_demo.py --ros-args \
-        -p target:=apple -p arm:=right -p z_offset:=-0.03
+        -p target:=apple -p arm:=right -p z_offset:=-0.03 -p sim:=false
 """
 
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import rclpy
@@ -31,7 +43,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 import tf2_ros
 
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, JointState
 from vision_msgs.msg import Detection2DArray
 from geometry_msgs.msg import Pose, Quaternion
 from std_msgs.msg import Float64MultiArray
@@ -65,19 +77,26 @@ MIN_DEPTH_M = 0.1
 MAX_DEPTH_M = 2.0
 MIN_POINTS = 20
 TABLE_Z_MIN = 0.005
-OUTLIER_Z_THRESH = 0.05  # keep points within ±5cm of median Z
+OUTLIER_Z_THRESH = 0.05  # keep points within +/-5cm of median Z
+
+# Real hardware: safe tucked position for arm return
+SLEEP_POSE = [0.0, -1.80, 1.55, 0.0, 0.8, 0.0]
 
 
 class TopdownGraspDemo(Node):
-    """Detect via YOLO, plan top-down grasp via depth PCA, execute pick."""
+    """Detect via YOLO, plan top-down grasp via depth analysis, execute pick."""
 
     def __init__(self):
         super().__init__('topdown_grasp_demo')
 
+        # Sim/real parameter (must be read first to set defaults)
+        self.declare_parameter('sim', True)
+        self.is_sim = self.get_parameter('sim').value
+
         # Parameters
         self.declare_parameter('target', 'banana')
         self.declare_parameter('arm', 'right')
-        self.declare_parameter('duration', 2.0)
+        self.declare_parameter('duration', 2.0 if self.is_sim else 3.0)
         self.declare_parameter('pre_grasp_height', 0.10)
         self.declare_parameter('lift_height', 0.15)
         self.declare_parameter('z_offset', -0.02)
@@ -122,6 +141,24 @@ class TopdownGraspDemo(Node):
         self.marker_pub = self.create_publisher(Marker, '/grasp_debug_markers', 10)
         self.marker_id = 0
 
+        # Real hardware: JointGroupCommand publisher + joint state tracking
+        if not self.is_sim:
+            from interbotix_xs_msgs.msg import JointGroupCommand
+            self._JointGroupCommand = JointGroupCommand
+            self.arm_joint_group_pub = self.create_publisher(
+                JointGroupCommand,
+                f'/{self.arm_name}_arm/commands/joint_group', 10)
+            self.joint_states_received = False
+            self.current_joint_positions = {}
+            self.create_subscription(
+                JointState, '/joint_states', self._js_callback, 10)
+
+            # Import depth alignment utility
+            sys.path.insert(
+                0, str(Path(__file__).resolve().parent.parent / 'utilities'))
+            from align_depth_to_rgb import align_depth  # noqa: E402
+            self._align_depth_fn = align_depth
+
         # Service clients
         self.plan_client = self.create_client(PlanToTarget, '/plan_to_target')
 
@@ -138,6 +175,13 @@ class TopdownGraspDemo(Node):
 
     def _info_cb(self, msg):
         self.camera_info = msg
+
+    def _js_callback(self, msg):
+        """Track joint states (real hardware only)."""
+        self.joint_states_received = True
+        for i, name in enumerate(msg.name):
+            if i < len(msg.position):
+                self.current_joint_positions[name] = msg.position[i]
 
     # -- Utilities ---------------------------------------------------------
 
@@ -168,12 +212,70 @@ class TopdownGraspDemo(Node):
             rclpy.spin_once(self, timeout_sec=0.05)
 
     def go_home(self, duration=3.0):
-        self.get_logger().info(f'Returning arm to home over {duration}s...')
-        msg = ArmCommand()
-        msg.joint_positions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        msg.duration = duration
-        self.arm_pub.publish(msg)
-        time.sleep(duration + 0.5)
+        """Return arm to safe position. Sim: all-zeros. Real: sleep pose."""
+        if self.is_sim:
+            self.get_logger().info(f'Returning arm to home over {duration}s...')
+            msg = ArmCommand()
+            msg.joint_positions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            msg.duration = duration
+            self.arm_pub.publish(msg)
+            time.sleep(duration + 0.5)
+        else:
+            self.get_logger().info('Returning arm to sleep pose...')
+            self.go_to_sleep_pose()
+
+    def get_arm_positions(self):
+        """Get current joint positions for the active arm (real hardware)."""
+        joint_names = [
+            f'{self.arm_name}_{j}' for j in
+            ['waist', 'shoulder', 'elbow', 'forearm_roll',
+             'wrist_angle', 'wrist_rotate']
+        ]
+        return np.array([
+            self.current_joint_positions.get(n, 0.0) for n in joint_names
+        ])
+
+    def go_to_sleep_pose(self, max_joint_speed=0.5):
+        """Smooth cosine-interpolated trajectory to SLEEP_POSE (real hardware).
+
+        Args:
+            max_joint_speed: Maximum joint velocity in rad/s (default 0.5)
+        """
+        rclpy.spin_once(self, timeout_sec=0.1)
+
+        current = self.get_arm_positions()
+        target = np.array(SLEEP_POSE)
+
+        max_diff = np.max(np.abs(target - current))
+        duration = max(max_diff / max_joint_speed, 1.0)
+
+        self.get_logger().info(
+            f'Moving {self.arm_name} arm to sleep pose over {duration:.1f}s '
+            f'(max joint diff: {max_diff:.2f} rad)')
+
+        rate_hz = 50.0
+        dt = 1.0 / rate_hz
+        num_steps = max(int(duration * rate_hz), 1)
+
+        for i in range(num_steps + 1):
+            t = i / num_steps
+            alpha = 0.5 * (1 - np.cos(np.pi * t))
+            q = current + alpha * (target - current)
+
+            cmd = self._JointGroupCommand()
+            cmd.name = f'{self.arm_name}_arm'
+            cmd.cmd = q.tolist()
+            self.arm_joint_group_pub.publish(cmd)
+
+            if i < num_steps:
+                time.sleep(dt)
+
+    def _align_depth(self):
+        """Align depth image to RGB frame (real hardware D435 only)."""
+        if self.latest_depth is not None and self.latest_rgb is not None:
+            self.latest_depth = self._align_depth_fn(
+                self.latest_depth, self.latest_rgb)
+            self.get_logger().info('  Depth image aligned to RGB frame')
 
     def publish_marker(self, x, y, z, r, g, b, label='', scale=0.03):
         m = Marker()
@@ -291,7 +393,7 @@ class TopdownGraspDemo(Node):
         result = future.result()
         return result.success, result.message
 
-    # -- Depth PCA pipeline ------------------------------------------------
+    # -- Depth analysis pipeline -------------------------------------------
 
     def _crop_depth_to_bbox(self, detection):
         """Crop depth image to padded YOLO bounding box.
@@ -424,12 +526,12 @@ class TopdownGraspDemo(Node):
         grasp_yaw = analysis['grasp_yaw']
         grip_width = analysis['grip_width']
 
-        # Width check (warn only — PCA extents overestimate due to point cloud spread)
+        # Width check (warn only — point cloud extents overestimate)
         if grip_width > GRIPPER_MAX_OPENING_M:
             self.get_logger().warn(
                 f'  Estimated width {grip_width*1000:.0f}mm > '
                 f'{GRIPPER_MAX_OPENING_M*1000:.0f}mm gripper opening '
-                f'(proceeding anyway — PCA extents are approximate)')
+                f'(proceeding anyway — extents are approximate)')
         else:
             self.get_logger().info(
                 f'  Grip width: {grip_width*1000:.0f}mm '
@@ -438,7 +540,7 @@ class TopdownGraspDemo(Node):
         # Grasp orientation
         qw, qx, qy, qz = yaw_to_grasp_quaternion(grasp_yaw)
 
-        # Grasp position: PCA centroid XY, slightly below top surface
+        # Grasp position: centroid XY, slightly below top surface
         grasp_z = analysis['z_top'] + self.z_offset
 
         grasp_pose = Pose()
@@ -463,10 +565,12 @@ class TopdownGraspDemo(Node):
 
     def run(self):
         """Execute top-down grasp. Returns True if holding object, False on failure."""
+        mode = 'SIMULATION' if self.is_sim else 'REAL HARDWARE'
         self.get_logger().info('=' * 50)
-        self.get_logger().info('Top-Down Grasp Demo')
+        self.get_logger().info(f'Top-Down Grasp Demo — {mode}')
         self.get_logger().info(f'  Target          : {self.target_object}')
         self.get_logger().info(f'  Arm             : {self.arm_name}')
+        self.get_logger().info(f'  Duration        : {self.move_duration}s')
         self.get_logger().info(f'  Pre-grasp height: {self.pre_grasp_height}m')
         self.get_logger().info(f'  Z offset        : {self.z_offset}m')
         self.get_logger().info(f'  Bbox padding    : {self.bbox_pad}x')
@@ -474,8 +578,26 @@ class TopdownGraspDemo(Node):
 
         # Wait for motion planner
         self.get_logger().info('Waiting for /plan_to_target service...')
-        while not self.plan_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('  ...waiting')
+        if not self.is_sim:
+            if not self.plan_client.wait_for_service(timeout_sec=10.0):
+                self.get_logger().error(
+                    'Service not available! Launch with: '
+                    'ros2 launch tidybot_bringup real.launch.py use_planner:=true')
+                return False
+        else:
+            while not self.plan_client.wait_for_service(timeout_sec=1.0):
+                self.get_logger().info('  ...waiting')
+
+        # Wait for joint states (real hardware)
+        if not self.is_sim:
+            self.get_logger().info('Waiting for joint states...')
+            for _ in range(50):
+                rclpy.spin_once(self, timeout_sec=0.1)
+                if self.joint_states_received:
+                    break
+            if not self.joint_states_received:
+                self.get_logger().warn(
+                    'No joint states received — proceeding anyway')
 
         # Wait for YOLO detections
         self.get_logger().info('Waiting for YOLO classifier (/objbbox)...')
@@ -523,6 +645,11 @@ class TopdownGraspDemo(Node):
             f'bbox {bbox_w:.0f}x{bbox_h:.0f}')
 
         # -- Step 2: Depth point cloud from bbox ROI -----------------------
+        # Align depth to RGB on real hardware (D435 sensor offset)
+        if not self.is_sim:
+            self.get_logger().info('Aligning depth to RGB (real hardware)...')
+            self._align_depth()
+
         self.get_logger().info('Generating point cloud from depth ROI...')
         depth_roi, u_off, v_off = self._crop_depth_to_bbox(det)
         if depth_roi is None:
@@ -587,6 +714,10 @@ class TopdownGraspDemo(Node):
         else:
             self.get_logger().info('  IK OK')
 
+        # Safety prompt before execution (real hardware only)
+        if not self.is_sim:
+            input('\n  Press Enter to execute grasp (Ctrl+C to abort)...\n')
+
         # -- Step 6: Execute grasp -----------------------------------------
         self.get_logger().info('Opening gripper')
         self.set_gripper(0.0)
@@ -633,7 +764,7 @@ class TopdownGraspDemo(Node):
         return True
 
     def release(self):
-        """Open gripper and return arm to home. Call this when done holding."""
+        """Open gripper and return arm to home/sleep. Call this when done holding."""
         self.get_logger().info('Releasing object')
         self.set_gripper(0.0)
         time.sleep(0.5)
