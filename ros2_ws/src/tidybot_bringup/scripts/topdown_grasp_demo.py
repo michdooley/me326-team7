@@ -370,72 +370,59 @@ class TopdownGraspDemo(Node):
 
         return pts_base
 
-    def _pca_analysis(self, points_base):
-        """Run 2D PCA (XY plane) on point cloud to get object geometry.
+    def _analyze_object(self, points_base):
+        """Analyze point cloud to find centroid, z_top, and optimal grasp angle.
 
-        Returns dict with centroid, major_axis, eigenvalues, extents, etc.
+        Sweeps candidate yaw angles and picks the one that gives the
+        minimum grip width (narrowest cross-section through the centroid).
+        This directly finds the best grasp direction regardless of object shape.
+
+        Returns dict with centroid, grasp_yaw, grip_width, max_width, z_top, num_points.
         """
         centroid = np.mean(points_base, axis=0)
-        centered_xy = points_base[:, :2] - centroid[:2]
-
-        # 2x2 covariance matrix in XY plane
-        cov = np.cov(centered_xy.T)
-        eigenvalues, eigenvectors = np.linalg.eigh(cov)
-
-        # eigh returns ascending order — flip to descending
-        eigenvalues = eigenvalues[::-1]
-        eigenvectors = eigenvectors[:, ::-1]
-
-        # Major axis in base_link XY plane
-        major_2d = eigenvectors[:, 0]
-        major_axis = np.array([major_2d[0], major_2d[1], 0.0])
-
-        # Elongation check
-        ratio = np.sqrt(eigenvalues[0] / max(eigenvalues[1], 1e-10))
-        is_elongated = ratio > 1.5
-
-        # Extents along major and minor axes
-        proj_major = centered_xy @ major_2d
-        proj_minor = centered_xy @ eigenvectors[:, 1]
-        extent_major = float(np.ptp(proj_major))
-        extent_minor = float(np.ptp(proj_minor))
-
         z_top = float(np.max(points_base[:, 2]))
+
+        # Work in 2D (XY plane)
+        pts_xy = points_base[:, :2]
+        centered = pts_xy - centroid[:2]
+
+        # Sweep angles 0-180° (symmetric — 180° is same as 0° for parallel jaw)
+        best_yaw = 0.0
+        min_width = float('inf')
+        max_width = 0.0
+        for angle_deg in range(0, 180, 5):
+            angle = np.radians(angle_deg)
+            direction = np.array([np.cos(angle), np.sin(angle)])
+            projections = centered @ direction
+            width = float(np.ptp(projections))
+            if width < min_width:
+                min_width = width
+                best_yaw = angle
+            if width > max_width:
+                max_width = width
+
+        self.get_logger().info(
+            f'  Min-width sweep: best_yaw={np.degrees(best_yaw):.0f}deg, '
+            f'grip_width={min_width*1000:.0f}mm, '
+            f'max_width={max_width*1000:.0f}mm')
 
         return {
             'centroid': centroid,
-            'major_axis': major_axis,
-            'eigenvalues': eigenvalues,
-            'is_elongated': is_elongated,
-            'ratio': ratio,
-            'extent_major': extent_major,
-            'extent_minor': extent_minor,
+            'grasp_yaw': best_yaw,
+            'grip_width': min_width,
+            'max_width': max_width,
             'z_top': z_top,
             'num_points': len(points_base),
         }
 
-    def _compute_grasp_pose(self, pca):
-        """Compute grasp and pre-grasp poses from PCA results.
+    def _compute_grasp_pose(self, analysis):
+        """Compute grasp and pre-grasp poses from object analysis.
 
-        Returns (grasp_pose, pre_grasp_pose, use_orientation, info_str) or None.
+        Returns (grasp_pose, pre_grasp_pose, info_str) or None.
         """
-        centroid = pca['centroid']
-
-        # Determine grasp yaw
-        if pca['is_elongated']:
-            # Grip perpendicular to major axis (across narrow dimension)
-            major = pca['major_axis']
-            grasp_yaw = np.arctan2(major[1], major[0]) + np.pi / 2
-            grip_width = pca['extent_minor']
-            self.get_logger().info(
-                f'  Elongated object (ratio {pca["ratio"]:.1f}), '
-                f'gripping perpendicular to major axis')
-        else:
-            grasp_yaw = 0.0
-            grip_width = pca['extent_major']
-            self.get_logger().info(
-                f'  Roughly circular object (ratio {pca["ratio"]:.1f}), '
-                f'using default orientation')
+        centroid = analysis['centroid']
+        grasp_yaw = analysis['grasp_yaw']
+        grip_width = analysis['grip_width']
 
         # Width check (warn only — PCA extents overestimate due to point cloud spread)
         if grip_width > GRIPPER_MAX_OPENING_M:
@@ -452,7 +439,7 @@ class TopdownGraspDemo(Node):
         qw, qx, qy, qz = yaw_to_grasp_quaternion(grasp_yaw)
 
         # Grasp position: PCA centroid XY, slightly below top surface
-        grasp_z = pca['z_top'] + self.z_offset
+        grasp_z = analysis['z_top'] + self.z_offset
 
         grasp_pose = Pose()
         grasp_pose.position.x = float(centroid[0])
@@ -550,20 +537,17 @@ class TopdownGraspDemo(Node):
 
         self.get_logger().info(f'  Point cloud: {len(pts_base)} points')
 
-        # -- Step 3: PCA analysis ------------------------------------------
-        self.get_logger().info('Running PCA analysis...')
-        pca = self._pca_analysis(pts_base)
-        centroid = pca['centroid']
+        # -- Step 3: Analyze object (centroid + min-width grasp angle) ------
+        self.get_logger().info('Analyzing object point cloud...')
+        analysis = self._analyze_object(pts_base)
+        centroid = analysis['centroid']
         self.get_logger().info(
             f'  Centroid: ({centroid[0]:.3f}, {centroid[1]:.3f}, {centroid[2]:.3f})')
         self.get_logger().info(
-            f'  Extents: major={pca["extent_major"]*1000:.0f}mm, '
-            f'minor={pca["extent_minor"]*1000:.0f}mm')
-        self.get_logger().info(
-            f'  Z top: {pca["z_top"]:.3f}m')
+            f'  Z top: {analysis["z_top"]:.3f}m')
 
         # -- Step 4: Compute grasp pose ------------------------------------
-        result = self._compute_grasp_pose(pca)
+        result = self._compute_grasp_pose(analysis)
         if result is None:
             self.get_logger().error('Grasp pose computation failed -- aborting')
             self.go_home()
