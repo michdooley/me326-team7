@@ -2,10 +2,8 @@ import sounddevice as sd
 import wave
 import os
 import google.generativeai as genai
-
-
-
 from google.cloud import speech_v1p1beta1 as speech
+
 def transcribe_audio(filename, sample_rate=16000):
     """
     Uses Google Cloud Speech-to-Text to transcribe the given audio file and returns the transcription as a string.
