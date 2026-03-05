@@ -100,6 +100,7 @@ class TopdownGraspDemo(Node):
         self.declare_parameter('pre_grasp_height', 0.10)
         self.declare_parameter('lift_height', 0.15)
         self.declare_parameter('z_offset', -0.02)
+        self.declare_parameter('z_bias', 0.0)
         self.declare_parameter('bbox_pad', 1.3)
         self.target_object = self.get_parameter('target').value
         self.arm_name = self.get_parameter('arm').value
@@ -107,6 +108,7 @@ class TopdownGraspDemo(Node):
         self.pre_grasp_height = self.get_parameter('pre_grasp_height').value
         self.lift_height = self.get_parameter('lift_height').value
         self.z_offset = self.get_parameter('z_offset').value
+        self.z_bias = self.get_parameter('z_bias').value
         self.bbox_pad = self.get_parameter('bbox_pad').value
 
         # TF2
@@ -631,7 +633,7 @@ class TopdownGraspDemo(Node):
         qw, qx, qy, qz = yaw_to_grasp_quaternion(grasp_yaw)
 
         # Grasp position: centroid XY, slightly below top surface
-        grasp_z = analysis['z_top'] + self.z_offset
+        grasp_z = analysis['z_top'] + self.z_offset + self.z_bias
 
         grasp_pose = Pose()
         grasp_pose.position.x = float(centroid[0])
@@ -806,7 +808,34 @@ class TopdownGraspDemo(Node):
             pp.x, pp.y, pp.z,
             0.0, 0.0, 1.0, label='pre_grasp', scale=0.02)
 
-        # -- Step 5: IK check ----------------------------------------------
+        # -- Step 5: Workspace distance check + IK -------------------------
+        # Warn early if the target is outside the arm's reach so the user
+        # knows to drive the robot closer rather than debugging IK seeds.
+        # Shoulder joint positions in base_link (from URDF):
+        #   right: base(-0.15, -0.1199, 0.3847) + shoulder_offset(0, 0, 0.10483)
+        #   left:  base( 0.15, -0.1199, 0.3847) + shoulder_offset(0, 0, 0.10483)
+        ARM_SHOULDER_BASE = {
+            'right': np.array([-0.15, -0.1199, 0.4895]),
+            'left':  np.array([ 0.15, -0.1199, 0.4895]),
+        }
+        ARM_MAX_REACH = 0.636  # shoulder → fingertip (from URDF link offsets)
+        shoulder = ARM_SHOULDER_BASE.get(self.arm_name)
+        if shoulder is not None:
+            target_xyz = np.array([grasp_pose.position.x,
+                                   grasp_pose.position.y,
+                                   grasp_pose.position.z])
+            dist = float(np.linalg.norm(target_xyz - shoulder))
+            margin = ARM_MAX_REACH - dist
+            if margin < 0:
+                self.get_logger().error(
+                    f'  Target is {-margin*100:.1f}cm OUTSIDE arm workspace '
+                    f'(dist={dist*100:.1f}cm, max={ARM_MAX_REACH*100:.1f}cm) '
+                    f'-- drive robot {-margin*100:.0f}cm closer and retry')
+            else:
+                self.get_logger().info(
+                    f'  Workspace check: dist={dist*100:.1f}cm, '
+                    f'margin={margin*100:.1f}cm to arm limit')
+
         self.get_logger().info('Checking IK feasibility...')
         use_orientation = True
         ok, msg = self._try_ik(grasp_pose, use_orientation=True)
