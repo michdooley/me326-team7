@@ -11,8 +11,9 @@ State machine:
   1. SCANNING    — 360 rotation scan, mapping depth into occupancy grid.
   2. SELECTING   — pick best frontier (or approach known object).
   3. NAVIGATING  — follow A* waypoints to frontier, checking for target.
-  4. APPROACHING — navigate to detected object's worros2 launch tidybot_bringup sim.launch.py scene:=scene_banana_test.xml show_mujoco_viewer:=falseld position.
+  4. APPROACHING — navigate to detected object's world position.
   5. COMPLETE    — object found and reached.
+  6. GRASPING    — if action is "get", run top-down grasp pipeline.
 
 Object detection uses HSV color filtering on the RGB camera feed.
 When the target color blob is detected in multiple consecutive frames,
@@ -61,14 +62,22 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
-from geometry_msgs.msg import Point, Twist
+from geometry_msgs.msg import Point, Pose, Quaternion, Twist
 from nav_msgs.msg import MapMetaData, OccupancyGrid
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import ColorRGBA, Float64MultiArray, String
 from visualization_msgs.msg import Marker, MarkerArray
 from vision_msgs.msg import Detection2DArray
+from tidybot_msgs.msg import ArmCommand
+from tidybot_msgs.srv import PlanToTarget
+from scipy.spatial.transform import Rotation
 
 import tf2_ros
+
+from tidybot_perception.grasp_geometry import (
+    yaw_to_grasp_quaternion,
+    GRIPPER_MAX_OPENING_M,
+)
 
 try:
     from cv_bridge import CvBridge
@@ -84,6 +93,7 @@ class ExploreState(Enum):
     NAVIGATING  = 2
     APPROACHING = 3
     COMPLETE    = 4
+    GRASPING    = 5
 
 
 # HSV color ranges for cube detection (OpenCV HSV: H=[0,180], S/V=[0,255])
@@ -180,9 +190,25 @@ class ExploreAndFind(Node):
 
     # ── Object detection ──────────────────────────────────────────────────────
     MIN_DETECTION_AREA = 50    # px² — minimum color blob area
-    APPROACH_DIST      = 0.50  # m — stop before reaching the object
+    APPROACH_DIST      = 0.35  # m — stop before reaching the object
     DETECT_WINDOW      = 2.0   # s — time window for detection confirmation
     DETECT_COUNT_REQ   = 2     # frames within window to confirm
+
+    # ── Grasp parameters ─────────────────────────────────────────────────────
+    GRASP_ARM_NAME               = 'right'
+    GRASP_MOVE_DURATION          = 2.0     # s for IK moves
+    GRASP_PRE_HEIGHT             = 0.10    # m above grasp for pre-grasp
+    GRASP_LIFT_HEIGHT            = 0.15    # m to lift after grasping
+    GRASP_Z_OFFSET               = -0.02   # m below z_top for grasp contact
+    GRASP_BBOX_PAD               = 1.3     # bbox padding factor
+    GRASP_SETTLE_TIME            = 1.0     # s to wait at positions
+    GRASP_GRIPPER_CLOSE_REPEATS  = 20
+    GRASP_GRIPPER_CLOSE_WAIT     = 2.0     # s
+    GRASP_MIN_DEPTH_M            = 0.1
+    GRASP_MAX_DEPTH_M            = 2.0
+    GRASP_MIN_POINTS             = 20
+    GRASP_TABLE_Z_MIN            = 0.005   # m — points below this are floor
+    GRASP_OUTLIER_Z_THRESH       = 0.05    # m — Z outlier filter
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -301,6 +327,14 @@ class ExploreAndFind(Node):
             Twist, '/cmd_vel', 10)
         self.pan_tilt_pub      = self.create_publisher(
             Float64MultiArray, '/camera/pan_tilt_cmd', 10)
+
+        # Grasp infrastructure
+        self.gripper_pub = self.create_publisher(
+            Float64MultiArray, f'/{self.GRASP_ARM_NAME}_gripper/cmd', 10)
+        self.arm_pub = self.create_publisher(
+            ArmCommand, f'/{self.GRASP_ARM_NAME}_arm/cmd', 10)
+        self.plan_client = self.create_client(PlanToTarget, '/plan_to_target')
+
         latch_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -1726,8 +1760,416 @@ class ExploreAndFind(Node):
         self.get_logger().info(f'  Confirmed occupied : {occupied}')
         self.get_logger().info('=' * 55)
 
-        # Transition to next command (or wait for one)
+        # If action is "get" and we found the object, try grasping
+        if (self.current_action == 'get' and
+                self.object_world_pos is not None):
+            self.get_logger().info(
+                '[COMPLETE] Action is "get" — transitioning to GRASPING')
+            self.state = ExploreState.GRASPING
+            return
+
+        # Otherwise, move to next command
         self._start_next_command()
+
+    # ── Grasping ─────────────────────────────────────────────────────────────
+
+    def _state_grasping(self):
+        """Execute top-down grasp pipeline."""
+        self.get_logger().info('=' * 55)
+        self.get_logger().info('[GRASP] Starting grasp pipeline...')
+
+        # 1. Wait for motion planner service
+        if not self.plan_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().error(
+                '[GRASP] /plan_to_target service not available! '
+                'Ensure sim.launch.py has use_motion_planner:=true')
+            self._start_next_command()
+            return
+
+        # 2. Tilt camera down to see the object on the table
+        pt_msg = Float64MultiArray()
+        pt_msg.data = [0.0, 0.5]  # pan=0, tilt down ~28 deg
+        self.pan_tilt_pub.publish(pt_msg)
+        self._grasp_spin_for(1.5)  # wait for camera to settle + new depth
+
+        # 3. Get fresh YOLO detection
+        det = self.latest_yolo_detection
+        if det is None:
+            for _ in range(20):
+                self._grasp_spin_for(0.2)
+                det = self.latest_yolo_detection
+                if det is not None:
+                    break
+
+        if det is None:
+            self.get_logger().error(
+                '[GRASP] No YOLO detection available — cannot grasp')
+            self._grasp_go_home()
+            self._start_next_command()
+            return
+
+        self.latest_yolo_detection = None  # consume
+
+        cx = int(det.bbox.center.position.x)
+        cy = int(det.bbox.center.position.y)
+        bbox_w = float(det.bbox.size_x)
+        bbox_h = float(det.bbox.size_y)
+        self.get_logger().info(
+            f'[GRASP] YOLO detection at pixel ({cx}, {cy}), '
+            f'bbox {bbox_w:.0f}x{bbox_h:.0f}')
+
+        # 4. Crop depth to bbox and generate point cloud
+        depth_roi, u_off, v_off = self._grasp_crop_depth(
+            cx, cy, bbox_w, bbox_h)
+        if depth_roi is None:
+            self.get_logger().error('[GRASP] Failed to crop depth image')
+            self._grasp_go_home()
+            self._start_next_command()
+            return
+
+        pts_base = self._grasp_depth_to_points(depth_roi, u_off, v_off)
+        if pts_base is None:
+            self.get_logger().error(
+                f'[GRASP] Insufficient points in depth ROI '
+                f'(need >= {self.GRASP_MIN_POINTS})')
+            self._grasp_go_home()
+            self._start_next_command()
+            return
+
+        self.get_logger().info(
+            f'[GRASP] Point cloud: {len(pts_base)} points')
+
+        # 5. Analyze object (centroid + grasp yaw)
+        analysis = self._grasp_analyze_object(pts_base)
+        centroid = analysis['centroid']
+        self.get_logger().info(
+            f'[GRASP] Centroid: ({centroid[0]:.3f}, {centroid[1]:.3f}, '
+            f'{centroid[2]:.3f}), z_top={analysis["z_top"]:.3f}m')
+
+        # 6. Compute grasp + pre-grasp poses
+        result = self._grasp_compute_poses(analysis)
+        if result is None:
+            self.get_logger().error('[GRASP] Pose computation failed')
+            self._grasp_go_home()
+            self._start_next_command()
+            return
+        grasp_pose, pre_grasp_pose, info = result
+        self.get_logger().info(f'[GRASP] Params: {info}')
+
+        # 7. IK feasibility check
+        use_orientation = True
+        ok, msg = self._grasp_try_ik(grasp_pose, use_orientation=True)
+        if not ok:
+            self.get_logger().warn(
+                f'[GRASP] IK with orientation failed: {msg}')
+            self.get_logger().info(
+                '[GRASP] Trying position-only IK...')
+            ok, msg = self._grasp_try_ik(
+                grasp_pose, use_orientation=False)
+            if ok:
+                use_orientation = False
+            else:
+                self.get_logger().error(
+                    f'[GRASP] Position-only IK also failed: {msg}')
+                self._grasp_go_home()
+                self._start_next_command()
+                return
+
+        # 8. Execute grasp sequence
+        self.get_logger().info('[GRASP] Opening gripper')
+        self._grasp_set_gripper(0.0)
+
+        self.get_logger().info('[GRASP] Moving to pre-grasp')
+        if not self._grasp_plan_and_execute(
+                pre_grasp_pose, 'pre-grasp', use_orientation):
+            self.get_logger().error('[GRASP] Pre-grasp failed')
+            self._grasp_go_home()
+            self._start_next_command()
+            return
+
+        self._grasp_spin_for(self.GRASP_SETTLE_TIME)
+
+        self.get_logger().info('[GRASP] Descending to grasp')
+        if not self._grasp_plan_and_execute(
+                grasp_pose, 'grasp', use_orientation):
+            self.get_logger().error('[GRASP] Descent failed')
+            self._grasp_go_home()
+            self._start_next_command()
+            return
+
+        self._grasp_spin_for(self.GRASP_SETTLE_TIME)
+
+        self.get_logger().info('[GRASP] Closing gripper (firm)')
+        self._grasp_close_firm()
+
+        # 9. Lift
+        self.get_logger().info('[GRASP] Lifting object')
+        lift_pose = Pose()
+        lift_pose.position.x = grasp_pose.position.x
+        lift_pose.position.y = grasp_pose.position.y
+        lift_pose.position.z = grasp_pose.position.z + self.GRASP_LIFT_HEIGHT
+        lift_pose.orientation = grasp_pose.orientation
+        if not self._grasp_plan_and_execute(
+                lift_pose, 'lift', use_orientation):
+            self.get_logger().warn(
+                '[GRASP] Lift failed, continuing anyway')
+
+        self.get_logger().info('=' * 55)
+        self.get_logger().info('[GRASP] Grasp complete — holding object')
+        self.get_logger().info('=' * 55)
+
+        # Hold for a moment then release and go home
+        self._grasp_spin_for(3.0)
+        self._grasp_set_gripper(0.0)
+        self._grasp_spin_for(0.5)
+        self._grasp_go_home()
+
+        # Transition to next command
+        self._start_next_command()
+
+    # ── Grasp helper methods ─────────────────────────────────────────────────
+
+    def _grasp_spin_for(self, seconds):
+        """Spin callbacks for the given duration."""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+    def _grasp_set_gripper(self, position):
+        """Set gripper to position (0.0=open, 1.0=closed)."""
+        msg = Float64MultiArray()
+        msg.data = [position]
+        for _ in range(10):
+            self.gripper_pub.publish(msg)
+            rclpy.spin_once(self, timeout_sec=0.05)
+        time.sleep(0.5)
+
+    def _grasp_close_firm(self):
+        """Close gripper with repeated commands for firm grasp."""
+        msg = Float64MultiArray()
+        msg.data = [1.0]
+        for _ in range(self.GRASP_GRIPPER_CLOSE_REPEATS):
+            self.gripper_pub.publish(msg)
+            rclpy.spin_once(self, timeout_sec=0.05)
+        time.sleep(self.GRASP_GRIPPER_CLOSE_WAIT)
+        for _ in range(10):
+            self.gripper_pub.publish(msg)
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+    def _grasp_go_home(self, duration=3.0):
+        """Return arm to home (all zeros) position."""
+        self.get_logger().info(
+            f'[GRASP] Returning arm home over {duration}s')
+        msg = ArmCommand()
+        msg.joint_positions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        msg.duration = duration
+        self.arm_pub.publish(msg)
+        time.sleep(duration + 0.5)
+
+    def _grasp_get_tf_matrix(self, target_frame, source_frame):
+        """Get 4x4 transformation matrix between frames."""
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                target_frame, source_frame,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=2.0))
+            t = transform.transform.translation
+            q = transform.transform.rotation
+            rot = Rotation.from_quat([q.x, q.y, q.z, q.w])
+            mat = np.eye(4, dtype=np.float32)
+            mat[:3, :3] = rot.as_matrix().astype(np.float32)
+            mat[:3, 3] = [t.x, t.y, t.z]
+            return mat
+        except Exception as e:
+            self.get_logger().error(f'[GRASP] TF lookup failed: {e}')
+            return None
+
+    def _grasp_crop_depth(self, cx, cy, bbox_w, bbox_h):
+        """Crop depth to padded YOLO bbox. Returns (roi, u_off, v_off)."""
+        if self.latest_depth is None:
+            return None, None, None
+        h, w = self.latest_depth.shape
+        half_w = int(bbox_w * self.GRASP_BBOX_PAD / 2)
+        half_h = int(bbox_h * self.GRASP_BBOX_PAD / 2)
+        u0 = max(0, cx - half_w)
+        v0 = max(0, cy - half_h)
+        u1 = min(w, cx + half_w)
+        v1 = min(h, cy + half_h)
+        return self.latest_depth[v0:v1, u0:u1], u0, v0
+
+    def _grasp_depth_to_points(self, depth_roi, u_offset, v_offset):
+        """Back-project depth ROI to 3D points in base_link frame."""
+        if self.camera_K is None:
+            return None
+
+        fx = self.camera_K[0, 0]
+        fy = self.camera_K[1, 1]
+        cx = self.camera_K[0, 2]
+        cy = self.camera_K[1, 2]
+
+        depth_m = depth_roi.astype(np.float32) / 1000.0
+        roi_h, roi_w = depth_m.shape
+
+        u_grid, v_grid = np.meshgrid(
+            np.arange(roi_w) + u_offset,
+            np.arange(roi_h) + v_offset)
+
+        mask = ((depth_m > self.GRASP_MIN_DEPTH_M) &
+                (depth_m < self.GRASP_MAX_DEPTH_M))
+        z = depth_m[mask]
+        u = u_grid[mask].astype(np.float32)
+        v = v_grid[mask].astype(np.float32)
+
+        if len(z) < self.GRASP_MIN_POINTS:
+            return None
+
+        x_cam = (u - cx) * z / fx
+        y_cam = (v - cy) * z / fy
+        points_cam = np.stack([x_cam, y_cam, z], axis=1)
+
+        tf_mat = self._grasp_get_tf_matrix(
+            'base_link', 'camera_depth_optical_frame')
+        if tf_mat is None:
+            return None
+
+        ones = np.ones((len(points_cam), 1), dtype=np.float32)
+        pts_h = np.hstack([points_cam, ones])
+        pts_base = (tf_mat @ pts_h.T).T[:, :3]
+
+        # Filter: above table
+        pts_base = pts_base[pts_base[:, 2] > self.GRASP_TABLE_Z_MIN]
+
+        # Filter: Z outliers
+        if len(pts_base) > self.GRASP_MIN_POINTS:
+            median_z = np.median(pts_base[:, 2])
+            z_mask = (np.abs(pts_base[:, 2] - median_z)
+                      < self.GRASP_OUTLIER_Z_THRESH)
+            pts_base = pts_base[z_mask]
+
+        if len(pts_base) < self.GRASP_MIN_POINTS:
+            return None
+
+        return pts_base
+
+    def _grasp_analyze_object(self, points_base):
+        """Analyze point cloud: centroid, z_top, optimal grasp yaw."""
+        centroid = np.mean(points_base, axis=0)
+        z_top = float(np.max(points_base[:, 2]))
+
+        pts_xy = points_base[:, :2]
+        centered = pts_xy - centroid[:2]
+
+        best_yaw = 0.0
+        min_width = float('inf')
+        max_width = 0.0
+        for angle_deg in range(0, 180, 5):
+            angle = np.radians(angle_deg)
+            direction = np.array([np.cos(angle), np.sin(angle)])
+            projections = centered @ direction
+            width = float(np.ptp(projections))
+            if width < min_width:
+                min_width = width
+                best_yaw = angle
+            if width > max_width:
+                max_width = width
+
+        self.get_logger().info(
+            f'[GRASP] Min-width sweep: '
+            f'yaw={np.degrees(best_yaw):.0f}deg, '
+            f'grip={min_width*1000:.0f}mm, '
+            f'max={max_width*1000:.0f}mm')
+
+        return {
+            'centroid': centroid,
+            'grasp_yaw': best_yaw,
+            'grip_width': min_width,
+            'max_width': max_width,
+            'z_top': z_top,
+            'num_points': len(points_base),
+        }
+
+    def _grasp_compute_poses(self, analysis):
+        """Compute grasp and pre-grasp poses from analysis dict."""
+        centroid = analysis['centroid']
+        grasp_yaw = analysis['grasp_yaw']
+        grip_width = analysis['grip_width']
+
+        if grip_width > GRIPPER_MAX_OPENING_M:
+            self.get_logger().warn(
+                f'[GRASP] Width {grip_width*1000:.0f}mm > '
+                f'{GRIPPER_MAX_OPENING_M*1000:.0f}mm max '
+                f'(proceeding anyway)')
+
+        qw, qx, qy, qz = yaw_to_grasp_quaternion(grasp_yaw)
+
+        grasp_z = analysis['z_top'] + self.GRASP_Z_OFFSET
+
+        grasp_pose = Pose()
+        grasp_pose.position.x = float(centroid[0])
+        grasp_pose.position.y = float(centroid[1])
+        grasp_pose.position.z = float(grasp_z)
+        grasp_pose.orientation = Quaternion(w=qw, x=qx, y=qy, z=qz)
+
+        pre_grasp_pose = Pose()
+        pre_grasp_pose.position.x = float(centroid[0])
+        pre_grasp_pose.position.y = float(centroid[1])
+        pre_grasp_pose.position.z = float(grasp_z + self.GRASP_PRE_HEIGHT)
+        pre_grasp_pose.orientation = Quaternion(w=qw, x=qx, y=qy, z=qz)
+
+        info = (f'yaw={np.degrees(grasp_yaw):.0f}deg, '
+                f'z={grasp_z:.3f}m, width={grip_width*1000:.0f}mm')
+
+        return grasp_pose, pre_grasp_pose, info
+
+    def _grasp_try_ik(self, pose, use_orientation=True):
+        """Dry-run IK check. Returns (success, message)."""
+        req = PlanToTarget.Request()
+        req.arm_name = self.GRASP_ARM_NAME
+        req.target_pose = pose
+        req.use_orientation = use_orientation
+        req.execute = False
+        req.duration = self.GRASP_MOVE_DURATION
+        req.max_condition_number = 200.0
+
+        future = self.plan_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
+
+        if not future.done() or future.exception():
+            return False, 'service call timed out'
+
+        result = future.result()
+        return result.success, result.message
+
+    def _grasp_plan_and_execute(self, pose, label, use_orientation=True):
+        """Plan and execute a motion to the given pose."""
+        req = PlanToTarget.Request()
+        req.arm_name = self.GRASP_ARM_NAME
+        req.target_pose = pose
+        req.use_orientation = use_orientation
+        req.execute = True
+        req.duration = self.GRASP_MOVE_DURATION
+        req.max_condition_number = 100.0
+
+        self.get_logger().info(
+            f'  [{label}] Planning + executing...')
+
+        future = self.plan_client.call_async(req)
+        rclpy.spin_until_future_complete(
+            self, future, timeout_sec=15.0)
+        if not future.done() or future.exception():
+            self.get_logger().error(
+                f'  [{label}] Service call timed out')
+            return False
+
+        result = future.result()
+        if result.success:
+            if result.executed:
+                time.sleep(self.GRASP_MOVE_DURATION + 0.5)
+            return True
+
+        self.get_logger().warn(
+            f'  [{label}] Failed: {result.message}')
+        return False
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -1812,6 +2254,8 @@ class ExploreAndFind(Node):
                 self._state_approaching()
             elif self.state == ExploreState.COMPLETE:
                 self._state_complete()
+            elif self.state == ExploreState.GRASPING:
+                self._state_grasping()
 
 
 def main(args=None):
