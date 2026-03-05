@@ -64,7 +64,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Point, Twist
 from nav_msgs.msg import MapMetaData, OccupancyGrid
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import ColorRGBA, String
+from std_msgs.msg import ColorRGBA, Float64MultiArray, String
 from visualization_msgs.msg import Marker, MarkerArray
 from vision_msgs.msg import Detection2DArray
 
@@ -176,11 +176,11 @@ class ExploreAndFind(Node):
     DEPTH_STEER_TIMEOUT = 3.0  # s — force re-plan after steering this long
 
     # ── Depth integration angular gating ──────────────────────────────────────
-    MAX_MAPPING_ANGULAR_VEL = 0.5  # rad/s
+    MAX_MAPPING_ANGULAR_VEL = 0.05  # rad/s
 
     # ── Object detection ──────────────────────────────────────────────────────
     MIN_DETECTION_AREA = 50    # px² — minimum color blob area
-    APPROACH_DIST      = 0.30  # m — declare arrived when this close
+    APPROACH_DIST      = 0.50  # m — stop before reaching the object
     DETECT_WINDOW      = 2.0   # s — time window for detection confirmation
     DETECT_COUNT_REQ   = 2     # frames within window to confirm
 
@@ -299,6 +299,8 @@ class ExploreAndFind(Node):
             MarkerArray, '/object_marker', 10)
         self.cmd_vel_pub       = self.create_publisher(
             Twist, '/cmd_vel', 10)
+        self.pan_tilt_pub      = self.create_publisher(
+            Float64MultiArray, '/camera/pan_tilt_cmd', 10)
         latch_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -875,6 +877,12 @@ class ExploreAndFind(Node):
 
         self.target_class_id = class_id
         self._reset_detection_state()
+
+        # Tilt camera down so it can see the ground/objects ahead
+        pt_msg = Float64MultiArray()
+        pt_msg.data = [0.0, 0.3]  # [pan, tilt] — tilt down ~17 deg
+        self.pan_tilt_pub.publish(pt_msg)
+
         self.get_logger().info('=' * 55)
         self.get_logger().info(
             f'NEW COMMAND: {action} {obj_name} (YOLO class {class_id})')
