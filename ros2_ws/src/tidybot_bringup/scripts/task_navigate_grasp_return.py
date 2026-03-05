@@ -3,7 +3,7 @@
 Navigate to YOLO target, grasp it, then return to initial odometry pose.
 
 Extends NavigateAndReturnNode by inserting a top-down grasp sequence
-between arriving at the target and returning home.  Optionally accepts
+between arriving at the target and returning home.  Optionally takes in
 a voice command (via microphone + Gemini) to select the target object.
 
 State machine:
