@@ -108,6 +108,14 @@ class NavigateGraspReturnNode(NavigationTaskNode):
     APPROACH_TARGET_MEMORY_S = 4.0    # keep approaching last known heading for 4s
     YOLO_DETECTION_MAX_AGE_S = 3.0    # accept detections up to 3s old
 
+    # Wider center tolerance so the robot drives forward more and turns less.
+    # Prevents swerving from YOLO bbox jitter on real hardware.
+    APPROACH_CENTER_TOLERANCE = 0.25
+    APPROACH_CENTER_HYSTERESIS = 0.10
+    SEEK_HEADING_GAIN = 0.25          # gentler heading correction
+    SIMPLE_CENTER_TURN_STEP_RAD = 0.05  # smaller turn steps
+    SIMPLE_FORWARD_STEP_M = 0.15     # bigger forward steps when centered
+
     # Grasp parameters
     GRASP_ARM = 'right'
     GRASP_MOVE_DURATION_SIM = 2.0
