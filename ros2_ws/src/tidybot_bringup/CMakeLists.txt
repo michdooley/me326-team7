@@ -47,6 +47,7 @@ install(PROGRAMS
   scripts/topdown_grasp_demo.py
   scripts/test_grasp_validation.py
   scripts/grasp_and_verify_demo.py
+  scripts/ik_debug_tool.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

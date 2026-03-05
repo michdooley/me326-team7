@@ -377,6 +377,47 @@ class TopdownGraspDemo(Node):
 
     # -- Motion planning ---------------------------------------------------
 
+    def _log_ik_result(self, label, result, pose, use_orientation):
+        """Log detailed IK/planner diagnostics."""
+        q = Rotation.from_quat([
+            pose.orientation.x, pose.orientation.y,
+            pose.orientation.z, pose.orientation.w])
+        rpy = q.as_euler('xyz', degrees=True)
+
+        status = 'OK' if result.success else 'FAILED'
+        self.get_logger().info(f'  [{label}] {status}')
+        self.get_logger().info(
+            f'    Target pose:')
+        self.get_logger().info(
+            f'      position : ({pose.position.x:.4f}, '
+            f'{pose.position.y:.4f}, {pose.position.z:.4f}) m')
+        self.get_logger().info(
+            f'      orient   : quat=({pose.orientation.x:.3f}, '
+            f'{pose.orientation.y:.3f}, {pose.orientation.z:.3f}, '
+            f'{pose.orientation.w:.3f})')
+        self.get_logger().info(
+            f'      orient   : rpy=({rpy[0]:.1f}, {rpy[1]:.1f}, '
+            f'{rpy[2]:.1f}) deg')
+        self.get_logger().info(
+            f'    use_orientation: {use_orientation}')
+        self.get_logger().info(
+            f'    pos_error  : {result.position_error:.4f} m')
+        self.get_logger().info(
+            f'    ori_error  : {result.orientation_error:.4f} rad '
+            f'({np.degrees(result.orientation_error):.1f} deg)')
+        self.get_logger().info(
+            f'    cond_number: {result.condition_number:.1f}')
+        if result.joint_positions:
+            joints = list(result.joint_positions)
+            joint_names = ['waist', 'shoulder', 'elbow',
+                           'forearm_roll', 'wrist_angle', 'wrist_rotate']
+            self.get_logger().info(f'    IK solution:')
+            for name, val in zip(joint_names, joints):
+                self.get_logger().info(
+                    f'      {name:15s}: {val:+.4f} rad ({np.degrees(val):+.1f} deg)')
+        if not result.success:
+            self.get_logger().warn(f'    message    : {result.message}')
+
     def plan_and_execute(self, pose, label, use_orientation=True):
         req = PlanToTarget.Request()
         req.arm_name = self.arm_name
@@ -387,25 +428,22 @@ class TopdownGraspDemo(Node):
         req.max_condition_number = 100.0
 
         self.get_logger().info(
-            f'  [{label}] pos=({pose.position.x:.3f}, {pose.position.y:.3f}, '
-            f'{pose.position.z:.3f})')
+            f'  [{label}] Planning + executing...')
 
         future = self.plan_client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=15.0)
         if not future.done() or future.exception():
-            self.get_logger().error(f'  [{label}] service call failed')
+            self.get_logger().error(
+                f'  [{label}] service call timed out or threw exception')
             return False
 
         result = future.result()
+        self._log_ik_result(label, result, pose, use_orientation)
         if result.success:
-            self.get_logger().info(
-                f'  [{label}] OK  pos_err={result.position_error:.4f}m')
             if result.executed:
                 time.sleep(self.move_duration + 0.5)
             return True
-        else:
-            self.get_logger().warn(f'  [{label}] FAILED: {result.message}')
-            return False
+        return False
 
     def _try_ik(self, pose, use_orientation=True):
         """Dry-run IK check. Returns (success, result_message)."""
@@ -421,9 +459,10 @@ class TopdownGraspDemo(Node):
         rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
 
         if not future.done() or future.exception():
-            return False, 'service call failed'
+            return False, 'service call timed out or threw exception'
 
         result = future.result()
+        self._log_ik_result('IK-check', result, pose, use_orientation)
         return result.success, result.message
 
     # -- Depth analysis pipeline -------------------------------------------
