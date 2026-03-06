@@ -1795,24 +1795,30 @@ class ExploreAndFind(Node):
             self._start_next_command()
             return
 
-        # 2. Tilt camera down to see the object on the floor
-        pt_msg = Float64MultiArray()
-        pt_msg.data = [0.0, 0.4]  # pan=0, tilt (some tilt down is [0.0, 0.2])
-        self.pan_tilt_pub.publish(pt_msg) 
-        self._grasp_spin_for(1.5)  # wait for camera to settle + new depth
-
-        # 3. Get fresh YOLO detection
-        det = self.latest_yolo_detection
-        if det is None:
-            for _ in range(20):
+        # 2-3. Sweep camera tilt to find the object in frame
+        det = None
+        tilt_angles = [i * 0.1 for i in range(0, 10)]  # 0.0 to 0.9
+        for tilt in tilt_angles:
+            pt_msg = Float64MultiArray()
+            pt_msg.data = [0.0, tilt]
+            self.pan_tilt_pub.publish(pt_msg)
+            self.get_logger().info(
+                f'[GRASP] Camera tilt={tilt:.1f}, waiting for YOLO...')
+            self.latest_yolo_detection = None  # clear stale
+            self._grasp_spin_for(1.0)  # wait for camera + fresh frame
+            for _ in range(10):
                 self._grasp_spin_for(0.2)
-                det = self.latest_yolo_detection
-                if det is not None:
+                if self.latest_yolo_detection is not None:
+                    det = self.latest_yolo_detection
                     break
+            if det is not None:
+                self.get_logger().info(
+                    f'[GRASP] Found object at tilt={tilt:.1f}')
+                break
 
         if det is None:
             self.get_logger().error(
-                '[GRASP] No YOLO detection available — cannot grasp')
+                '[GRASP] No YOLO detection at any tilt — cannot grasp')
             self._grasp_go_home()
             self._start_next_command()
             return
@@ -2224,18 +2230,18 @@ class ExploreAndFind(Node):
             now = time.time()
 
             # ── periodic debug heartbeat (every 3 s) ──────────────
-            if now - self._dbg_last >= 3.0:
-                self.get_logger().info(
-                    f'[DBG] state={self.state.name} '
-                    f'depth_cb={self._dbg_depth_count} '
-                    f'integrate={self._dbg_integrate_count} '
-                    f'yolo_cb={self._dbg_yolo_count} '
-                    f'cmd_ang={self.last_cmd_angular:.2f} '
-                    f'obj={self.object_world_pos}')
-                self._dbg_depth_count = 0
-                self._dbg_integrate_count = 0
-                self._dbg_yolo_count = 0
-                self._dbg_last = now
+            # if now - self._dbg_last >= 3.0:
+            #     self.get_logger().info(
+            #         f'[DBG] state={self.state.name} '
+            #         f'depth_cb={self._dbg_depth_count} '
+            #         f'integrate={self._dbg_integrate_count} '
+            #         f'yolo_cb={self._dbg_yolo_count} '
+            #         f'cmd_ang={self.last_cmd_angular:.2f} '
+            #         f'obj={self.object_world_pos}')
+            #     self._dbg_depth_count = 0
+            #     self._dbg_integrate_count = 0
+            #     self._dbg_yolo_count = 0
+            #     self._dbg_last = now
 
             if now - self.last_map_publish >= 1.0 / self.MAP_PUBLISH_RATE:
                 self.publish_map()
