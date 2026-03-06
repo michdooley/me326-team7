@@ -9,6 +9,7 @@ to it.
 
 State machine:
   1. SCANNING    — 360 rotation scan, mapping depth into occupancy grid.
+  1b. CENTERING  — rotate in place to center detected object in camera.
   2. SELECTING   — pick best frontier (or approach known object).
   3. NAVIGATING  — follow A* waypoints to frontier, checking for target.
   4. APPROACHING — navigate to detected object's world position.
@@ -96,6 +97,7 @@ except ImportError:
 class ExploreState(Enum):
     WAITING_FOR_COMMAND = -1
     SCANNING    = 0
+    CENTERING   = 6
     SELECTING   = 1
     NAVIGATING  = 2
     APPROACHING = 3
@@ -175,7 +177,7 @@ class ExploreAndFind(Node):
     MAP_PUBLISH_RATE = 1.0   # Hz
 
     # ── 360 scan ─────────────────────────────────────────────────────────────
-    SCAN_ANGULAR_VEL = 0.6   # rad/s
+    SCAN_ANGULAR_VEL = 0.3   # rad/s
     SCAN_SETTLE_TIME = 0.5   # s
 
     # ── Frontier selection ────────────────────────────────────────────────────
@@ -188,18 +190,23 @@ class ExploreAndFind(Node):
     NO_FRONTIER_LIMIT  = 3
     WAYPOINT_SPACING   = 20
     WAYPOINT_TOLERANCE = 0.3    # m
-    NAV_LINEAR_SPEED   = 0.2   # m/s
+    NAV_LINEAR_SPEED   = 0.1   # m/s
     OBSTACLE_THRESHOLD = 0.8    # m
     DEPTH_STEER_TIMEOUT = 3.0  # s — force re-plan after steering this long
 
     # ── Depth integration angular gating ──────────────────────────────────────
     MAX_MAPPING_ANGULAR_VEL = 0.06  # rad/s (only applied during nav, not scanning)
 
+    # ── Centering after scan ─────────────────────────────────────────────────
+    CENTER_PIXEL_THRESH = 40    # px — how close to image center is "centered"
+    CENTER_ANGULAR_VEL  = 0.25  # rad/s — rotation speed during centering
+    CENTER_TIMEOUT      = 15.0  # s — give up centering if no detection
+
     # ── Object detection ──────────────────────────────────────────────────────
     MIN_DETECTION_AREA = 50    # px² — minimum color blob area
     APPROACH_DIST      = 0.35  # m — stop before reaching the object
     DETECT_WINDOW      = 2.0   # s — time window for detection confirmation
-    DETECT_COUNT_REQ   = 2     # frames within window to confirm
+    DETECT_COUNT_REQ   = 1     # frames within window to confirm
 
     # ── Grasp parameters ─────────────────────────────────────────────────────
     GRASP_ARM_NAME               = 'right'
@@ -878,6 +885,34 @@ class ExploreAndFind(Node):
 
         return False
 
+    def _refine_object_position(self):
+        """Update object_world_pos from a new YOLO detection if available.
+
+        Called during NAVIGATING and APPROACHING to keep the position
+        estimate fresh as the robot gets closer (depth accuracy improves).
+        """
+        det = self.latest_yolo_detection
+        if det is None:
+            return
+        self.latest_yolo_detection = None  # consume
+
+        u = int(det.bbox.center.position.x)
+        v = int(det.bbox.center.position.y)
+        new_pos = self._estimate_object_position(u, v)
+        if new_pos is None:
+            return
+
+        old_ox, old_oy = self.object_world_pos
+        shift = np.hypot(new_pos[0] - old_ox, new_pos[1] - old_oy)
+        if shift < 1.5:
+            self.object_world_pos = new_pos
+            self.last_detection_pos = new_pos
+            if shift > 0.15:
+                self.get_logger().info(
+                    f'[REFINE] Updated object position: '
+                    f'({new_pos[0]:.2f}, {new_pos[1]:.2f}) '
+                    f'shift={shift:.2f}m')
+
     # ── Voice command callbacks ───────────────────────────────────────────
 
     def _user_command_cb(self, msg: String):
@@ -923,7 +958,7 @@ class ExploreAndFind(Node):
 
         # Tilt camera down so it can see the ground/objects ahead
         pt_msg = Float64MultiArray()
-        pt_msg.data = [0.0, 0.1]  # [pan, tilt] TODO 0.2 for real
+        pt_msg.data = [0.0, 0.3]  # [pan, tilt] TODO 0.2 for real
         self.pan_tilt_pub.publish(pt_msg)
 
         self.get_logger().info('=' * 55)
@@ -1355,8 +1390,14 @@ class ExploreAndFind(Node):
     def _state_scanning(self):
         if self.scan_settle_start is not None:
             if time.time() - self.scan_settle_start >= self.SCAN_SETTLE_TIME:
-                self.get_logger().info('[SCAN] Settled — selecting frontier.')
-                self.state = ExploreState.SELECTING
+                # If object was detected during scan, center on it first
+                if self.object_world_pos is not None:
+                    self.get_logger().info(
+                        '[SCAN] Settled — object detected, centering on it.')
+                    self._start_centering()
+                else:
+                    self.get_logger().info('[SCAN] Settled — selecting frontier.')
+                    self.state = ExploreState.SELECTING
             return
 
         heading = self.get_heading()
@@ -1381,6 +1422,118 @@ class ExploreAndFind(Node):
             cmd.angular.z = self.SCAN_ANGULAR_VEL
             self.last_cmd_angular = cmd.angular.z
             self.cmd_vel_pub.publish(cmd)
+
+    def _start_centering(self):
+        self.center_start_time = time.time()
+        self.state = ExploreState.CENTERING
+        self.get_logger().info('[CENTER] Rotating to center object in camera...')
+
+    def _state_centering(self):
+        """Rotate in place until the target object is horizontally centered.
+
+        Two modes:
+        1. No YOLO detection visible: rotate toward the object's known world
+           position using bearing from base_link.
+        2. YOLO detection visible: fine-tune using pixel offset in the image,
+           and update the world position estimate.
+        """
+        now = time.time()
+
+        if now - self.center_start_time > self.CENTER_TIMEOUT:
+            self._stop_base()
+            self.get_logger().warn(
+                '[CENTER] Timeout — proceeding to selection.')
+            self.state = ExploreState.SELECTING
+            return
+
+        pose = self.get_base_pose()
+        if pose is None:
+            return
+        bx, by, btheta = pose
+
+        det = self.latest_yolo_detection
+        if det is not None:
+            # ── YOLO visible: fine-center using pixel offset ──────────
+            u = int(det.bbox.center.position.x)
+
+            if self.latest_depth is None:
+                return
+            img_w = self.latest_depth.shape[1]
+            img_center = img_w / 2.0
+            offset = u - img_center  # positive = object right of center
+
+            # Update object position from fresh detection
+            v = int(det.bbox.center.position.y)
+            new_pos = self._estimate_object_position(u, v)
+            if new_pos is not None:
+                if self.object_world_pos is not None:
+                    shift = np.hypot(
+                        new_pos[0] - self.object_world_pos[0],
+                        new_pos[1] - self.object_world_pos[1])
+                    if shift < 1.5:
+                        self.object_world_pos = new_pos
+                        self.last_detection_pos = new_pos
+                else:
+                    self.object_world_pos = new_pos
+                    self.last_detection_pos = new_pos
+
+            if abs(offset) < self.CENTER_PIXEL_THRESH:
+                self._stop_base()
+                self.get_logger().info(
+                    f'[CENTER] Object centered (offset={offset:.0f}px) '
+                    f'— proceeding to selection.')
+                self.state = ExploreState.SELECTING
+                return
+
+            # Rotate to reduce pixel offset
+            cmd = Twist()
+            # Proportional control: faster when far off-center
+            frac = min(abs(offset) / (img_w / 2.0), 1.0)
+            speed = self.CENTER_ANGULAR_VEL * (0.4 + 0.6 * frac)
+            cmd.angular.z = -speed if offset > 0 else speed
+            self.last_cmd_angular = cmd.angular.z
+            self.cmd_vel_pub.publish(cmd)
+
+            if not hasattr(self, '_center_last_log') or now - self._center_last_log > 1.0:
+                self._center_last_log = now
+                self.get_logger().info(
+                    f'[CENTER] pixel offset={offset:.0f}px, rotating '
+                    f'{"right" if offset > 0 else "left"}')
+        else:
+            # ── No YOLO detection: rotate toward known world position ─
+            if self.object_world_pos is None:
+                self._stop_base()
+                self.state = ExploreState.SELECTING
+                return
+
+            ox, oy = self.object_world_pos
+            bearing = np.arctan2(oy - by, ox - bx)
+            # Robot's forward direction uses btheta - pi/2 convention
+            actual_heading = btheta - np.pi / 2
+            heading_error = self._normalize_angle(bearing - actual_heading)
+
+            # Close enough in heading — object should appear soon
+            if abs(heading_error) < np.radians(5):
+                # Stop and wait a moment for YOLO to detect
+                self._stop_base()
+                if not hasattr(self, '_center_last_log') or now - self._center_last_log > 1.0:
+                    self._center_last_log = now
+                    self.get_logger().info(
+                        '[CENTER] Facing object, waiting for YOLO detection...')
+                return
+
+            cmd = Twist()
+            cmd.angular.z = float(np.clip(
+                1.0 * heading_error, -self.CENTER_ANGULAR_VEL,
+                self.CENTER_ANGULAR_VEL))
+            self.last_cmd_angular = cmd.angular.z
+            self.cmd_vel_pub.publish(cmd)
+
+            if not hasattr(self, '_center_last_log') or now - self._center_last_log > 1.0:
+                self._center_last_log = now
+                self.get_logger().info(
+                    f'[CENTER] bearing err={np.degrees(heading_error):.0f}deg, '
+                    f'rotating toward ({ox:.2f},{oy:.2f})')
 
     def _state_selecting(self):
         # ── If object confirmed, try to approach it first ─────────────
@@ -1482,6 +1635,9 @@ class ExploreAndFind(Node):
         # ── Check for target object while navigating ──────────────────
         if self.object_world_pos is None:
             self._check_for_object()
+        else:
+            # Refine object position from new detections while navigating
+            self._refine_object_position()
         if self.object_world_pos is not None:
             if self._plan_approach():
                 return
@@ -1601,41 +1757,28 @@ class ExploreAndFind(Node):
         # ── Refine object position while approaching ──────────────
         # Re-detect the object to update position estimate as we get closer
         # (depth accuracy improves at shorter range).
-        if self.latest_yolo_detection is not None:
-            det = self.latest_yolo_detection
-            self.latest_yolo_detection = None
-            u = int(det.bbox.center.position.x)
-            v = int(det.bbox.center.position.y)
-            new_pos = self._estimate_object_position(u, v)
-            if new_pos is not None:
-                old_ox, old_oy = self.object_world_pos
-                shift = np.hypot(
-                    new_pos[0] - old_ox, new_pos[1] - old_oy)
-                # Only update if shift is reasonable (< 1.5m)
-                # to avoid jumping to a different object
-                if shift < 1.5:
-                    self.object_world_pos = new_pos
-                    if shift > 0.15:
-                        self.get_logger().info(
-                            f'[APPROACH] Refined position: '
-                            f'({new_pos[0]:.2f}, {new_pos[1]:.2f}) '
-                            f'shift={shift:.2f}m')
-                        # Re-plan path to updated position
-                        goal_gx, goal_gy = self.world_to_grid(
-                            new_pos[0], new_pos[1])
-                        robot_gx, robot_gy = self.world_to_grid(
-                            bx, by)
-                        for cl in [None, self.ROBOT_CLEARANCE * 0.5]:
-                            path = self._plan_path(
-                                robot_gx, robot_gy,
-                                goal_gx, goal_gy,
-                                clearance_m=cl)
-                            if path is not None:
-                                self.nav_waypoints = path
-                                self.nav_waypoint_idx = 0
-                                self.nav_clearance = cl
-                                self.publish_nav_path()
-                                break
+        old_pos = self.object_world_pos
+        self._refine_object_position()
+        if self.object_world_pos != old_pos:
+            shift = np.hypot(
+                self.object_world_pos[0] - old_pos[0],
+                self.object_world_pos[1] - old_pos[1])
+            if shift > 0.15:
+                # Re-plan path to updated position
+                goal_gx, goal_gy = self.world_to_grid(
+                    self.object_world_pos[0], self.object_world_pos[1])
+                robot_gx, robot_gy = self.world_to_grid(bx, by)
+                for cl in [None, self.ROBOT_CLEARANCE * 0.5]:
+                    path = self._plan_path(
+                        robot_gx, robot_gy,
+                        goal_gx, goal_gy,
+                        clearance_m=cl)
+                    if path is not None:
+                        self.nav_waypoints = path
+                        self.nav_waypoint_idx = 0
+                        self.nav_clearance = cl
+                        self.publish_nav_path()
+                        break
 
         # Check distance to object
         ox, oy = self.object_world_pos
@@ -2261,6 +2404,8 @@ class ExploreAndFind(Node):
                     self._start_next_command()
             elif self.state == ExploreState.SCANNING:
                 self._state_scanning()
+            elif self.state == ExploreState.CENTERING:
+                self._state_centering()
             elif self.state == ExploreState.SELECTING:
                 self._state_selecting()
             elif self.state == ExploreState.NAVIGATING:
