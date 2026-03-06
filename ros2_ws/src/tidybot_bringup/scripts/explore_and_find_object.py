@@ -2000,10 +2000,12 @@ class ExploreAndFind(Node):
             self._start_next_command()
             return
 
-        # 2-3. Sweep camera tilt to find the object in frame
+        # 2-3. Sweep camera tilt to find the object, then center it
         det = None
+        current_tilt = 0.0
         tilt_angles = [i * 0.1 for i in range(0, 10)]  # 0.0 to 0.9
         for tilt in tilt_angles:
+            current_tilt = tilt
             pt_msg = Float64MultiArray()
             pt_msg.data = [0.0, tilt]
             self.pan_tilt_pub.publish(pt_msg)
@@ -2027,6 +2029,51 @@ class ExploreAndFind(Node):
             self._grasp_go_home()
             self._start_next_command()
             return
+
+        # Fine-tune tilt to center object vertically in frame
+        center_thresh = 40  # px — how close to vertical center is "good enough"
+        for _ in range(10):  # max iterations to avoid infinite loop
+            if self.latest_depth is None:
+                break
+            img_h = self.latest_depth.shape[0]
+            cy_det = int(det.bbox.center.position.y)
+            v_offset = cy_det - img_h / 2.0  # positive = object below center
+
+            if abs(v_offset) <= center_thresh:
+                self.get_logger().info(
+                    f'[GRASP] Object centered vertically '
+                    f'(offset={v_offset:.0f}px, tilt={current_tilt:.2f})')
+                break
+
+            # Adjust tilt: object below center → increase tilt, above → decrease
+            tilt_step = 0.03 if abs(v_offset) < img_h * 0.25 else 0.06
+            if v_offset > 0:
+                current_tilt += tilt_step
+            else:
+                current_tilt -= tilt_step
+            current_tilt = max(0.0, min(current_tilt, 0.9))
+
+            pt_msg = Float64MultiArray()
+            pt_msg.data = [0.0, current_tilt]
+            self.pan_tilt_pub.publish(pt_msg)
+            self.get_logger().info(
+                f'[GRASP] Centering: v_offset={v_offset:.0f}px, '
+                f'new tilt={current_tilt:.2f}')
+
+            # Wait for camera to settle and get fresh detection
+            self.latest_yolo_detection = None
+            self._grasp_spin_for(0.8)
+            for _ in range(10):
+                self._grasp_spin_for(0.2)
+                if self.latest_yolo_detection is not None:
+                    det = self.latest_yolo_detection
+                    break
+            if self.latest_yolo_detection is None:
+                # Lost detection after tilt adjust — use last good one
+                self.get_logger().warn(
+                    '[GRASP] Lost detection during centering — '
+                    'using last good detection')
+                break
 
         self.latest_yolo_detection = None  # consume
 
