@@ -49,6 +49,8 @@ install(PROGRAMS
   scripts/voice_command.py
   scripts/speech_to_text.py
   scripts/objective1_task.py
+  scripts/test_grasp_validation.py
+  scripts/grasp_and_verify_demo.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

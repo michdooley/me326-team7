@@ -40,8 +40,12 @@ from interbotix_xs_msgs.msg import JointGroupCommand
 
 from tidybot_perception.rgbd_object_detector import RGBDObjectDetector
 
-# Import depth alignment utility
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'utilities'))
+# Import depth alignment utility (works from both source and installed locations)
+_script_dir = Path(__file__).resolve().parent
+for _p in [_script_dir / 'utilities', _script_dir.parent / 'utilities']:
+    if _p.is_dir():
+        sys.path.insert(0, str(_p))
+        break
 from align_depth_to_rgb import align_depth  # noqa: E402
 
 
