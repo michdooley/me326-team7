@@ -31,20 +31,27 @@ Subscribes:
   /camera/depth/camera_info  — depth camera intrinsics
   /camera/color/image_raw    — RGB frames for object detection
 
-Terminal 1 — sim:
-    source ros2_ws/setup_env.bash
-    ros2 launch tidybot_bringup sim.launch.py scene:=scene_banana_test.xml show_mujoco_viewer:=false
+Build
+cd ros2_ws && colcon build --packages-select tidybot_perception tidybot_bringup && source install/setup.bash
 
-Terminal 2 — nav (hardcoded target, no mic):
-    ros2 launch tidybot_bringup nav.launch.py target_object:=banana
+Terminal 1: robot/rviz bringup
+ros2 launch tidybot_bringup sim.launch.py scene:=scene_banana_test.xml show_mujoco_viewer:=false
 
-Terminal 2 — nav (voice mode, wait for voice command):
-    ros2 launch tidybot_bringup nav.launch.py skip_voice:=false
+OR
+
+ros2 launch tidybot_bringup real.launch.py show_mujoco_viewer:=false
+
+Terminal 2: nav + grasp (no voice)
+ros2 launch tidybot_bringup nav.launch.py target_object:=banana user_command:=get
+
+With voice:
+Terminal 2: nav + grasp (with voice)
+ros2 launch tidybot_bringup nav.launch.py skip_voice:=false
 
 Terminal 3 - interactive voice command script that will start nav
-    ros2 launch tidybot_bringup nav.launch.py skip_voice:=false
+    ros2 run tidybot_bringup voice_command.py
 
-To manually publish a voice command instead of using the mic:
+To manually publish a voice command instead of using the mic (terminal 3):
     ros2 topic pub --once /user_command std_msgs/msg/String "data: 'get'"
     ros2 topic pub --once /target_object std_msgs/msg/String "data: 'banana'"
 """
@@ -186,7 +193,7 @@ class ExploreAndFind(Node):
     DEPTH_STEER_TIMEOUT = 3.0  # s — force re-plan after steering this long
 
     # ── Depth integration angular gating ──────────────────────────────────────
-    MAX_MAPPING_ANGULAR_VEL = 0.05  # rad/s
+    MAX_MAPPING_ANGULAR_VEL = 0.06  # rad/s (only applied during nav, not scanning)
 
     # ── Object detection ──────────────────────────────────────────────────────
     MIN_DETECTION_AREA = 50    # px² — minimum color blob area
@@ -382,7 +389,9 @@ class ExploreAndFind(Node):
         if hasattr(self, '_dbg_depth_count'):
             self._dbg_depth_count += 1
         if self.camera_K is not None:
-            if abs(self.last_cmd_angular) <= self.MAX_MAPPING_ANGULAR_VEL:
+            # Always integrate during scanning; gate by angular vel otherwise
+            scanning = (self.state == ExploreState.SCANNING)
+            if scanning or abs(self.last_cmd_angular) <= self.MAX_MAPPING_ANGULAR_VEL:
                 if hasattr(self, '_dbg_integrate_count'):
                     self._dbg_integrate_count += 1
                 self._integrate_depth()
@@ -914,7 +923,7 @@ class ExploreAndFind(Node):
 
         # Tilt camera down so it can see the ground/objects ahead
         pt_msg = Float64MultiArray()
-        pt_msg.data = [0.0, 0.3]  # [pan, tilt] — tilt down ~17 deg
+        pt_msg.data = [0.0, 0.2]  # [pan, tilt] — tilt down ~17 deg
         self.pan_tilt_pub.publish(pt_msg)
 
         self.get_logger().info('=' * 55)
@@ -1788,7 +1797,7 @@ class ExploreAndFind(Node):
 
         # 2. Tilt camera down to see the object on the table
         pt_msg = Float64MultiArray()
-        pt_msg.data = [0.0, 0.5]  # pan=0, tilt down ~28 deg
+        pt_msg.data = [0.0, 0.2]  # pan=0, tilt down ~28 deg
         self.pan_tilt_pub.publish(pt_msg)
         self._grasp_spin_for(1.5)  # wait for camera to settle + new depth
 
