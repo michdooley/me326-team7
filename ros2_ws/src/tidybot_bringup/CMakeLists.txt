@@ -51,6 +51,7 @@ install(PROGRAMS
   scripts/task_navigate_grasp_return.py
   scripts/task_navigate_grasp_return_no_obstacles.py
   scripts/explore_and_find_object.py
+  scripts/banana_pickup.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
