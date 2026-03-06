@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Navigate to YOLO target, grasp it, then return to initial odometry pose.
-NO obstacle avoidance logic — drives straight toward the target.
+NO obstacle avoidance — drives straight toward the target.
 
 Extends NavigationTaskNode but disables all obstacle detection/avoidance.
 Optionally takes in a voice command (via microphone + Gemini) to select
