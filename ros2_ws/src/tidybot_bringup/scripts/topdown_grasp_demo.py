@@ -34,6 +34,7 @@ Usage:
 
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -78,6 +79,61 @@ MAX_DEPTH_M = 2.0
 MIN_POINTS = 20
 TABLE_Z_MIN = 0.005
 OUTLIER_Z_THRESH = 0.05  # keep points within +/-5cm of median Z
+FLOOR_BIN_WIDTH = 0.003  # 3mm bins for floor detection histogram
+FLOOR_MARGIN = 0.008     # RANSAC inlier distance threshold for floor plane
+
+
+def _ransac_floor_separate(pts, distance_thresh=0.008, max_iterations=200,
+                            min_inlier_ratio=0.20, min_pts=20):
+    """RANSAC plane fit to find the dominant planar surface (floor/table).
+
+    Returns (floor_z, object_points).  floor_z is the median Z of inliers.
+    Works on tilted floors unlike a simple Z-histogram.
+    """
+    n = len(pts)
+    if n < min_pts:
+        return float(np.median(pts[:, 2])), pts
+
+    best_inlier_mask = None
+    best_count = 0
+
+    rng = np.random.default_rng(42)
+    for _ in range(max_iterations):
+        # Sample 3 random points
+        idx = rng.choice(n, 3, replace=False)
+        p0, p1, p2 = pts[idx]
+
+        # Fit plane: normal = (p1-p0) x (p2-p0)
+        v1 = p1 - p0
+        v2 = p2 - p0
+        normal = np.cross(v1, v2)
+        norm_len = np.linalg.norm(normal)
+        if norm_len < 1e-10:
+            continue
+        normal /= norm_len
+
+        # Distance from all points to the plane
+        dists = np.abs((pts - p0) @ normal)
+        inlier_mask = dists < distance_thresh
+        count = inlier_mask.sum()
+
+        if count > best_count:
+            best_count = count
+            best_inlier_mask = inlier_mask
+
+    if best_inlier_mask is None or best_count < min_inlier_ratio * n:
+        # No dominant plane found — fall back to Z-histogram style
+        return float(np.min(pts[:, 2])), pts
+
+    floor_z = float(np.median(pts[best_inlier_mask, 2]))
+    outlier_mask = ~best_inlier_mask
+
+    if outlier_mask.sum() < min_pts:
+        # Almost everything is floor — return all points
+        return floor_z, pts
+
+    return floor_z, pts[outlier_mask]
+
 
 # Real hardware: safe tucked position for arm return
 SLEEP_POSE = [0.0, -1.80, 1.55, 0.0, 0.8, 0.0]
@@ -102,6 +158,7 @@ class TopdownGraspDemo(Node):
         self.declare_parameter('z_offset', -0.02)
         self.declare_parameter('z_bias', 0.0)
         self.declare_parameter('bbox_pad', 1.3)
+        self.declare_parameter('save_snapshot', True)
         self.target_object = self.get_parameter('target').value
         self.arm_name = self.get_parameter('arm').value
         self.move_duration = self.get_parameter('duration').value
@@ -110,6 +167,7 @@ class TopdownGraspDemo(Node):
         self.z_offset = self.get_parameter('z_offset').value
         self.z_bias = self.get_parameter('z_bias').value
         self.bbox_pad = self.get_parameter('bbox_pad').value
+        self.save_snapshot = self.get_parameter('save_snapshot').value
 
         # TF2
         self.tf_buffer = tf2_ros.Buffer()
@@ -506,15 +564,16 @@ class TopdownGraspDemo(Node):
         On real hardware, uses depth camera intrinsics and depth optical frame.
         In simulation, uses RGB camera intrinsics (same virtual camera).
 
-        Returns (N, 3) numpy array or None.
+        Returns (obj_pts, floor_z, pts_base_raw) or (None, None, None).
         """
-        # Select intrinsics: depth on real hw, RGB (same camera) in sim
+        # On real hw: use depth intrinsics + depth optical frame (no alignment).
+        # In sim: depth and color share the same virtual camera.
         if not self.is_sim and self.depth_camera_info is not None:
             K = self.depth_camera_info.k
             tf_frame = 'camera_depth_optical_frame'
         else:
             if self.camera_info is None:
-                return None
+                return None, None, None
             K = self.camera_info.k
             tf_frame = 'camera_color_optical_frame'
 
@@ -534,7 +593,7 @@ class TopdownGraspDemo(Node):
         v = v_grid[mask].astype(np.float32)
 
         if len(z) < MIN_POINTS:
-            return None
+            return None, None, None
 
         # Pinhole back-projection to camera frame
         x_cam = (u - cx) * z / fx
@@ -544,7 +603,7 @@ class TopdownGraspDemo(Node):
         # Transform to base_link
         tf_mat = self._get_tf_matrix('base_link', tf_frame)
         if tf_mat is None:
-            return None
+            return None, None, None
 
         ones = np.ones((len(points_cam), 1), dtype=np.float32)
         pts_h = np.hstack([points_cam, ones])
@@ -560,9 +619,29 @@ class TopdownGraspDemo(Node):
             pts_base = pts_base[z_mask]
 
         if len(pts_base) < MIN_POINTS:
-            return None
+            return None, None, None
 
-        return pts_base
+        # Separate floor/table surface from object points via Z histogram
+        floor_z, obj_pts = self._separate_floor(pts_base)
+
+        if len(obj_pts) < MIN_POINTS:
+            self.get_logger().warn(
+                f'  Floor filter removed too many points '
+                f'({len(pts_base)} -> {len(obj_pts)}), using all points')
+            return pts_base, floor_z, pts_base
+
+        return obj_pts, floor_z, pts_base
+
+    def _separate_floor(self, pts_base):
+        """Detect the floor/table plane via RANSAC and separate object points.
+
+        Fits a plane to the largest planar surface (floor/table), then
+        returns (floor_z, object_points) where floor_z is the median Z
+        of inlier points and object_points are those above the plane.
+        """
+        floor_z, obj_pts = _ransac_floor_separate(
+            pts_base, distance_thresh=FLOOR_MARGIN, min_pts=MIN_POINTS)
+        return floor_z, obj_pts
 
     def _analyze_object(self, points_base):
         """Analyze point cloud to find centroid, z_top, and optimal grasp angle.
@@ -714,10 +793,6 @@ class TopdownGraspDemo(Node):
         if self.latest_depth is None or self.camera_info is None:
             self.get_logger().error('No depth/camera_info received -- aborting')
             return False
-        if not self.is_sim and self.depth_camera_info is None:
-            self.get_logger().warn(
-                'No depth camera_info received -- '
-                'falling back to RGB intrinsics for back-projection')
 
         # -- Step 1: YOLO detection ----------------------------------------
         self.spin_for(1.0)  # let data flow
@@ -744,13 +819,13 @@ class TopdownGraspDemo(Node):
             f'bbox {bbox_w:.0f}x{bbox_h:.0f}')
 
         # -- Step 2: Depth point cloud from bbox ROI -----------------------
-        if not self.is_sim:
-            # Transform YOLO bbox from RGB pixel space to depth pixel space
+        # YOLO detects in RGB pixel space; depth is in its native frame
+        # (align_depth disabled), so transform bbox from RGB→depth pixels.
+        if not self.is_sim and self.depth_camera_info is not None:
             self.get_logger().info(
                 'Transforming bbox from RGB to depth pixel space...')
             u, v = self._rgb_pixel_to_depth_pixel(u, v)
             u, v = int(round(u)), int(round(v))
-            # Scale bbox size by focal length ratio (RGB→depth)
             K_rgb = np.array(self.camera_info.k).reshape(3, 3)
             K_depth = np.array(self.depth_camera_info.k).reshape(3, 3)
             scale_x = K_depth[0, 0] / K_rgb[0, 0]
@@ -769,13 +844,32 @@ class TopdownGraspDemo(Node):
             self.get_logger().error('Failed to crop depth image')
             return False
 
-        pts_base = self._depth_roi_to_points_base(depth_roi, u_off, v_off)
+        pts_base, floor_z, pts_base_raw = self._depth_roi_to_points_base(depth_roi, u_off, v_off)
         if pts_base is None:
             self.get_logger().error(
                 f'Insufficient points in depth ROI (need >= {MIN_POINTS})')
             return False
 
-        self.get_logger().info(f'  Point cloud: {len(pts_base)} points')
+        self.get_logger().info(f'  Point cloud: {len(pts_base)} points (raw: {len(pts_base_raw)})')
+        if floor_z is not None:
+            self.get_logger().info(f'  Floor Z: {floor_z:.3f}m')
+
+        # Save snapshot for offline visualization
+        if self.save_snapshot:
+            snap_dir = Path.home() / '.tidybot_grasp_snapshots'
+            snap_dir.mkdir(exist_ok=True)
+            snap_path = snap_dir / f'{datetime.now().strftime("%Y-%m-%d_%H%M%S")}.npz'
+            save_kwargs = dict(
+                points_base=pts_base,
+                points_base_raw=pts_base_raw,
+                z_offset=self.z_offset,
+                z_bias=self.z_bias,
+                pre_grasp_height=self.pre_grasp_height,
+                target_object=self.target_object)
+            if floor_z is not None:
+                save_kwargs['floor_z'] = floor_z
+            np.savez(str(snap_path), **save_kwargs)
+            self.get_logger().info(f'  Snapshot saved: {snap_path}')
 
         # -- Step 3: Analyze object (centroid + min-width grasp angle) ------
         self.get_logger().info('Analyzing object point cloud...')
