@@ -58,10 +58,11 @@ SLEEP_POSE = [0.0, -1.80, 1.55, 0.0, 0.8, 0.0]
 
 class TaskState(Enum):
     WAIT = 0
-    APPROACH = 1
-    GRASP = 2
-    RETURN = 3
-    DONE = 4
+    CENTERING = 1
+    APPROACH = 2
+    GRASP = 3
+    RETURN = 4
+    DONE = 5
 
 
 def yaw_to_grasp_quaternion(yaw_rad):
@@ -144,6 +145,12 @@ class BananaPickupNode(Node):
         # --- Camera pan/tilt state ---
         self.camera_pan = 0.0
         self.camera_tilt = 0.0
+
+        # --- Centering memory ---
+        self.target_yaw_lock = None 
+        self.CENTERING_ANG_TOL = 0.15
+        self.TURN_GAIN = 0.3           # Reduced: Slower rotation (was 0.8)
+        self.MIN_TURN_SPEED = 0.02
 
         # --- Approach state ---
         self.approach_depth_m = None  # latest depth to banana center
@@ -317,6 +324,8 @@ class BananaPickupNode(Node):
 
         if self.state == TaskState.WAIT:
             self._do_wait()
+        elif self.state == TaskState.CENTERING: # New
+            self._do_centering()
         elif self.state == TaskState.APPROACH:
             self._do_approach()
         elif self.state == TaskState.GRASP:
@@ -329,73 +338,139 @@ class BananaPickupNode(Node):
     # ------------------------------------------------------------------
     # WAIT: hold position until YOLO sees the banana (no spinning)
     # ------------------------------------------------------------------
+    # def _do_wait(self):
+    #     if self._banana_visible():
+    #         self.get_logger().info(
+    #             f'Banana detected (conf={self.banana_conf:.2f})! Approaching.')
+    #         self.state = TaskState.APPROACH
+    #         return
+
+    #     # Hold still — banana should be right in front
+    #     self._hold()
+
     def _do_wait(self):
         if self._banana_visible():
-            self.get_logger().info(
-                f'Banana detected (conf={self.banana_conf:.2f})! Approaching.')
+            cx, _, _, _ = self.banana_bbox
+            img_w = getattr(self, '_color_shape', (480, 640))[1]
+            
+            # Calculate how far off-center the banana is in radians
+            # 0.5 is FOV approximation; adjust if your camera FOV is known
+            fov_approx = 1.0 
+            offset_rad = -((cx / img_w) - 0.5) * fov_approx
+            
+            # Lock the target heading in world coordinates
+            self.target_yaw_lock = wrap_angle(self.current_theta + offset_rad)
+            
+            self.get_logger().info(f'Banana found! Locking heading: {np.rad2deg(self.target_yaw_lock):.1f} deg')
+            self.state = TaskState.CENTERING
+            return
+        self._hold()
+
+    def _do_centering(self):
+        # 1. Calculate the shortest angular distance to our target
+        angle_err = wrap_angle(self.target_yaw_lock - self.current_theta)
+        
+        # 2. Check if we are within the new, larger tolerance
+        if abs(angle_err) < self.CENTERING_ANG_TOL:
+            self.get_logger().info(f'Within tolerance ({np.rad2deg(abs(angle_err)):.1f} deg). Moving to APPROACH.')
+            # Stop rotation before moving forward
+            self._hold()
             self.state = TaskState.APPROACH
             return
 
-        # Hold still — banana should be right in front
-        self._hold()
+        # 3. Calculate Slower Turn Speed
+        # We use a lower proportional gain (self.TURN_GAIN)
+        raw_turn = angle_err * self.TURN_GAIN
+        
+        # Apply a conservative cap so it never "whips" around
+        max_safe_turn = 0.05  # Slow and steady
+        turn_speed = np.clip(raw_turn, -max_safe_turn, max_safe_turn)
+        
+        # 4. Add a minimum floor so the motors actually turn
+        if abs(turn_speed) < self.MIN_TURN_SPEED:
+            turn_speed = np.sign(angle_err) * self.MIN_TURN_SPEED
+
+        self.get_logger().info(f'Centering... Error: {np.rad2deg(angle_err):.1f} deg | Speed: {turn_speed:.3f}', throttle_duration_sec=1.0)
+        
+        self._send_base(self.current_x, self.current_y, self.current_theta + turn_speed)
 
     # ------------------------------------------------------------------
     # APPROACH: center banana in frame, drive forward until close
     # ------------------------------------------------------------------
     def _do_approach(self):
-        if not self._banana_visible(max_age=3.0):
-            self.get_logger().info('Lost banana — holding position, waiting.')
-            self._hold()
-            self.state = TaskState.WAIT
-            return
-
-        cx, cy, bw, bh = self.banana_bbox
-        img_w = getattr(self, '_color_shape', (480, 640))[1]
-
-        # Fraction of image: 0=left, 1=right
-        frac = cx / img_w
-        offset = frac - 0.5  # negative=left, positive=right
-
-        # Check depth
         depth_m = self._get_banana_depth_m()
-        if depth_m is not None:
-            self.approach_depth_m = depth_m
-
-        # Auto-tilt camera to keep banana in view
-        img_h = getattr(self, '_color_shape', (480, 640))[0]
-        y_frac = cy / img_h
-        if y_frac > 0.80:
-            self._set_pan_tilt(self.camera_pan,
-                               min(self.camera_tilt + 0.06, 1.0))
-        elif y_frac < 0.30:
-            self._set_pan_tilt(self.camera_pan,
-                               max(self.camera_tilt - 0.06, -0.5))
-
-        # Are we close enough?
+        
         if depth_m is not None and depth_m < self.STOP_DEPTH_M:
-            self.get_logger().info(
-                f'Close enough (depth={depth_m:.2f}m). Starting grasp.')
+            self.get_logger().info('Target reached. Grasping.')
             self._hold()
             self.state = TaskState.GRASP
             self._run_grasp()
             return
 
-        # Steer: turn to center, then step forward
-        if abs(offset) > self.CENTER_TOLERANCE:
-            # Turn toward banana — negative offset means turn left (positive theta)
-            turn = -offset * 0.5  # proportional control
-            turn = np.clip(turn, -self.TURN_STEP_RAD, self.TURN_STEP_RAD)
-            self._send_base(self.current_x, self.current_y,
-                            self.current_theta + turn)
-        else:
-            # Drive forward in current heading
-            step = self.FORWARD_STEP_M
-            if depth_m is not None and depth_m < 0.5:
-                step = self.FORWARD_STEP_M * 0.5  # slow down when close
-            dx = step * np.cos(self.current_theta)
-            dy = step * np.sin(self.current_theta)
-            self._send_base(self.current_x + dx, self.current_y + dy,
-                            self.current_theta)
+        # Drive straight toward the locked yaw
+        step = self.FORWARD_STEP_M
+        if depth_m is not None and depth_m < 0.5:
+            step *= 0.5
+            
+        dx = step * np.cos(self.current_theta)
+        dy = step * np.sin(self.current_theta)
+        
+        # Use target_yaw_lock to keep the heading stable
+        self._send_base(self.current_x + dx, self.current_y + dy, self.target_yaw_lock)
+    # def _do_approach(self):
+    #     if not self._banana_visible(max_age=3.0):
+    #         self.get_logger().info('Lost banana — holding position, waiting.')
+    #         self._hold()
+    #         self.state = TaskState.WAIT
+    #         return
+
+    #     cx, cy, bw, bh = self.banana_bbox
+    #     img_w = getattr(self, '_color_shape', (480, 640))[1]
+
+    #     # Fraction of image: 0=left, 1=right
+    #     frac = cx / img_w
+    #     offset = frac - 0.5  # negative=left, positive=right
+
+    #     # Check depth
+    #     depth_m = self._get_banana_depth_m()
+    #     if depth_m is not None:
+    #         self.approach_depth_m = depth_m
+
+    #     # Auto-tilt camera to keep banana in view
+    #     img_h = getattr(self, '_color_shape', (480, 640))[0]
+    #     y_frac = cy / img_h
+    #     if y_frac > 0.80:
+    #         self._set_pan_tilt(self.camera_pan,
+    #                            min(self.camera_tilt + 0.06, 1.0))
+    #     elif y_frac < 0.30:
+    #         self._set_pan_tilt(self.camera_pan,
+    #                            max(self.camera_tilt - 0.06, -0.5))
+
+    #     # Are we close enough?
+    #     if depth_m is not None and depth_m < self.STOP_DEPTH_M:
+    #         self.get_logger().info(
+    #             f'Close enough (depth={depth_m:.2f}m). Starting grasp.')
+    #         self._hold()
+    #         self.state = TaskState.GRASP
+    #         self._run_grasp()
+    #         return
+
+    #     # Steer: turn to center, then step forward
+    #     if abs(offset) > self.CENTER_TOLERANCE:
+    #         # Turn toward banana — negative offset means turn left (positive theta)
+    #         turn = -offset * 0.5  # proportional control
+    #         turn = np.clip(turn, -self.TURN_STEP_RAD, self.TURN_STEP_RAD)
+    #         self._send_base(self.current_x, self.current_y,
+    #                         self.current_theta + turn)
+    #     else:
+    #         # Drive forward in current heading
+    #         step = self.FORWARD_STEP_M
+    #         if depth_m is not None and depth_m < 0.5:
+    #             step = self.FORWARD_STEP_M * 0.5  # slow down when close
+    #         dx = step * np.cos(self.current_theta)
+    #         dy = step * np.sin(self.current_theta)
+    #         self._send_base(self.current_x + dx, self.current_y + dy,
+    #                         self.current_theta)
 
     # ------------------------------------------------------------------
     # GRASP: blocking pipeline
