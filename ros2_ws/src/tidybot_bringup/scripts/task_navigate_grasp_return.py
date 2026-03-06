@@ -250,7 +250,7 @@ class NavigateGraspReturnNode(NavigationTaskNode):
     def is_obstacle_blocking(self) -> bool:
         return False
 
-    def handle_seek_target(self, current_time):
+    def _seek_banana(self, current_time):
         """Skip search_scan spin — hold still until YOLO sees banana, then approach."""
         if self.red_target_reached_logged:
             self.publish_hold_position()
@@ -523,8 +523,8 @@ class NavigateGraspReturnNode(NavigationTaskNode):
             self.publish_hold_position()
             return
 
-        # Phase 1: normal seek behavior
-        super().handle_seek_target(current_time)
+        # Phase 1: wait for YOLO, then drive straight to banana (no spin)
+        self._seek_banana(current_time)
 
         # Check if target was just reached
         if (
