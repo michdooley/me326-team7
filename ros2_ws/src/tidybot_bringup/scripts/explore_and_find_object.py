@@ -923,7 +923,7 @@ class ExploreAndFind(Node):
 
         # Tilt camera down so it can see the ground/objects ahead
         pt_msg = Float64MultiArray()
-        pt_msg.data = [0.0, 0.1]  # [pan, tilt] — tilt down ~17 deg
+        pt_msg.data = [0.0, 0.2]  # [pan, tilt] — tilt down ~17 deg
         self.pan_tilt_pub.publish(pt_msg)
 
         self.get_logger().info('=' * 55)
@@ -1797,7 +1797,7 @@ class ExploreAndFind(Node):
 
         # 2. Tilt camera down to see the object on the table
         pt_msg = Float64MultiArray()
-        pt_msg.data = [0.0, 0.5]  # pan=0, tilt down ~28 deg
+        pt_msg.data = [0.0, 0.2]  # pan=0, tilt down ~28 deg
         self.pan_tilt_pub.publish(pt_msg)
         self._grasp_spin_for(1.5)  # wait for camera to settle + new depth
 
