@@ -205,8 +205,10 @@ class ExploreAndFind(Node):
     # ── Object detection ──────────────────────────────────────────────────────
     MIN_DETECTION_AREA = 50    # px² — minimum color blob area
     APPROACH_DIST      = 0.35  # m — stop before reaching the object
+    APPROACH_RECENTER_THRESH = 60  # px — re-center if banana drifts off-center during approach
+    APPROACH_LOST_PATIENCE   = 3.0  # s — no YOLO detection triggers re-center
     DETECT_WINDOW      = 2.0   # s — time window for detection confirmation
-    DETECT_COUNT_REQ   = 1     # frames within window to confirm
+    DETECT_COUNT_REQ   = 2     # frames within window to confirm
 
     # ── Grasp parameters ─────────────────────────────────────────────────────
     GRASP_ARM_NAME               = 'right'
@@ -1754,6 +1756,15 @@ class ExploreAndFind(Node):
         bx, by, btheta = pose
         actual_heading = btheta - np.pi / 2
 
+        # ── Capture YOLO pixel offset before refine consumes it ──────
+        det = self.latest_yolo_detection
+        approach_pixel_offset = None
+        if det is not None and self.latest_depth is not None:
+            u_det = int(det.bbox.center.position.x)
+            img_w = self.latest_depth.shape[1]
+            approach_pixel_offset = u_det - img_w / 2.0
+            self._last_approach_see_time = now
+
         # ── Refine object position while approaching ──────────────
         # Re-detect the object to update position estimate as we get closer
         # (depth accuracy improves at shorter range).
@@ -1790,6 +1801,57 @@ class ExploreAndFind(Node):
                 f'dist={dist_to_obj:.2f}m')
             self.state = ExploreState.COMPLETE
             return
+
+        # ── Visual servo: keep banana centered during approach ──────
+        # If we can see the banana but it's off-center, stop forward
+        # motion and rotate to re-center before continuing. This prevents
+        # drifting toward a stale position estimate (camera/YOLO lag).
+        if approach_pixel_offset is not None:
+            if abs(approach_pixel_offset) > self.APPROACH_RECENTER_THRESH:
+                self._approach_recentering = True
+                cmd = Twist()
+                img_w = self.latest_depth.shape[1]
+                frac = min(abs(approach_pixel_offset) / (img_w / 2.0), 1.0)
+                speed = self.CENTER_ANGULAR_VEL * (0.4 + 0.6 * frac)
+                cmd.angular.z = -speed if approach_pixel_offset > 0 else speed
+                cmd.linear.x = 0.0
+                self.last_cmd_angular = cmd.angular.z
+                self.cmd_vel_pub.publish(cmd)
+                if not hasattr(self, '_approach_servo_log') or now - self._approach_servo_log > 1.0:
+                    self._approach_servo_log = now
+                    self.get_logger().info(
+                        f'[APPROACH] Visual re-centering: offset={approach_pixel_offset:.0f}px, '
+                        f'dist={dist_to_obj:.2f}m')
+                return
+            elif getattr(self, '_approach_recentering', False):
+                # Just finished re-centering — re-plan with fresh position
+                self._approach_recentering = False
+                goal_gx, goal_gy = self.world_to_grid(ox, oy)
+                robot_gx, robot_gy = self.world_to_grid(bx, by)
+                for cl in [None, self.ROBOT_CLEARANCE * 0.5]:
+                    path = self._plan_path(
+                        robot_gx, robot_gy, goal_gx, goal_gy,
+                        clearance_m=cl)
+                    if path is not None:
+                        self.nav_waypoints = path
+                        self.nav_waypoint_idx = 0
+                        self.nav_clearance = cl
+                        self.publish_nav_path()
+                        self.get_logger().info(
+                            f'[APPROACH] Re-planned after re-center: '
+                            f'{len(path)} waypoints to ({ox:.2f}, {oy:.2f})')
+                        break
+        else:
+            # No YOLO detection this tick
+            last_see = getattr(self, '_last_approach_see_time', self.nav_start_time)
+            if (now - last_see > self.APPROACH_LOST_PATIENCE
+                    and dist_to_obj > self.APPROACH_DIST * 3):
+                self._stop_base()
+                self.get_logger().warn(
+                    f'[APPROACH] Lost visual on object for '
+                    f'{now - last_see:.1f}s — re-centering.')
+                self._start_centering()
+                return
 
         # Re-plan if path blocked — rate-limited to avoid thrashing
         if (self._is_path_blocked() and
