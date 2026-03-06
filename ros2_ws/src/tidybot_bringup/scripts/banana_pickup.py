@@ -5,7 +5,7 @@ Banana pickup: find a banana, drive to it, pick it up, return home.
 Self-contained ROS2 node. No obstacle avoidance — assumes clear path.
 
 State machine:
-    SEARCH   -> spin in place scanning for banana via YOLO
+    WAIT     -> hold position until YOLO detects banana (no spinning)
     APPROACH -> drive toward banana, centering it and closing distance
     GRASP    -> stop, tilt camera, detect, depth->3D, IK pick
     RETURN   -> drive back to start pose
@@ -57,7 +57,7 @@ SLEEP_POSE = [0.0, -1.80, 1.55, 0.0, 0.8, 0.0]
 
 
 class TaskState(Enum):
-    SEARCH = 0
+    WAIT = 0
     APPROACH = 1
     GRASP = 2
     RETURN = 3
@@ -88,7 +88,6 @@ class BananaPickupNode(Node):
     TURN_STEP_RAD = 0.08         # how much to yaw per cycle to center banana
     FORWARD_STEP_M = 0.10        # how far to step forward per cycle
     CENTER_TOLERANCE = 0.12      # fraction of image width: banana is "centered"
-    SCAN_STEP_RAD = 0.15         # rotation per scan tick
 
     # --- Grasp tuning ---
     GRASP_CAMERA_TILT_RAD = 0.65
@@ -116,7 +115,7 @@ class BananaPickupNode(Node):
         self.grasp_move_duration = float(self.declare_parameter(
             'grasp_duration', 2.0 if self.is_sim else 3.0).value)
 
-        self.state = TaskState.SEARCH
+        self.state = TaskState.WAIT
 
         # --- Odometry ---
         self.odom_received = False
@@ -316,8 +315,8 @@ class BananaPickupNode(Node):
         if not self.odom_received:
             return
 
-        if self.state == TaskState.SEARCH:
-            self._do_search()
+        if self.state == TaskState.WAIT:
+            self._do_wait()
         elif self.state == TaskState.APPROACH:
             self._do_approach()
         elif self.state == TaskState.GRASP:
@@ -328,26 +327,26 @@ class BananaPickupNode(Node):
             self._hold()
 
     # ------------------------------------------------------------------
-    # SEARCH: spin slowly, looking for banana
+    # WAIT: hold position until YOLO sees the banana (no spinning)
     # ------------------------------------------------------------------
-    def _do_search(self):
+    def _do_wait(self):
         if self._banana_visible():
             self.get_logger().info(
-                f'Banana spotted (conf={self.banana_conf:.2f})! Approaching.')
+                f'Banana detected (conf={self.banana_conf:.2f})! Approaching.')
             self.state = TaskState.APPROACH
             return
 
-        # Rotate in place
-        new_theta = self.current_theta + self.SCAN_STEP_RAD
-        self._send_base(self.current_x, self.current_y, new_theta)
+        # Hold still — banana should be right in front
+        self._hold()
 
     # ------------------------------------------------------------------
     # APPROACH: center banana in frame, drive forward until close
     # ------------------------------------------------------------------
     def _do_approach(self):
         if not self._banana_visible(max_age=3.0):
-            self.get_logger().info('Lost banana — returning to search.')
-            self.state = TaskState.SEARCH
+            self.get_logger().info('Lost banana — holding position, waiting.')
+            self._hold()
+            self.state = TaskState.WAIT
             return
 
         cx, cy, bw, bh = self.banana_bbox
