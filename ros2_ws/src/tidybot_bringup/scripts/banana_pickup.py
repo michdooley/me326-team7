@@ -85,7 +85,9 @@ def wrap_angle(a):
 class BananaPickupNode(Node):
 
     # --- Approach tuning ---
-    STOP_DEPTH_M = 0.20          # stop when banana is this close (depth meters)
+    STOP_DEPTH_M = 0.30          # stop when banana is this close (depth meters)
+    SLOW_DOWN_DIST = 0.60        # Start decelerating at 60cm
+    MIN_APPROACH_STEP = 0.02     # Minimum step size when approaching
     TURN_STEP_RAD = 0.08         # how much to yaw per cycle to center banana
     FORWARD_STEP_M = 0.10        # how far to step forward per cycle
     CENTER_TOLERANCE = 0.12      # fraction of image width: banana is "centered"
@@ -400,22 +402,35 @@ class BananaPickupNode(Node):
     def _do_approach(self):
         depth_m = self._get_banana_depth_m()
         
-        if depth_m is not None and depth_m < self.STOP_DEPTH_M:
-            self.get_logger().info('Target reached. Grasping.')
+        # If we can't see the depth, we rely on the last known approach_depth_m
+        current_depth = depth_m if depth_m is not None else self.approach_depth_m
+
+        if current_depth is not None:
+            # 1. Check if we hit the 0.3m Buffer
+            if current_depth <= self.STOP_DEPTH_M:
+                self.get_logger().info(f'Buffer reached ({current_depth:.2f}m). Stopping for Arm.')
+                self._hold()
+                self.state = TaskState.GRASP
+                self._run_grasp()
+                return
+
+            # 2. Calculate Variable Forward Step (Smooth Deceleration)
+            if current_depth < self.SLOW_DOWN_DIST:
+                # Linearly scale speed between SLOW_DOWN_DIST and STOP_DEPTH_M
+                ratio = (current_depth - self.STOP_DEPTH_M) / (self.SLOW_DOWN_DIST - self.STOP_DEPTH_M)
+                step = self.FORWARD_STEP_M * max(ratio, 0.2) # Don't go below 20% speed
+            else:
+                step = self.FORWARD_STEP_M
+        else:
+            # If totally lost, just hold and wait
             self._hold()
-            self.state = TaskState.GRASP
-            self._run_grasp()
             return
 
-        # Drive straight toward the locked yaw
-        step = self.FORWARD_STEP_M
-        if depth_m is not None and depth_m < 0.5:
-            step *= 0.5
-            
+        # 3. Execute the step
         dx = step * np.cos(self.current_theta)
         dy = step * np.sin(self.current_theta)
         
-        # Use target_yaw_lock to keep the heading stable
+        # Keep facing the target yaw while moving
         self._send_base(self.current_x + dx, self.current_y + dy, self.target_yaw_lock)
     # def _do_approach(self):
     #     if not self._banana_visible(max_age=3.0):
