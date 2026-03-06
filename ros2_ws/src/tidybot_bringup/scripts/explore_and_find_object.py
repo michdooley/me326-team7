@@ -175,7 +175,7 @@ class ExploreAndFind(Node):
     MAP_PUBLISH_RATE = 1.0   # Hz
 
     # ── 360 scan ─────────────────────────────────────────────────────────────
-    SCAN_ANGULAR_VEL = 0.3   # rad/s
+    SCAN_ANGULAR_VEL = 0.6   # rad/s
     SCAN_SETTLE_TIME = 0.5   # s
 
     # ── Frontier selection ────────────────────────────────────────────────────
@@ -923,7 +923,7 @@ class ExploreAndFind(Node):
 
         # Tilt camera down so it can see the ground/objects ahead
         pt_msg = Float64MultiArray()
-        pt_msg.data = [0.0, 0.2]  # [pan, tilt] — tilt down ~17 deg
+        pt_msg.data = [0.0, 0.1]  # [pan, tilt] TODO 0.2 for real
         self.pan_tilt_pub.publish(pt_msg)
 
         self.get_logger().info('=' * 55)
@@ -1561,11 +1561,11 @@ class ExploreAndFind(Node):
                     f'({now - self.depth_steer_start:.1f}s/'
                     f'{self.DEPTH_STEER_TIMEOUT:.1f}s)')
             if left_dist > right_dist:
-                cmd.angular.z = 1.0
+                cmd.angular.z = 0.5
             elif right_dist > left_dist:
-                cmd.angular.z = -1.0
+                cmd.angular.z = -0.5
             else:
-                cmd.angular.z = 1.0
+                cmd.angular.z = 0.5
             cmd.linear.x = 0.0
         else:
             self.depth_steer_start = None
@@ -1574,7 +1574,7 @@ class ExploreAndFind(Node):
             if min_dist < 1.5:
                 speed *= min(min_dist / 1.5, 1.0)
             cmd.linear.x = float(min(speed, dist * 0.5))
-            cmd.angular.z = float(np.clip(2.0 * heading_error, -1.2, 1.2))
+            cmd.angular.z = float(np.clip(1.0 * heading_error, -0.5, 0.5))
 
         if min_dist < 0.35:
             cmd.linear.x = 0.0
@@ -1736,7 +1736,7 @@ class ExploreAndFind(Node):
         if min_dist < 1.5:
             speed *= min(min_dist / 1.5, 1.0)
         cmd.linear.x = float(min(speed, dist * 0.5))
-        cmd.angular.z = float(np.clip(2.0 * heading_error, -1.2, 1.2))
+        cmd.angular.z = float(np.clip(1.0 * heading_error, -0.5, 0.5))
 
         if min_dist < 0.35:
             cmd.linear.x = 0.0
@@ -1795,10 +1795,10 @@ class ExploreAndFind(Node):
             self._start_next_command()
             return
 
-        # 2. Tilt camera down to see the object on the table
+        # 2. Tilt camera down to see the object on the floor
         pt_msg = Float64MultiArray()
-        pt_msg.data = [0.0, 0.2]  # pan=0, tilt down ~28 deg
-        self.pan_tilt_pub.publish(pt_msg)
+        pt_msg.data = [0.0, 0.4]  # pan=0, tilt (some tilt down is [0.0, 0.2])
+        self.pan_tilt_pub.publish(pt_msg) 
         self._grasp_spin_for(1.5)  # wait for camera to settle + new depth
 
         # 3. Get fresh YOLO detection
