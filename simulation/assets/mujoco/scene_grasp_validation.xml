@@ -24,7 +24,7 @@
     <!-- Banana: initial pos doesn't matter much — weld constraint holds it to gripper -->
     <body name="banana" pos="0.3 0 0.5">
       <freejoint name="banana_joint"/>
-      <geom name="banana_geom" type="mesh" mesh="banana_mesh" mass="0.12"
+      <geom name="banana_geom" type="mesh" mesh="banana_mesh" mass="0.012"
         material="banana_mat" friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
     </body>
   </worldbody>
