@@ -108,7 +108,7 @@ class ExploreAndFind(Node):
     MAX_DEPTH_M       = 5.00
 
     # ── 360 scan ─────────────────────────────────────────────────────────────
-    SCAN_ANGULAR_VEL = 0.3   # rad/s
+    SCAN_ANGULAR_VEL = -0.3   # rad/s
     SCAN_SETTLE_TIME = 0.5   # s
     MAX_SCAN_ATTEMPTS = 3
 
@@ -551,13 +551,17 @@ class ExploreAndFind(Node):
         self.cmd_vel_pub.publish(Twist())
 
     def _state_scanning(self):
+        # Early exit: object spotted mid-scan — stop and center immediately
+        if self.object_world_pos is not None:
+            self._stop_base()
+            self.get_logger().info(
+                '[SCAN] Object spotted mid-scan — centering on it.')
+            self._start_centering()
+            return
+
         if self.scan_settle_start is not None:
             if time.time() - self.scan_settle_start >= self.SCAN_SETTLE_TIME:
-                if self.object_world_pos is not None:
-                    self.get_logger().info(
-                        '[SCAN] Settled — object detected, centering on it.')
-                    self._start_centering()
-                elif self.scan_attempt_count >= self.MAX_SCAN_ATTEMPTS:
+                if self.scan_attempt_count >= self.MAX_SCAN_ATTEMPTS:
                     self.get_logger().warn(
                         f'[SCAN] No object found after '
                         f'{self.MAX_SCAN_ATTEMPTS} scans — giving up.')
@@ -638,12 +642,11 @@ class ExploreAndFind(Node):
                     self.object_world_pos = new_pos
                     self.last_detection_pos = new_pos
 
-            # Adjust camera tilt to center vertically
+            # Adjust camera tilt to center vertically (proportional)
             if abs(offset_y) > self.CENTER_PIXEL_THRESH_V:
-                if offset_y > 0:
-                    self._set_camera_tilt(self.current_tilt + self.CENTER_TILT_STEP)
-                else:
-                    self._set_camera_tilt(self.current_tilt - self.CENTER_TILT_STEP)
+                # Small proportional step: ~0.01 rad per 60px offset
+                tilt_adj = offset_y / (img_h / 2.0) * self.CENTER_TILT_STEP
+                self._set_camera_tilt(self.current_tilt + tilt_adj)
 
             h_centered = abs(offset_x) < self.CENTER_PIXEL_THRESH
             v_centered = abs(offset_y) < self.CENTER_PIXEL_THRESH_V
@@ -748,15 +751,11 @@ class ExploreAndFind(Node):
                 cmd.angular.z = float(np.clip(
                     angular, -self.APPROACH_MAX_ANGULAR, self.APPROACH_MAX_ANGULAR))
 
-                # Adjust tilt to keep object vertically centered
+                # Adjust tilt to keep object vertically centered (proportional)
                 offset_y = v - img_center_y
                 if abs(offset_y) > self.CENTER_PIXEL_THRESH_V:
-                    if offset_y > 0:
-                        self._set_camera_tilt(
-                            self.current_tilt + self.APPROACH_TILT_STEP)
-                    else:
-                        self._set_camera_tilt(
-                            self.current_tilt - self.APPROACH_TILT_STEP)
+                    tilt_adj = offset_y / (img_h / 2.0) * self.APPROACH_TILT_STEP
+                    self._set_camera_tilt(self.current_tilt + tilt_adj)
 
             # Refine world position
             new_pos = self._estimate_object_position(u, v)
@@ -841,6 +840,8 @@ class ExploreAndFind(Node):
 
     # ── Grasping ─────────────────────────────────────────────────────────────
 
+    GRASP_MAX_ATTEMPTS = 3
+
     def _state_grasping(self):
         self.get_logger().info('=' * 55)
         self.get_logger().info('[GRASP] Starting grasp pipeline...')
@@ -852,6 +853,36 @@ class ExploreAndFind(Node):
             self._start_next_command()
             return
 
+        for attempt in range(1, self.GRASP_MAX_ATTEMPTS + 1):
+            self.get_logger().info(
+                f'[GRASP] === Attempt {attempt}/{self.GRASP_MAX_ATTEMPTS} ===')
+
+            # On retry attempts, nudge the robot slightly
+            if attempt > 1:
+                self._grasp_go_home()
+                self.get_logger().info(
+                    '[GRASP] Nudging robot forward + right for retry...')
+                cmd = Twist()
+                cmd.linear.x = 0.05
+                cmd.angular.z = -0.1
+                end = time.time() + 0.5
+                while time.time() < end and rclpy.ok():
+                    self.cmd_vel_pub.publish(cmd)
+                    rclpy.spin_once(self, timeout_sec=0.05)
+                self._stop_base()
+                self._grasp_spin_for(0.5)
+
+            if self._grasp_attempt():
+                return  # success
+
+        self.get_logger().error(
+            f'[GRASP] All {self.GRASP_MAX_ATTEMPTS} attempts failed')
+        self._grasp_go_home()
+        self._start_next_command()
+
+    def _grasp_attempt(self):
+        """Single grasp attempt. Returns True on success, False on failure."""
+        # Sweep tilt to find the object
         det = None
         tilt_angles = [i * 0.1 for i in range(0, 10)]
         for tilt in tilt_angles:
@@ -874,10 +905,47 @@ class ExploreAndFind(Node):
 
         if det is None:
             self.get_logger().error(
-                '[GRASP] No YOLO detection at any tilt — cannot grasp')
-            self._grasp_go_home()
-            self._start_next_command()
-            return
+                '[GRASP] No YOLO detection at any tilt')
+            return False
+
+        # Center the object in the camera frame by adjusting tilt
+        self.get_logger().info('[GRASP] Centering object in frame...')
+        center_deadline = time.time() + 5.0
+        while time.time() < center_deadline:
+            self._grasp_spin_for(0.2)
+            det = self.latest_yolo_detection
+            if det is None:
+                continue
+            self.latest_yolo_detection = None
+
+            v = int(det.bbox.center.position.y)
+            if self.latest_depth is None:
+                continue
+            img_h = self.latest_depth.shape[0]
+            img_center_y = img_h / 2.0
+            offset_y = v - img_center_y
+
+            if abs(offset_y) < self.CENTER_PIXEL_THRESH_V:
+                self.get_logger().info(
+                    f'[GRASP] Object centered vertically '
+                    f'(offset={offset_y:.0f}px, tilt={self.current_tilt:.2f})')
+                break
+
+            tilt_adj = offset_y / (img_h / 2.0) * self.CENTER_TILT_STEP
+            self._set_camera_tilt(self.current_tilt + tilt_adj)
+
+        # Get a fresh detection after centering
+        self.latest_yolo_detection = None
+        self._grasp_spin_for(0.5)
+        for _ in range(10):
+            self._grasp_spin_for(0.2)
+            if self.latest_yolo_detection is not None:
+                break
+        det = self.latest_yolo_detection
+        if det is None:
+            self.get_logger().error(
+                '[GRASP] Lost object after centering')
+            return False
 
         self.latest_yolo_detection = None
 
@@ -893,18 +961,14 @@ class ExploreAndFind(Node):
             cx, cy, bbox_w, bbox_h)
         if depth_roi is None:
             self.get_logger().error('[GRASP] Failed to crop depth image')
-            self._grasp_go_home()
-            self._start_next_command()
-            return
+            return False
 
         pts_base = self._grasp_depth_to_points(depth_roi, u_off, v_off)
         if pts_base is None:
             self.get_logger().error(
                 f'[GRASP] Insufficient points in depth ROI '
                 f'(need >= {self.GRASP_MIN_POINTS})')
-            self._grasp_go_home()
-            self._start_next_command()
-            return
+            return False
 
         self.get_logger().info(
             f'[GRASP] Point cloud: {len(pts_base)} points')
@@ -918,9 +982,7 @@ class ExploreAndFind(Node):
         result = self._grasp_compute_poses(analysis)
         if result is None:
             self.get_logger().error('[GRASP] Pose computation failed')
-            self._grasp_go_home()
-            self._start_next_command()
-            return
+            return False
         grasp_pose, pre_grasp_pose, info = result
         self.get_logger().info(f'[GRASP] Params: {info}')
 
@@ -938,9 +1000,7 @@ class ExploreAndFind(Node):
             else:
                 self.get_logger().error(
                     f'[GRASP] Position-only IK also failed: {msg}')
-                self._grasp_go_home()
-                self._start_next_command()
-                return
+                return False
 
         self.get_logger().info('[GRASP] Opening gripper')
         self._grasp_set_gripper(0.0)
@@ -949,9 +1009,7 @@ class ExploreAndFind(Node):
         if not self._grasp_plan_and_execute(
                 pre_grasp_pose, 'pre-grasp', use_orientation):
             self.get_logger().error('[GRASP] Pre-grasp failed')
-            self._grasp_go_home()
-            self._start_next_command()
-            return
+            return False
 
         self._grasp_spin_for(self.GRASP_SETTLE_TIME)
 
@@ -959,9 +1017,7 @@ class ExploreAndFind(Node):
         if not self._grasp_plan_and_execute(
                 grasp_pose, 'grasp', use_orientation):
             self.get_logger().error('[GRASP] Descent failed')
-            self._grasp_go_home()
-            self._start_next_command()
-            return
+            return False
 
         self._grasp_spin_for(self.GRASP_SETTLE_TIME)
 
@@ -989,6 +1045,7 @@ class ExploreAndFind(Node):
         self._grasp_go_home()
 
         self._start_next_command()
+        return True
 
     # ── Grasp helper methods ─────────────────────────────────────────────────
 
