@@ -1,36 +1,14 @@
 #!/usr/bin/env python3
 """
-TidyBot2 Explore & Find Object
+TidyBot2 Find & Grasp Object (Simplified — no mapping/obstacles)
 
-Combines frontier exploration with color-based object detection.
-The robot explores unknown space using frontier-based exploration until
-it detects the target colored cube (red, yellow, or blue), then navigates
-to it.
-
-State machine:
-  1. SCANNING    — 360 rotation scan, mapping depth into occupancy grid.
-  1b. CENTERING  — rotate in place to center detected object in camera.
-  2. SELECTING   — pick best frontier (or approach known object).
-  3. NAVIGATING  — follow A* waypoints to frontier, checking for target.
-  4. APPROACHING — navigate to detected object's world position.
-  5. COMPLETE    — object found and reached.
-  6. GRASPING    — if action is "get", run top-down grasp pipeline.
-
-Object detection uses HSV color filtering on the RGB camera feed.
-When the target color blob is detected in multiple consecutive frames,
-its world position is estimated via depth back-projection and the robot
-navigates to it.
-
-Publishes:
-  /map               nav_msgs/OccupancyGrid
-  /frontier_markers  visualization_msgs/MarkerArray
-  /object_marker     visualization_msgs/MarkerArray
-  /cmd_vel           geometry_msgs/Twist
-
-Subscribes:
-  /camera/depth/image_raw    — depth frames (16UC1, mm)
-  /camera/depth/camera_info  — depth camera intrinsics
-  /camera/color/image_raw    — RGB frames for object detection
+Simplified pipeline for unobstructed environments:
+  1. WAITING_FOR_COMMAND — wait for voice or hardcoded command
+  2. SCANNING            — 360 rotation scan, check YOLO each frame
+  3. CENTERING           — rotate base + tilt camera to center object
+  4. APPROACHING         — drive straight toward object with visual servoing
+  5. COMPLETE            — object reached
+  6. GRASPING            — top-down grasp pipeline
 
 Build
 cd ros2_ws && colcon build --packages-select tidybot_perception tidybot_bringup && source install/setup.bash
@@ -57,21 +35,17 @@ To manually publish a voice command instead of using the mic (terminal 3):
     ros2 topic pub --once /target_object std_msgs/msg/String "data: 'banana'"
 """
 
-import heapq
 import time
 from collections import deque
 from enum import Enum
 
-import cv2
 import numpy as np
-from scipy.ndimage import binary_dilation, label as ndimage_label
 import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
-from geometry_msgs.msg import Point, Pose, Quaternion, Twist
-from nav_msgs.msg import MapMetaData, OccupancyGrid
+from geometry_msgs.msg import Pose, Quaternion, Twist
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import ColorRGBA, Float64MultiArray, String
 from visualization_msgs.msg import Marker, MarkerArray
@@ -98,24 +72,10 @@ class ExploreState(Enum):
     WAITING_FOR_COMMAND = -1
     SCANNING    = 0
     CENTERING   = 6
-    SELECTING   = 1
-    NAVIGATING  = 2
     APPROACHING = 3
     COMPLETE    = 4
     GRASPING    = 5
 
-
-# HSV color ranges for cube detection (OpenCV HSV: H=[0,180], S/V=[0,255])
-# Ranges are intentionally wide to handle MuJoCo lighting variation
-# (headlight diffuse + ambient + directional light).
-# COLOR_RANGES = {
-#     'red':    [((0,   80,  50),  (10,  255, 255)),
-#                ((165, 80,  50),  (180, 255, 255))],
-#     'blue':   [((95,  50,  40),  (135, 255, 255))],
-#     'yellow': [((20,  60,  60),  (45,  255, 255))],
-#     'green':  [((35,  40,  40),  (90,  255, 255))],
-#     'orange': [((8,   100, 80),  (20,  255, 255))],
-# }
 
 # YOLO class name -> ID mapping (COCO dataset)
 YOLO_CLASS_MAP = {
@@ -143,99 +103,55 @@ YOLO_CLASS_MAP = {
 
 class ExploreAndFind(Node):
 
-    # ── Grid ─────────────────────────────────────────────────────────────────
-    GRID_RESOLUTION = 0.05   # m / cell
-    GRID_SIZE       = 300    # cells per axis  →  15 m × 15 m world
-    GRID_ORIGIN_X   = -7.5   # world X of grid column 0  (m)
-    GRID_ORIGIN_Y   = -7.5   # world Y of grid row    0  (m)
-
     # ── Depth filtering ───────────────────────────────────────────────────────
-    MIN_DEPTH_M       = 0.40   # ignore returns closer than this (robot body)
-    MAX_DEPTH_M       = 5.00   # ignore returns farther  than this
-    DEPTH_SUBSAMPLE   = 8      # process every Nth pixel (speed vs. quality)
-    DEPTH_H_CROP      = 0.20   # fraction of image width to crop from each side
-    ROBOT_BODY_RADIUS = 0.60   # m — XY radius around camera to exclude self-hits
-    FREE_TRACE_MAX_M  = 3.00   # m — max free-ray length for floor/ceiling returns
-
-    # ── Height filter ─────────────────────────────────────────────────────────
-    MIN_OBSTACLE_Z = 0.10    # m — clears floor returns (z ≈ 0)
-    MAX_OBSTACLE_Z = 0.80    # m — ignores camera mount / ceilings
-
-    # ── Log-odds belief (Thrun, Burgard & Fox, Ch. 9) ────────────────────────
-    LOG_ODDS_HIT         =  0.85
-    LOG_ODDS_MISS        = -0.40
-    LOG_ODDS_MIN         = -10.0
-    LOG_ODDS_MAX         =  10.0
-    LOG_ODDS_FREE_THRESH = -0.50
-    LOG_ODDS_OCC_THRESH  =  1.50
-
-    # ── Angular-diversity obstacle confirmation ───────────────────────────────
-    MIN_HIT_ANGLE_SEP = np.radians(20)
-    MIN_HIT_COUNT     = 2
-
-    # ── Map publishing ────────────────────────────────────────────────────────
-    MAP_PUBLISH_RATE = 1.0   # Hz
+    MIN_DEPTH_M       = 0.40
+    MAX_DEPTH_M       = 5.00
 
     # ── 360 scan ─────────────────────────────────────────────────────────────
     SCAN_ANGULAR_VEL = 0.3   # rad/s
     SCAN_SETTLE_TIME = 0.5   # s
+    MAX_SCAN_ATTEMPTS = 3
 
-    # ── Frontier selection ────────────────────────────────────────────────────
-    MIN_FRONTIER_SIZE   = 8
-    MIN_FRONTIER_DIST   = 1.0   # m
-    ROBOT_CLEARANCE     = 0.35  # m
-
-    # ── Navigation ────────────────────────────────────────────────────────────
-    NAV_TIMEOUT        = 120.0  # s per waypoint
-    NO_FRONTIER_LIMIT  = 3
-    WAYPOINT_SPACING   = 20
-    WAYPOINT_TOLERANCE = 0.3    # m
-    NAV_LINEAR_SPEED   = 0.1   # m/s
-    OBSTACLE_THRESHOLD = 0.8    # m
-    DEPTH_STEER_TIMEOUT = 3.0  # s — force re-plan after steering this long
-
-    # ── Depth integration angular gating ──────────────────────────────────────
-    MAX_MAPPING_ANGULAR_VEL = 0.06  # rad/s (only applied during nav, not scanning)
-
-    # ── Centering after scan ─────────────────────────────────────────────────
+    # ── Centering ───────────────────────────────────────────────────────────
     CENTER_PIXEL_THRESH = 40    # px — how close to image center is "centered"
-    CENTER_ANGULAR_VEL  = 0.25  # rad/s — rotation speed during centering
-    CENTER_TIMEOUT      = 15.0  # s — give up centering if no detection
+    CENTER_PIXEL_THRESH_V = 60  # px — vertical threshold (more lenient)
+    CENTER_ANGULAR_VEL  = 0.25  # rad/s
+    CENTER_TILT_STEP    = 0.05  # rad — camera tilt adjustment per tick
+    CENTER_TIMEOUT      = 15.0  # s
 
     # ── Object detection ──────────────────────────────────────────────────────
-    MIN_DETECTION_AREA = 50    # px² — minimum color blob area
+    MIN_DETECTION_AREA = 50    # px²
     APPROACH_DIST      = 0.35  # m — stop before reaching the object
-    DETECT_WINDOW      = 2.0   # s — time window for detection confirmation
-    DETECT_COUNT_REQ   = 1     # frames within window to confirm
+    DETECT_WINDOW      = 2.0   # s
+    DETECT_COUNT_REQ   = 1
+
+    # ── Approach ─────────────────────────────────────────────────────────────
+    APPROACH_LINEAR_SPEED = 0.05  # m/s — very slow
+    APPROACH_ANGULAR_GAIN = 0.003 # rad/s per pixel offset
+    APPROACH_MAX_ANGULAR  = 0.3   # rad/s
+    APPROACH_TIMEOUT      = 60.0  # s
+    APPROACH_TILT_STEP    = 0.03  # rad — tilt adjustment during approach
 
     # ── Grasp parameters ─────────────────────────────────────────────────────
     GRASP_ARM_NAME               = 'right'
-    GRASP_MOVE_DURATION          = 2.0     # s for IK moves
-    GRASP_PRE_HEIGHT             = 0.10    # m above grasp for pre-grasp
-    GRASP_LIFT_HEIGHT            = 0.15    # m to lift after grasping
-    GRASP_Z_OFFSET               = -0.02   # m below z_top for grasp contact
-    GRASP_BBOX_PAD               = 1.3     # bbox padding factor
-    GRASP_SETTLE_TIME            = 1.0     # s to wait at positions
+    GRASP_MOVE_DURATION          = 2.0
+    GRASP_PRE_HEIGHT             = 0.10
+    GRASP_LIFT_HEIGHT            = 0.15
+    GRASP_Z_OFFSET               = -0.02
+    GRASP_BBOX_PAD               = 1.3
+    GRASP_SETTLE_TIME            = 1.0
     GRASP_GRIPPER_CLOSE_REPEATS  = 20
-    GRASP_GRIPPER_CLOSE_WAIT     = 2.0     # s
+    GRASP_GRIPPER_CLOSE_WAIT     = 2.0
     GRASP_MIN_DEPTH_M            = 0.1
     GRASP_MAX_DEPTH_M            = 2.0
     GRASP_MIN_POINTS             = 20
-    GRASP_TABLE_Z_MIN            = 0.005   # m — points below this are floor
-    GRASP_OUTLIER_Z_THRESH       = 0.05    # m — Z outlier filter
+    GRASP_TABLE_Z_MIN            = 0.005
+    GRASP_OUTLIER_Z_THRESH       = 0.05
 
     # ─────────────────────────────────────────────────────────────────────────
 
     def __init__(self):
         super().__init__('explore_and_find')
-
-        # Persistent log-odds grid
-        self.log_odds  = np.zeros(
-            (self.GRID_SIZE, self.GRID_SIZE), dtype=np.float32)
-        self.hit_count = np.zeros(
-            (self.GRID_SIZE, self.GRID_SIZE), dtype=np.uint8)
-        self.hit_angle = np.full(
-            (self.GRID_SIZE, self.GRID_SIZE), np.nan, dtype=np.float32)
 
         # Camera state
         self.latest_depth       = None
@@ -249,25 +165,10 @@ class ExploreAndFind(Node):
         self.scan_accumulated  = 0.0
         self.scan_last_heading = None
         self.scan_settle_start = None
-        self.nav_start_time    = None
-        self.no_frontier_count = 0
-        self.last_map_publish  = 0.0
+        self.scan_attempt_count = 0
 
-        # Waypoint navigation state
-        self.nav_waypoints     = []
-        self.nav_waypoint_idx  = 0
-        self.last_cmd_angular  = 0.0
-        self.last_approach_replan = 0.0
-
-        # Object detection state
-        # self.declare_parameter('target_color', 'red')
-        # self.target_color = (
-        #     self.get_parameter('target_color')
-        #     .get_parameter_value().string_value)
-        # if self.target_color not in COLOR_RANGES:
-        #     self.get_logger().error(
-        #         f'Unknown target_color "{self.target_color}". Using "red".')
-        #     self.target_color = 'red'
+        # Camera tilt tracking
+        self.current_tilt = 0.3  # initial tilt (set in _start_next_command)
 
         # Voice command parameters
         self.declare_parameter('skip_voice', False)
@@ -281,29 +182,29 @@ class ExploreAndFind(Node):
         self.command_queue       = deque()
         self.current_object_name = ''
         self.current_action      = ''
-        self.target_class_id     = -1   # set when a command is received
+        self.target_class_id     = -1
         self._last_voice_action  = 'get'
 
         # Object detection state
-        self.object_world_pos      = None   # (wx, wy) once confirmed
-        self.detection_times       = []     # timestamps of recent detections
-        self.last_detection_pos    = None   # (wx, wy) of most recent detection
-        self.latest_yolo_detection = None   # most recent matching Detection2D
-        self.depth_steer_start     = None   # when depth-steering began (stuck detection)
+        self.object_world_pos      = None
+        self.detection_times       = []
+        self.last_detection_pos    = None
+        self.latest_yolo_detection = None
+
+        # Approach state
+        self.approach_start_time = None
 
         # TF
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # Subscriptions — use RELIABLE to match the MuJoCo bridge publisher QoS
+        # Subscriptions
         sensor_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
         self.create_subscription(Image,      '/camera/depth/image_raw',
                                  self._depth_cb,       sensor_qos)
         self.create_subscription(CameraInfo, '/camera/depth/camera_info',
                                  self._camera_info_cb, sensor_qos)
-        # self.create_subscription(Image,      '/camera/color/image_raw',
-        #                          self._rgb_cb,         be)
-        
+
         yolo_qos = QoSProfile(
             depth=1, reliability=ReliabilityPolicy.RELIABLE)
         self.bbox_sub = self.create_subscription(
@@ -312,8 +213,6 @@ class ExploreAndFind(Node):
             self._yolo_bbox_cb,
             yolo_qos)
 
-        # Voice command subscriptions (latched to match voice_command.py)
-        # Subscribe to action first so it's stored before target triggers queue
         voice_qos = QoSProfile(
             depth=1, reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -331,10 +230,6 @@ class ExploreAndFind(Node):
             self.command_queue.append((act, obj))
 
         # Publishers
-        self.map_pub           = self.create_publisher(
-            OccupancyGrid, '/map', 10)
-        self.frontier_pub      = self.create_publisher(
-            MarkerArray, '/frontier_markers', 10)
         self.object_marker_pub = self.create_publisher(
             MarkerArray, '/object_marker', 10)
         self.cmd_vel_pub       = self.create_publisher(
@@ -349,18 +244,9 @@ class ExploreAndFind(Node):
             ArmCommand, f'/{self.GRASP_ARM_NAME}_arm/cmd', 10)
         self.plan_client = self.create_client(PlanToTarget, '/plan_to_target')
 
-        latch_qos = QoSProfile(
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.inflated_map_pub  = self.create_publisher(
-            OccupancyGrid, '/inflated_map', latch_qos)
-        self.nav_path_pub      = self.create_publisher(
-            MarkerArray, '/nav_path', latch_qos)
-
         self.get_logger().info('=' * 55)
         self.get_logger().info(
-            'Explore & Find  (frontier exploration + voice commands)')
+            'Find & Grasp (simplified — no mapping/obstacles)')
         if self.skip_voice:
             obj = (self.get_parameter('target_object')
                    .get_parameter_value().string_value)
@@ -371,16 +257,6 @@ class ExploreAndFind(Node):
         else:
             self.get_logger().info(
                 f'  Mode   : voice commands via /target_object')
-        self.get_logger().info(
-            f'  Grid   : {self.GRID_SIZE}x{self.GRID_SIZE} '
-            f'@ {self.GRID_RESOLUTION} m/cell '
-            f'({self.GRID_SIZE * self.GRID_RESOLUTION:.0f} m x '
-            f'{self.GRID_SIZE * self.GRID_RESOLUTION:.0f} m)')
-        self.get_logger().info(
-            f'  Height : {self.MIN_OBSTACLE_Z}-{self.MAX_OBSTACLE_Z} m')
-        self.get_logger().info(
-            f'  Scan   : {self.SCAN_ANGULAR_VEL} rad/s '
-            f'(~{2*np.pi/self.SCAN_ANGULAR_VEL:.0f} s per 360)')
         self.get_logger().info('=' * 55)
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
@@ -393,45 +269,9 @@ class ExploreAndFind(Node):
             return
         self.latest_depth       = depth
         self.latest_depth_stamp = msg.header.stamp
-        if hasattr(self, '_dbg_depth_count'):
-            self._dbg_depth_count += 1
-        if self.camera_K is not None:
-            # Always integrate during scanning; gate by angular vel otherwise
-            scanning = (self.state == ExploreState.SCANNING)
-            if scanning or abs(self.last_cmd_angular) <= self.MAX_MAPPING_ANGULAR_VEL:
-                if hasattr(self, '_dbg_integrate_count'):
-                    self._dbg_integrate_count += 1
-                self._integrate_depth()
-
-    # def _rgb_cb(self, msg: Image):
-    #     try:
-    #         self.latest_rgb = self.cv_bridge.imgmsg_to_cv2(msg, 'bgr8')
-    #     except Exception as e:
-    #         self.get_logger().warn(f'RGB conversion failed: {e}')
-    #         return
-    #     if not hasattr(self, '_rgb_logged'):
-    #         self._rgb_logged = True
-    #         h, w = self.latest_rgb.shape[:2]
-    #         self.get_logger().info(
-    #             f'[RGB] First frame: {w}x{h} encoding={msg.encoding}')
 
     def _camera_info_cb(self, msg: CameraInfo):
         self.camera_K = np.array(msg.k).reshape(3, 3)
-
-    # ── Grid helpers ──────────────────────────────────────────────────────────
-
-    def world_to_grid(self, wx, wy):
-        gx = int((wx - self.GRID_ORIGIN_X) / self.GRID_RESOLUTION)
-        gy = int((wy - self.GRID_ORIGIN_Y) / self.GRID_RESOLUTION)
-        return gx, gy
-
-    def grid_to_world(self, gx, gy):
-        wx = self.GRID_ORIGIN_X + (gx + 0.5) * self.GRID_RESOLUTION
-        wy = self.GRID_ORIGIN_Y + (gy + 0.5) * self.GRID_RESOLUTION
-        return wx, wy
-
-    def in_grid(self, gx, gy):
-        return 0 <= gx < self.GRID_SIZE and 0 <= gy < self.GRID_SIZE
 
     # ── Robot pose ────────────────────────────────────────────────────────────
 
@@ -453,358 +293,6 @@ class ExploreAndFind(Node):
         p = self.get_base_pose()
         return p[2] if p is not None else None
 
-    # ── Mapping ───────────────────────────────────────────────────────────────
-
-    def _integrate_depth(self):
-        if self.latest_depth is None or self.camera_K is None:
-            return
-
-        try:
-            stamp  = rclpy.time.Time.from_msg(self.latest_depth_stamp)
-            tf_ob  = self.tf_buffer.lookup_transform(
-                'odom', 'base_link', stamp, timeout=Duration(seconds=0.1))
-        except Exception:
-            try:
-                tf_ob = self.tf_buffer.lookup_transform(
-                    'odom', 'base_link',
-                    rclpy.time.Time(), timeout=Duration(seconds=0.05))
-            except Exception:
-                return
-
-        try:
-            tf_bc = self.tf_buffer.lookup_transform(
-                'base_link', 'camera_depth_optical_frame',
-                rclpy.time.Time(), timeout=Duration(seconds=0.1))
-        except Exception:
-            return
-
-        def _q2m(q):
-            qw, qx, qy, qz = q.w, q.x, q.y, q.z
-            return np.array([
-                [1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw), 2*(qx*qz+qy*qw)],
-                [2*(qx*qy+qz*qw),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
-                [2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw),   1-2*(qx*qx+qy*qy)],
-            ])
-
-        R_ob = _q2m(tf_ob.transform.rotation)
-        R_bc = _q2m(tf_bc.transform.rotation)
-        to   = tf_ob.transform.translation
-        tc   = tf_bc.transform.translation
-
-        cam_origin = R_ob @ np.array([tc.x, tc.y, tc.z]) + np.array([to.x, to.y, to.z])
-        R          = R_ob @ R_bc
-
-        fx = self.camera_K[0, 0];  fy = self.camera_K[1, 1]
-        cx = self.camera_K[0, 2];  cy = self.camera_K[1, 2]
-
-        depth = self.latest_depth
-        h, w  = depth.shape
-        step  = self.DEPTH_SUBSAMPLE
-
-        margin = int(w * self.DEPTH_H_CROP)
-        vs, us    = np.mgrid[0:h:step, margin:w - margin:step]
-        us        = us.ravel();  vs = vs.ravel()
-        depths_mm = depth[vs, us].astype(np.float64)
-
-        min_mm = self.MIN_DEPTH_M * 1000.0
-        max_mm = self.MAX_DEPTH_M * 1000.0
-        valid  = (depths_mm > min_mm) & (depths_mm < max_mm)
-        us     = us[valid];  vs     = vs[valid]
-        depths_m = depths_mm[valid] / 1000.0
-
-        if len(depths_m) == 0:
-            return
-
-        x_cam = (us - cx) * depths_m / fx
-        y_cam = (vs - cy) * depths_m / fy
-        z_cam = depths_m
-        pts_odom = (R @ np.stack([x_cam, y_cam, z_cam], axis=1).T).T + cam_origin
-
-        gxs = ((pts_odom[:, 0] - self.GRID_ORIGIN_X) / self.GRID_RESOLUTION).astype(int)
-        gys = ((pts_odom[:, 1] - self.GRID_ORIGIN_Y) / self.GRID_RESOLUTION).astype(int)
-
-        dist_xy  = np.hypot(pts_odom[:, 0] - cam_origin[0],
-                            pts_odom[:, 1] - cam_origin[1])
-        not_self = dist_xy > self.ROBOT_BODY_RADIUS
-
-        in_bounds = ((gxs >= 0) & (gxs < self.GRID_SIZE) &
-                     (gys >= 0) & (gys < self.GRID_SIZE))
-        in_height = ((pts_odom[:, 2] > self.MIN_OBSTACLE_Z) &
-                     (pts_odom[:, 2] < self.MAX_OBSTACLE_Z))
-
-        obs_mask = not_self & in_bounds & in_height
-
-        floor_mask = (not_self & in_bounds & ~in_height &
-                      (depths_m < self.FREE_TRACE_MAX_M))
-
-        obs_idx   = np.where(obs_mask)[0]
-        floor_idx = np.where(floor_mask)[0]
-
-        cam_gx, cam_gy = self.world_to_grid(cam_origin[0], cam_origin[1])
-
-        # Mark robot footprint as free
-        r_cells = int(self.ROBOT_BODY_RADIUS / self.GRID_RESOLUTION) + 1
-        fy_min  = max(0, cam_gy - r_cells)
-        fy_max  = min(self.GRID_SIZE, cam_gy + r_cells + 1)
-        fx_min  = max(0, cam_gx - r_cells)
-        fx_max  = min(self.GRID_SIZE, cam_gx + r_cells + 1)
-        ffy, ffx = np.meshgrid(
-            np.arange(fy_min, fy_max), np.arange(fx_min, fx_max), indexing='ij')
-        in_fp   = ((ffy - cam_gy)**2 + (ffx - cam_gx)**2) <= r_cells ** 2
-        fp_gy   = ffy[in_fp];  fp_gx = ffx[in_fp]
-        clearable = self.hit_count[fp_gy, fp_gx] < self.MIN_HIT_COUNT
-        self.log_odds[fp_gy[clearable], fp_gx[clearable]] = np.maximum(
-            self.LOG_ODDS_MIN,
-            self.log_odds[fp_gy[clearable], fp_gx[clearable]] + self.LOG_ODDS_MISS)
-
-        if len(obs_idx) == 0 and len(floor_idx) == 0:
-            return
-
-        if len(obs_idx) > 0:
-            ray_step = max(1, len(obs_idx) // 200)
-            for i in obs_idx[::ray_step]:
-                self._raytrace_free(cam_gx, cam_gy, int(gxs[i]), int(gys[i]))
-
-        if len(floor_idx) > 0:
-            ray_step2 = max(1, len(floor_idx) // 100)
-            for i in floor_idx[::ray_step2]:
-                self._raytrace_free(cam_gx, cam_gy, int(gxs[i]), int(gys[i]))
-
-        if len(obs_idx) > 0:
-            np.add.at(self.log_odds, (gys[obs_mask], gxs[obs_mask]), self.LOG_ODDS_HIT)
-            np.clip(self.log_odds, self.LOG_ODDS_MIN, self.LOG_ODDS_MAX, out=self.log_odds)
-
-        if len(obs_idx) > 0:
-            base_pose = self.get_base_pose()
-            if base_pose is not None:
-                cam_theta = float(base_pose[2])
-
-                u_yx = np.unique(
-                    np.stack([gys[obs_mask], gxs[obs_mask]], axis=1), axis=0)
-                u_gy, u_gx = u_yx[:, 0], u_yx[:, 1]
-
-                no_prior = np.isnan(self.hit_angle[u_gy, u_gx])
-                if np.any(no_prior):
-                    self.hit_angle[u_gy[no_prior], u_gx[no_prior]] = cam_theta
-                    self.hit_count[u_gy[no_prior], u_gx[no_prior]] = 1
-
-                has_prior = ~no_prior
-                if np.any(has_prior):
-                    hp_gy     = u_gy[has_prior]
-                    hp_gx     = u_gx[has_prior]
-                    prior     = self.hit_angle[hp_gy, hp_gx]
-                    diff      = np.abs(cam_theta - prior)
-                    diff      = np.minimum(diff, 2 * np.pi - diff)
-                    diverse   = diff >= self.MIN_HIT_ANGLE_SEP
-                    if np.any(diverse):
-                        d_gy = hp_gy[diverse];  d_gx = hp_gx[diverse]
-                        self.hit_count[d_gy, d_gx] = np.minimum(
-                            self.hit_count[d_gy, d_gx].astype(np.uint16) + 1,
-                            255).astype(np.uint8)
-                        self.hit_angle[d_gy, d_gx] = cam_theta
-
-    def _raytrace_free(self, x0: int, y0: int, x1: int, y1: int):
-        dx = abs(x1 - x0);  sx = 1 if x0 < x1 else -1
-        dy = abs(y1 - y0);  sy = 1 if y0 < y1 else -1
-        err = dx - dy
-        x, y = x0, y0
-
-        while not (x == x1 and y == y1):
-            if self.in_grid(x, y):
-                if (self.hit_count[y, x] >= self.MIN_HIT_COUNT and
-                        self.log_odds[y, x] >= self.LOG_ODDS_OCC_THRESH):
-                    break
-                self.log_odds[y, x] = max(
-                    self.LOG_ODDS_MIN,
-                    self.log_odds[y, x] + self.LOG_ODDS_MISS)
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy;  x += sx
-            if e2 < dx:
-                err += dx;  y += sy
-
-    # ── Path planning ──────────────────────────────────────────────────────────
-
-    def _plan_path(self, start_gx, start_gy, goal_gx, goal_gy, clearance_m=None):
-        if clearance_m is None:
-            clearance_m = self.ROBOT_CLEARANCE
-        free_mask = self.log_odds <= self.LOG_ODDS_FREE_THRESH
-        confirmed_occ = ((self.log_odds  >= self.LOG_ODDS_OCC_THRESH) &
-                         (self.hit_count >= self.MIN_HIT_COUNT))
-        if clearance_m > 0:
-            r_clear = int(np.ceil(clearance_m / self.GRID_RESOLUTION))
-            ky_c, kx_c = np.ogrid[-r_clear:r_clear + 1, -r_clear:r_clear + 1]
-            clear_disc = (ky_c ** 2 + kx_c ** 2) <= r_clear ** 2
-            inflated = binary_dilation(confirmed_occ, structure=clear_disc)
-            traversable = free_mask & ~inflated
-        else:
-            traversable = free_mask & ~confirmed_occ
-
-        if not (self.in_grid(start_gx, start_gy) and
-                self.in_grid(goal_gx, goal_gy)):
-            return None
-
-        if not traversable[start_gy, start_gx]:
-            if not free_mask[start_gy, start_gx]:
-                return None
-            traversable[start_gy, start_gx] = True
-
-        if not traversable[goal_gy, goal_gx]:
-            # Goal is in inflated zone — snap to nearest traversable cell
-            best_d2 = float('inf')
-            best_gx, best_gy = None, None
-            search_r = int(np.ceil(clearance_m / self.GRID_RESOLUTION)) + 5
-            for dy in range(-search_r, search_r + 1):
-                for dx in range(-search_r, search_r + 1):
-                    nx, ny = goal_gx + dx, goal_gy + dy
-                    if (0 <= nx < self.GRID_SIZE and
-                            0 <= ny < self.GRID_SIZE and
-                            traversable[ny, nx]):
-                        d2 = dx * dx + dy * dy
-                        if d2 < best_d2:
-                            best_d2 = d2
-                            best_gx, best_gy = nx, ny
-            if best_gx is None:
-                return None
-            goal_gx, goal_gy = best_gx, best_gy
-            goal = (goal_gx, goal_gy)
-
-        SQRT2 = 1.414
-        DIRS = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
-                (-1, -1, SQRT2), (-1, 1, SQRT2), (1, -1, SQRT2), (1, 1, SQRT2)]
-
-        def heuristic(gx, gy):
-            return np.hypot(gx - goal_gx, gy - goal_gy)
-
-        start = (start_gx, start_gy)
-        goal  = (goal_gx, goal_gy)
-
-        open_set = [(heuristic(*start), 0.0, start)]
-        g_cost   = {start: 0.0}
-        came_from = {}
-        expansions = 0
-        MAX_EXPANSIONS = 50000
-
-        while open_set and expansions < MAX_EXPANSIONS:
-            _, g, (cx, cy) = heapq.heappop(open_set)
-            expansions += 1
-
-            if (cx, cy) == goal:
-                path = [(cx, cy)]
-                while (cx, cy) in came_from:
-                    cx, cy = came_from[(cx, cy)]
-                    path.append((cx, cy))
-                path.reverse()
-                return self._subsample_path(path)
-
-            if g > g_cost.get((cx, cy), float('inf')):
-                continue
-
-            for dx, dy, cost in DIRS:
-                nx, ny = cx + dx, cy + dy
-                if not (0 <= nx < self.GRID_SIZE and 0 <= ny < self.GRID_SIZE):
-                    continue
-                if not traversable[ny, nx]:
-                    continue
-                ng = g + cost
-                if ng < g_cost.get((nx, ny), float('inf')):
-                    g_cost[(nx, ny)] = ng
-                    came_from[(nx, ny)] = (cx, cy)
-                    heapq.heappush(open_set, (ng + heuristic(nx, ny), ng, (nx, ny)))
-
-        return None
-
-    def _subsample_path(self, path):
-        if len(path) <= 1:
-            return path
-        waypoints = []
-        for i in range(self.WAYPOINT_SPACING, len(path) - 1, self.WAYPOINT_SPACING):
-            waypoints.append(path[i])
-        waypoints.append(path[-1])
-        return waypoints
-
-    def _compute_inflated(self, clearance_m=None):
-        if clearance_m is None:
-            clearance_m = self.ROBOT_CLEARANCE
-        confirmed_occ = ((self.log_odds  >= self.LOG_ODDS_OCC_THRESH) &
-                         (self.hit_count >= self.MIN_HIT_COUNT))
-        if clearance_m > 0:
-            r = int(np.ceil(clearance_m / self.GRID_RESOLUTION))
-            ky, kx = np.ogrid[-r:r + 1, -r:r + 1]
-            disc = (ky ** 2 + kx ** 2) <= r ** 2
-            return binary_dilation(confirmed_occ, structure=disc)
-        return confirmed_occ
-
-    def _is_path_blocked(self):
-        nav_clear = getattr(self, 'nav_clearance', None)
-        inflated = self._compute_inflated(nav_clear)
-        # Only look 3 waypoints ahead — distant map noise should not trigger
-        # a replan; the robot will reroute when it gets closer.
-        lookahead = min(self.nav_waypoint_idx + 3, len(self.nav_waypoints))
-        for i in range(self.nav_waypoint_idx, lookahead):
-            gx, gy = self.nav_waypoints[i]
-            if self.in_grid(gx, gy) and inflated[gy, gx]:
-                return True
-        return False
-
-    def _replan_from_here(self):
-        pose = self.get_base_pose()
-        if pose is None or len(self.nav_waypoints) == 0:
-            return False
-        bx, by, _ = pose
-        robot_gx, robot_gy = self.world_to_grid(bx, by)
-        goal_gx, goal_gy = self.nav_waypoints[-1]
-
-        nav_clear = getattr(self, 'nav_clearance', None)
-        path = self._plan_path(robot_gx, robot_gy, goal_gx, goal_gy,
-                               clearance_m=nav_clear)
-        if path is None:
-            return False
-
-        self.nav_waypoints = path
-        self.nav_waypoint_idx = 0
-        self.publish_nav_path()
-        self.get_logger().info(
-            f'[NAV] Re-planned: {len(path)} waypoints from '
-            f'({bx:.2f},{by:.2f})')
-        return True
-
-    # ── Depth obstacle avoidance ─────────────────────────────────────────────
-
-    def _analyze_depth_obstacles(self):
-        depth = self.latest_depth
-        if depth is None:
-            return (True, True, True), (999.0, 999.0, 999.0)
-
-        h, w = depth.shape
-        v_start = int(h * 0.3)
-        v_end   = int(h * 0.55)  # stop at 55% to avoid floor returns
-        margin = int(w * self.DEPTH_H_CROP)
-        u_start = margin
-        u_end   = w - margin
-        third   = (u_end - u_start) // 3
-
-        left_region   = depth[v_start:v_end, u_start:u_start + third]
-        center_region = depth[v_start:v_end, u_start + third:u_start + 2 * third]
-        right_region  = depth[v_start:v_end, u_start + 2 * third:u_end]
-
-        def sector_min_dist(region):
-            min_mm = self.MIN_DEPTH_M * 1000.0
-            valid = region[(region > min_mm)].astype(np.float64)
-            if len(valid) == 0:
-                return 999.0
-            return float(np.percentile(valid, 10)) / 1000.0
-
-        left_dist   = sector_min_dist(left_region)
-        center_dist = sector_min_dist(center_region)
-        right_dist  = sector_min_dist(right_region)
-
-        threshold = self.OBSTACLE_THRESHOLD
-        clearance = (left_dist > threshold,
-                     center_dist > threshold,
-                     right_dist > threshold)
-        return clearance, (left_dist, center_dist, right_dist)
-
     @staticmethod
     def _normalize_angle(angle):
         while angle > np.pi:
@@ -816,14 +304,6 @@ class ExploreAndFind(Node):
     # ── Object detection ──────────────────────────────────────────────────────
 
     def _yolo_bbox_cb(self, msg: Detection2DArray):
-        """Store the latest YOLO detection that matches our target class.
-
-        This callback only caches the detection; the temporal-confirmation
-        logic lives in _check_for_object(), which is polled from the main
-        loop exactly like the old HSV version.
-        """
-        if hasattr(self, '_dbg_yolo_count'):
-            self._dbg_yolo_count += 1
         for detection in msg.detections:
             if not detection.results:
                 continue
@@ -833,18 +313,10 @@ class ExploreAndFind(Node):
                 return
 
     def _check_for_object(self):
-        """Check latest YOLO detection for target object.
-
-        Uses the bbox centre from the YOLO classifier and estimates
-        world position via depth back-projection.  Requires
-        DETECT_COUNT_REQ detections within DETECT_WINDOW seconds to
-        confirm.  Returns True when the object is confirmed.
-        """
         det = self.latest_yolo_detection
         if det is None or self.camera_K is None:
             return False
 
-        # Consume the detection so we don't re-process the same frame
         self.latest_yolo_detection = None
 
         u = int(det.bbox.center.position.x)
@@ -854,7 +326,6 @@ class ExploreAndFind(Node):
         if pos is None:
             return False
 
-        # Check consistency — if position jumped far, reset window
         if self.last_detection_pos is not None:
             d = np.hypot(pos[0] - self.last_detection_pos[0],
                          pos[1] - self.last_detection_pos[1])
@@ -865,7 +336,6 @@ class ExploreAndFind(Node):
         self.detection_times.append(now)
         self.last_detection_pos = pos
 
-        # Prune old detections outside the window
         cutoff = now - self.DETECT_WINDOW
         self.detection_times = [t for t in self.detection_times if t >= cutoff]
 
@@ -886,15 +356,10 @@ class ExploreAndFind(Node):
         return False
 
     def _refine_object_position(self):
-        """Update object_world_pos from a new YOLO detection if available.
-
-        Called during NAVIGATING and APPROACHING to keep the position
-        estimate fresh as the robot gets closer (depth accuracy improves).
-        """
         det = self.latest_yolo_detection
         if det is None:
             return
-        self.latest_yolo_detection = None  # consume
+        self.latest_yolo_detection = None
 
         u = int(det.bbox.center.position.x)
         v = int(det.bbox.center.position.y)
@@ -934,7 +399,6 @@ class ExploreAndFind(Node):
         self.get_logger().info(f'[VOICE] Queued command: {action} {obj}')
 
     def _start_next_command(self):
-        """Pop the next command from the queue and begin exploring for it."""
         if not self.command_queue:
             self.state = ExploreState.WAITING_FOR_COMMAND
             self.get_logger().info(
@@ -957,34 +421,31 @@ class ExploreAndFind(Node):
         self._reset_detection_state()
 
         # Tilt camera down so it can see the ground/objects ahead
+        self.current_tilt = 0.3
         pt_msg = Float64MultiArray()
-        pt_msg.data = [0.0, 0.3]  # [pan, tilt] TODO 0.2 for real
+        pt_msg.data = [0.0, self.current_tilt]
         self.pan_tilt_pub.publish(pt_msg)
 
         self.get_logger().info('=' * 55)
         self.get_logger().info(
             f'NEW COMMAND: {action} {obj_name} (YOLO class {class_id})')
         self.get_logger().info('=' * 55)
+        self.scan_attempt_count = 0
         self._start_scan()
 
     def _reset_detection_state(self):
-        """Clear detection state for a new target (keeps the map)."""
         self.object_world_pos = None
         self.detection_times = []
         self.last_detection_pos = None
         self.latest_yolo_detection = None
-        self.depth_steer_start = None
-        self.no_frontier_count = 0
 
     def _estimate_object_position(self, u, v):
-        """Estimate world (x, y) of pixel (u, v) using depth + TF."""
         if self.latest_depth is None or self.camera_K is None:
             return None
 
         depth = self.latest_depth
         h, w = depth.shape
 
-        # Average depth over small window for robustness
         half_win = 4
         v_lo = max(0, v - half_win)
         v_hi = min(h, v + half_win + 1)
@@ -1000,7 +461,6 @@ class ExploreAndFind(Node):
         if depth_m < self.MIN_DEPTH_M or depth_m > self.MAX_DEPTH_M:
             return None
 
-        # Back-project to camera frame
         fx = self.camera_K[0, 0]
         fy = self.camera_K[1, 1]
         cx_k = self.camera_K[0, 2]
@@ -1011,7 +471,6 @@ class ExploreAndFind(Node):
         z_cam = depth_m
         pt_cam = np.array([x_cam, y_cam, z_cam])
 
-        # Transform to world frame
         try:
             tf_ob = self.tf_buffer.lookup_transform(
                 'odom', 'base_link',
@@ -1046,56 +505,9 @@ class ExploreAndFind(Node):
         pt_world = R @ pt_cam + cam_origin
         return (float(pt_world[0]), float(pt_world[1]))
 
-    def _plan_approach(self):
-        """Try to plan A* path to object_world_pos.  Returns True on success."""
-        if self.object_world_pos is None:
-            return False
-
-        pose = self.get_base_pose()
-        if pose is None:
-            return False
-        bx, by, _ = pose
-        ox, oy = self.object_world_pos
-
-        # Already close enough?
-        if np.hypot(ox - bx, oy - by) < self.APPROACH_DIST:
-            self._stop_base()
-            self.get_logger().info(
-                f'[APPROACH] Already at target object!')
-            self.state = ExploreState.COMPLETE
-            return True
-
-        robot_gx, robot_gy = self.world_to_grid(bx, by)
-        goal_gx, goal_gy = self.world_to_grid(ox, oy)
-
-        # Try cascading inflation levels
-        clearances = [None, self.ROBOT_CLEARANCE * 0.5]
-        labels     = ['full', 'half']
-
-        for clearance, label in zip(clearances, labels):
-            path = self._plan_path(robot_gx, robot_gy, goal_gx, goal_gy,
-                                   clearance_m=clearance)
-            if path is not None:
-                self._stop_base()
-                self.nav_waypoints    = path
-                self.nav_waypoint_idx = 0
-                self.nav_start_time   = time.time()
-                self.nav_clearance    = clearance
-                self.publish_nav_path()
-                self.state = ExploreState.APPROACHING
-                self.get_logger().info(
-                    f'[APPROACH] Path to target object at '
-                    f'({ox:.2f}, {oy:.2f}): {len(path)} waypoints '
-                    f'({label} inflation)')
-                return True
-
-        self.get_logger().info(
-            f'[APPROACH] No path to object at ({ox:.2f}, {oy:.2f}) '
-            f'— continuing exploration')
-        return False
+    # ── Publishing ────────────────────────────────────────────────────────────
 
     def publish_object_marker(self):
-        """Publish a sphere marker at the detected object position."""
         if self.object_world_pos is None:
             return
         m = Marker()
@@ -1115,254 +527,13 @@ class ExploreAndFind(Node):
         ma.markers.append(m)
         self.object_marker_pub.publish(ma)
 
-    # ── Frontier detection ────────────────────────────────────────────────────
+    # ── Camera tilt helper ────────────────────────────────────────────────────
 
-    def find_frontiers(self):
-        free_mask    = self.log_odds <= self.LOG_ODDS_FREE_THRESH
-        confirmed_occ = ((self.log_odds  >= self.LOG_ODDS_OCC_THRESH) &
-                         (self.hit_count >= self.MIN_HIT_COUNT))
-        unknown_mask  = ~free_mask & ~confirmed_occ
-
-        r_clear = int(np.ceil(self.ROBOT_CLEARANCE / self.GRID_RESOLUTION))
-        ky_c, kx_c = np.ogrid[-r_clear:r_clear + 1, -r_clear:r_clear + 1]
-        clear_disc = (ky_c ** 2 + kx_c ** 2) <= r_clear ** 2
-        self._inflated_occ = binary_dilation(confirmed_occ, structure=clear_disc)
-
-        frontier_mask = np.zeros_like(self.log_odds, dtype=bool)
-        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            frontier_mask |= (free_mask &
-                              np.roll(np.roll(unknown_mask, dy, axis=0), dx, axis=1))
-
-        fys, fxs = np.where(frontier_mask)
-        if len(fxs) == 0:
-            return []
-
-        frontier_set = set(zip(fxs.tolist(), fys.tolist()))
-        visited      = set()
-        clusters     = []
-
-        for seed in frontier_set:
-            if seed in visited:
-                continue
-            cluster = []
-            queue   = deque([seed])
-            visited.add(seed)
-            while queue:
-                cx, cy = queue.popleft()
-                cluster.append((cx, cy))
-                for dy, dx in [(-1,0),(1,0),(0,-1),(0,1),
-                                (-1,-1),(-1,1),(1,-1),(1,1)]:
-                    nb = (cx + dx, cy + dy)
-                    if nb in frontier_set and nb not in visited:
-                        visited.add(nb)
-                        queue.append(nb)
-            if len(cluster) >= self.MIN_FRONTIER_SIZE:
-                clusters.append(cluster)
-
-        if not clusters:
-            return []
-
-        base_pose = self.get_base_pose()
-        if base_pose is None:
-            return []
-        bx, by, _ = base_pose
-        robot_gx, robot_gy = self.world_to_grid(bx, by)
-
-        _labeled, _ = ndimage_label(free_mask, structure=np.ones((3, 3), dtype=bool))
-        if (self.in_grid(robot_gx, robot_gy) and
-                _labeled[robot_gy, robot_gx] > 0):
-            reachable = (_labeled == _labeled[robot_gy, robot_gx])
-        else:
-            reachable = None
-
-        r_cells = int(self.MAX_DEPTH_M / self.GRID_RESOLUTION)
-        ky, kx  = np.ogrid[-r_cells:r_cells + 1, -r_cells:r_cells + 1]
-        disc    = (ky ** 2 + kx ** 2) <= r_cells ** 2
-
-        results = []
-        n_dist = n_reach = n_clear = 0
-
-        for cluster in clusters:
-            cluster_cells = np.array(cluster)
-            cxs, cys = cluster_cells[:, 0], cluster_cells[:, 1]
-
-            mgx = int(np.mean(cxs))
-            mgy = int(np.mean(cys))
-            wx, wy = self.grid_to_world(mgx, mgy)
-            dist   = np.hypot(wx - bx, wy - by)
-
-            if dist < self.MIN_FRONTIER_DIST:
-                n_dist += 1
-                continue
-
-            if reachable is not None:
-                if not np.any(reachable[cys, cxs]):
-                    n_reach += 1
-                    continue
-
-            centroid_valid = (
-                self.in_grid(mgx, mgy) and
-                not self._inflated_occ[mgy, mgx])
-
-            if not centroid_valid:
-                valid = ~self._inflated_occ[cys, cxs]
-                if not np.any(valid):
-                    n_clear += 1
-                    continue
-                valid_idx = np.where(valid)[0]
-                dists2 = (cxs[valid_idx] - mgx) ** 2 + (cys[valid_idx] - mgy) ** 2
-                best = valid_idx[np.argmin(dists2)]
-                mgx, mgy = int(cxs[best]), int(cys[best])
-                wx, wy = self.grid_to_world(mgx, mgy)
-                dist   = np.hypot(wx - bx, wy - by)
-
-            y_lo = max(0,             mgy - r_cells)
-            y_hi = min(self.GRID_SIZE, mgy + r_cells + 1)
-            x_lo = max(0,             mgx - r_cells)
-            x_hi = min(self.GRID_SIZE, mgx + r_cells + 1)
-
-            ky_lo = y_lo - (mgy - r_cells)
-            ky_hi = ky_lo + (y_hi - y_lo)
-            kx_lo = x_lo - (mgx - r_cells)
-            kx_hi = kx_lo + (x_hi - x_lo)
-
-            patch = unknown_mask[y_lo:y_hi, x_lo:x_hi]
-            nearby_unknown = int(np.sum(patch & disc[ky_lo:ky_hi, kx_lo:kx_hi]))
-
-            score = nearby_unknown / max(dist, 0.5)
-
-            # ── Bias toward last-seen object position ─────────────
-            # If the target was glimpsed (even unconfirmed), override
-            # the exploration score: rank primarily by proximity to
-            # the object, with a small info-gain tiebreaker.
-            if self.last_detection_pos is not None:
-                dist_to_obj = np.hypot(wx - self.last_detection_pos[0],
-                                       wy - self.last_detection_pos[1])
-                # Primary: closer to object = higher score
-                # 1/(d+0.3) so a frontier 0.5m from object scores ~1.25
-                # while one 5m away scores ~0.19
-                proximity = 1.0 / (dist_to_obj + 0.3)
-                # Normalize info-gain to [0,1] range as tiebreaker
-                info_norm = min(nearby_unknown / 500.0, 1.0)
-                score = proximity * 10.0 + info_norm
-
-            results.append((wx, wy, len(cluster), score))
-
-        bias_str = ''
-        if self.last_detection_pos is not None:
-            bias_str = (f', biased toward ({self.last_detection_pos[0]:.1f},'
-                        f' {self.last_detection_pos[1]:.1f})')
-        self.get_logger().info(
-            f'[FRONTIER] {len(clusters)} clusters -> {len(results)} valid '
-            f'(filtered: dist={n_dist}, reach={n_reach}, clear={n_clear})'
-            f'{bias_str}')
-
-        results.sort(key=lambda r: r[3], reverse=True)
-        return results
-
-    # ── Publishing ────────────────────────────────────────────────────────────
-
-    def publish_map(self):
-        span  = float(self.LOG_ODDS_MAX - self.LOG_ODDS_MIN)
-        ratio = (self.log_odds - self.LOG_ODDS_MIN) / span
-        occ   = np.clip(ratio * 100.0, 0.0, 100.0)
-
-        occ[self.hit_count < self.MIN_HIT_COUNT] = np.minimum(
-            occ[self.hit_count < self.MIN_HIT_COUNT], 80.0)
-
-        grid = occ.astype(np.int8)
-        grid[(self.hit_count == 0) & (self.log_odds == 0.0)] = -1
-
-        msg = OccupancyGrid()
-        msg.header.stamp              = self.get_clock().now().to_msg()
-        msg.header.frame_id           = 'odom'
-        msg.info                      = MapMetaData()
-        msg.info.resolution           = self.GRID_RESOLUTION
-        msg.info.width                = self.GRID_SIZE
-        msg.info.height               = self.GRID_SIZE
-        msg.info.origin.position.x    = float(self.GRID_ORIGIN_X)
-        msg.info.origin.position.y    = float(self.GRID_ORIGIN_Y)
-        msg.info.origin.position.z    = 0.0
-        msg.info.origin.orientation.w = 1.0
-        msg.data = grid.ravel().tolist()
-        self.map_pub.publish(msg)
-        self.publish_inflated_map()
-        self.publish_nav_path()
-
-    def publish_frontiers(self, frontiers):
-        ma = MarkerArray()
-        for i, (wx, wy, size, score) in enumerate(frontiers):
-            m = Marker()
-            m.header.stamp       = self.get_clock().now().to_msg()
-            m.header.frame_id    = 'odom'
-            m.ns                 = 'frontiers'
-            m.id                 = i
-            m.type               = Marker.CYLINDER
-            m.action             = Marker.ADD
-            m.pose.position.x    = wx
-            m.pose.position.y    = wy
-            m.pose.position.z    = 0.1
-            m.pose.orientation.w = 1.0
-            m.scale.x = 0.2;  m.scale.y = 0.2;  m.scale.z = 0.3
-            brightness = 1.0 if i == 0 else 0.4
-            m.color    = ColorRGBA(r=0.0, g=brightness, b=0.3, a=0.8)
-            m.lifetime.sec = 5
-            ma.markers.append(m)
-        self.frontier_pub.publish(ma)
-
-    def publish_inflated_map(self):
-        """Publish the A*-inflated obstacle layer as a second OccupancyGrid."""
-        inflated = self._compute_inflated()
-        confirmed_occ = ((self.log_odds >= self.LOG_ODDS_OCC_THRESH) &
-                         (self.hit_count >= self.MIN_HIT_COUNT))
-        grid = np.zeros((self.GRID_SIZE, self.GRID_SIZE), dtype=np.int8)
-        grid[inflated] = 50          # inflated zone — grey
-        grid[confirmed_occ] = 100    # real obstacle — black
-        grid[(self.hit_count == 0) & (self.log_odds == 0.0)] = -1  # unknown
-
-        msg = OccupancyGrid()
-        msg.header.stamp              = self.get_clock().now().to_msg()
-        msg.header.frame_id           = 'odom'
-        msg.info                      = MapMetaData()
-        msg.info.resolution           = self.GRID_RESOLUTION
-        msg.info.width                = self.GRID_SIZE
-        msg.info.height               = self.GRID_SIZE
-        msg.info.origin.position.x    = float(self.GRID_ORIGIN_X)
-        msg.info.origin.position.y    = float(self.GRID_ORIGIN_Y)
-        msg.info.origin.position.z    = 0.0
-        msg.info.origin.orientation.w = 1.0
-        msg.data = grid.ravel().tolist()
-        self.inflated_map_pub.publish(msg)
-
-    def publish_nav_path(self):
-        """Publish the current planned waypoints as a LINE_STRIP marker."""
-        ma = MarkerArray()
-        # Clear old path
-        del_m = Marker()
-        del_m.header.stamp    = self.get_clock().now().to_msg()
-        del_m.header.frame_id = 'odom'
-        del_m.ns              = 'nav_path'
-        del_m.action          = Marker.DELETEALL
-        ma.markers.append(del_m)
-
-        if self.nav_waypoints:
-            m = Marker()
-            m.header.stamp    = self.get_clock().now().to_msg()
-            m.header.frame_id = 'odom'
-            m.ns              = 'nav_path'
-            m.id              = 0
-            m.type            = Marker.LINE_STRIP
-            m.action          = Marker.ADD
-            m.scale.x         = 0.06
-            m.color           = ColorRGBA(r=0.0, g=0.6, b=1.0, a=1.0)
-            m.pose.orientation.w = 1.0
-            for gx, gy in self.nav_waypoints:
-                wx, wy = self.grid_to_world(gx, gy)
-                p = Point(); p.x = wx; p.y = wy; p.z = 0.05
-                m.points.append(p)
-            ma.markers.append(m)
-
-        self.nav_path_pub.publish(ma)
+    def _set_camera_tilt(self, tilt):
+        self.current_tilt = float(np.clip(tilt, 0.0, 0.9))
+        pt_msg = Float64MultiArray()
+        pt_msg.data = [0.0, self.current_tilt]
+        self.pan_tilt_pub.publish(pt_msg)
 
     # ── State machine ─────────────────────────────────────────────────────────
 
@@ -1370,34 +541,31 @@ class ExploreAndFind(Node):
         self.scan_accumulated  = 0.0
         self.scan_last_heading = None
         self.scan_settle_start = None
+        self.scan_attempt_count += 1
         self.state = ExploreState.SCANNING
-        self.get_logger().info('[SCAN] Starting 360 rotation scan...')
+        self.get_logger().info(
+            f'[SCAN] Starting 360 rotation scan '
+            f'(attempt {self.scan_attempt_count}/{self.MAX_SCAN_ATTEMPTS})...')
 
     def _stop_base(self):
-        self.last_cmd_angular = 0.0
         self.cmd_vel_pub.publish(Twist())
-
-    def _nudge_forward(self, duration: float = 0.5):
-        """Drive forward briefly so re-scan gets a new vantage point."""
-        twist = Twist()
-        twist.linear.x = 0.15
-        end = time.time() + duration
-        while time.time() < end and rclpy.ok():
-            self.cmd_vel_pub.publish(twist)
-            rclpy.spin_once(self, timeout_sec=0.05)
-        self._stop_base()
 
     def _state_scanning(self):
         if self.scan_settle_start is not None:
             if time.time() - self.scan_settle_start >= self.SCAN_SETTLE_TIME:
-                # If object was detected during scan, center on it first
                 if self.object_world_pos is not None:
                     self.get_logger().info(
                         '[SCAN] Settled — object detected, centering on it.')
                     self._start_centering()
+                elif self.scan_attempt_count >= self.MAX_SCAN_ATTEMPTS:
+                    self.get_logger().warn(
+                        f'[SCAN] No object found after '
+                        f'{self.MAX_SCAN_ATTEMPTS} scans — giving up.')
+                    self.state = ExploreState.COMPLETE
                 else:
-                    self.get_logger().info('[SCAN] Settled — selecting frontier.')
-                    self.state = ExploreState.SELECTING
+                    self.get_logger().info(
+                        '[SCAN] No object found — re-scanning...')
+                    self._start_scan()
             return
 
         heading = self.get_heading()
@@ -1420,7 +588,6 @@ class ExploreAndFind(Node):
         else:
             cmd = Twist()
             cmd.angular.z = self.SCAN_ANGULAR_VEL
-            self.last_cmd_angular = cmd.angular.z
             self.cmd_vel_pub.publish(cmd)
 
     def _start_centering(self):
@@ -1429,21 +596,13 @@ class ExploreAndFind(Node):
         self.get_logger().info('[CENTER] Rotating to center object in camera...')
 
     def _state_centering(self):
-        """Rotate in place until the target object is horizontally centered.
-
-        Two modes:
-        1. No YOLO detection visible: rotate toward the object's known world
-           position using bearing from base_link.
-        2. YOLO detection visible: fine-tune using pixel offset in the image,
-           and update the world position estimate.
-        """
         now = time.time()
 
         if now - self.center_start_time > self.CENTER_TIMEOUT:
             self._stop_base()
             self.get_logger().warn(
-                '[CENTER] Timeout — proceeding to selection.')
-            self.state = ExploreState.SELECTING
+                '[CENTER] Timeout — re-scanning.')
+            self._start_scan()
             return
 
         pose = self.get_base_pose()
@@ -1455,15 +614,17 @@ class ExploreAndFind(Node):
         if det is not None:
             # ── YOLO visible: fine-center using pixel offset ──────────
             u = int(det.bbox.center.position.x)
+            v = int(det.bbox.center.position.y)
 
             if self.latest_depth is None:
                 return
-            img_w = self.latest_depth.shape[1]
-            img_center = img_w / 2.0
-            offset = u - img_center  # positive = object right of center
+            img_h, img_w = self.latest_depth.shape
+            img_center_x = img_w / 2.0
+            img_center_y = img_h / 2.0
+            offset_x = u - img_center_x  # positive = object right of center
+            offset_y = v - img_center_y  # positive = object below center
 
             # Update object position from fresh detection
-            v = int(det.bbox.center.position.y)
             new_pos = self._estimate_object_position(u, v)
             if new_pos is not None:
                 if self.object_world_pos is not None:
@@ -1477,44 +638,52 @@ class ExploreAndFind(Node):
                     self.object_world_pos = new_pos
                     self.last_detection_pos = new_pos
 
-            if abs(offset) < self.CENTER_PIXEL_THRESH:
+            # Adjust camera tilt to center vertically
+            if abs(offset_y) > self.CENTER_PIXEL_THRESH_V:
+                if offset_y > 0:
+                    self._set_camera_tilt(self.current_tilt + self.CENTER_TILT_STEP)
+                else:
+                    self._set_camera_tilt(self.current_tilt - self.CENTER_TILT_STEP)
+
+            h_centered = abs(offset_x) < self.CENTER_PIXEL_THRESH
+            v_centered = abs(offset_y) < self.CENTER_PIXEL_THRESH_V
+
+            if h_centered and v_centered:
                 self._stop_base()
                 self.get_logger().info(
-                    f'[CENTER] Object centered (offset={offset:.0f}px) '
-                    f'— proceeding to selection.')
-                self.state = ExploreState.SELECTING
+                    f'[CENTER] Object centered (h={offset_x:.0f}px, '
+                    f'v={offset_y:.0f}px) — approaching.')
+                self.approach_start_time = time.time()
+                self.state = ExploreState.APPROACHING
                 return
 
-            # Rotate to reduce pixel offset
-            cmd = Twist()
-            # Proportional control: faster when far off-center
-            frac = min(abs(offset) / (img_w / 2.0), 1.0)
-            speed = self.CENTER_ANGULAR_VEL * (0.4 + 0.6 * frac)
-            cmd.angular.z = -speed if offset > 0 else speed
-            self.last_cmd_angular = cmd.angular.z
-            self.cmd_vel_pub.publish(cmd)
+            # Rotate to reduce horizontal offset
+            if not h_centered:
+                cmd = Twist()
+                frac = min(abs(offset_x) / (img_w / 2.0), 1.0)
+                speed = self.CENTER_ANGULAR_VEL * (0.4 + 0.6 * frac)
+                cmd.angular.z = -speed if offset_x > 0 else speed
+                self.cmd_vel_pub.publish(cmd)
 
             if not hasattr(self, '_center_last_log') or now - self._center_last_log > 1.0:
                 self._center_last_log = now
                 self.get_logger().info(
-                    f'[CENTER] pixel offset={offset:.0f}px, rotating '
-                    f'{"right" if offset > 0 else "left"}')
+                    f'[CENTER] h_offset={offset_x:.0f}px, v_offset={offset_y:.0f}px, '
+                    f'tilt={self.current_tilt:.2f}')
         else:
             # ── No YOLO detection: rotate toward known world position ─
             if self.object_world_pos is None:
                 self._stop_base()
-                self.state = ExploreState.SELECTING
+                self.get_logger().warn('[CENTER] Lost object, re-scanning.')
+                self._start_scan()
                 return
 
             ox, oy = self.object_world_pos
             bearing = np.arctan2(oy - by, ox - bx)
-            # Robot's forward direction uses btheta - pi/2 convention
             actual_heading = btheta - np.pi / 2
             heading_error = self._normalize_angle(bearing - actual_heading)
 
-            # Close enough in heading — object should appear soon
             if abs(heading_error) < np.radians(5):
-                # Stop and wait a moment for YOLO to detect
                 self._stop_base()
                 if not hasattr(self, '_center_last_log') or now - self._center_last_log > 1.0:
                     self._center_last_log = now
@@ -1526,7 +695,6 @@ class ExploreAndFind(Node):
             cmd.angular.z = float(np.clip(
                 1.0 * heading_error, -self.CENTER_ANGULAR_VEL,
                 self.CENTER_ANGULAR_VEL))
-            self.last_cmd_angular = cmd.angular.z
             self.cmd_vel_pub.publish(cmd)
 
             if not hasattr(self, '_center_last_log') or now - self._center_last_log > 1.0:
@@ -1535,369 +703,122 @@ class ExploreAndFind(Node):
                     f'[CENTER] bearing err={np.degrees(heading_error):.0f}deg, '
                     f'rotating toward ({ox:.2f},{oy:.2f})')
 
-    def _state_selecting(self):
-        # ── If object confirmed, try to approach it first ─────────────
-        if self.object_world_pos is not None:
-            if self._plan_approach():
-                return
-
-        # ── If object was glimpsed (unconfirmed), try approaching that ─
-        if self.object_world_pos is None and self.last_detection_pos is not None:
-            self.get_logger().info(
-                f'[SELECT] Trying unconfirmed sighting at '
-                f'({self.last_detection_pos[0]:.2f}, '
-                f'{self.last_detection_pos[1]:.2f})')
-            self.object_world_pos = self.last_detection_pos
-            if self._plan_approach():
-                return
-            # Couldn't path there — clear and fall through to frontiers
-            self.object_world_pos = None
-
-        frontiers = self.find_frontiers()
-        self.publish_frontiers(frontiers)
-
-        if not frontiers:
-            self.no_frontier_count += 1
-            if self.no_frontier_count >= self.NO_FRONTIER_LIMIT:
-                self.get_logger().info('[SELECT] Exploration complete — no object found.')
-                self.state = ExploreState.COMPLETE
-            else:
-                self.get_logger().info(
-                    f'[SELECT] No frontiers '
-                    f'({self.no_frontier_count}/{self.NO_FRONTIER_LIMIT}) '
-                    f'— nudging forward then re-scanning.')
-                self._nudge_forward(0.5)
-                self._start_scan()
-            return
-
-        self.no_frontier_count = 0
-
-        base_pose = self.get_base_pose()
-        if base_pose is None:
-            return
-        bx, by, _ = base_pose
-        robot_gx, robot_gy = self.world_to_grid(bx, by)
-
-        clearances = [None, self.ROBOT_CLEARANCE * 0.5]
-        labels     = ['full', 'half']
-
-        for clearance, label in zip(clearances, labels):
-            for wx, wy, size, score in frontiers:
-                if clearance is None:
-                    obj_info = ''
-                    if self.last_detection_pos is not None:
-                        d2o = np.hypot(wx - self.last_detection_pos[0],
-                                       wy - self.last_detection_pos[1])
-                        obj_info = f' dist_obj={d2o:.1f}'
-                    self.get_logger().info(
-                        f'[SELECT] Trying frontier ({wx:.2f}, {wy:.2f}) '
-                        f'cluster={size} score={score:.1f}{obj_info}')
-
-                goal_gx, goal_gy = self.world_to_grid(wx, wy)
-                path = self._plan_path(robot_gx, robot_gy, goal_gx, goal_gy,
-                                       clearance_m=clearance)
-
-                if path is None:
-                    continue
-
-                self.get_logger().info(
-                    f'[SELECT] A* path ({label} inflation): {len(path)} '
-                    f'waypoints to ({wx:.2f}, {wy:.2f})')
-
-                self.nav_waypoints    = path
-                self.nav_waypoint_idx = 0
-                self.nav_start_time   = time.time()
-                self.nav_clearance    = clearance
-                self.publish_nav_path()
-                self.state = ExploreState.NAVIGATING
-                return
-
-        self.get_logger().warn(
-            '[SELECT] No path to any frontier at any clearance '
-            '— nudging forward then re-scanning.')
-        self._nudge_forward(0.5)
-        self._start_scan()
-
-    def _state_navigating(self):
-        now = time.time()
-
-        if now - self.nav_start_time > self.NAV_TIMEOUT:
-            self._stop_base()
-            self.get_logger().warn('[NAV] Timeout — re-selecting.')
-            self.state = ExploreState.SELECTING
-            return
-
-        pose = self.get_base_pose()
-        if pose is None:
-            return
-        bx, by, btheta = pose
-
-        # ── Check for target object while navigating ──────────────────
-        if self.object_world_pos is None:
-            self._check_for_object()
-        else:
-            # Refine object position from new detections while navigating
-            self._refine_object_position()
-        if self.object_world_pos is not None:
-            if self._plan_approach():
-                return
-            # Can't reach object yet — continue to frontier
-
-        actual_heading = btheta - np.pi / 2
-
-        if self._is_path_blocked():
-            self.get_logger().info('[NAV] Path blocked on map — re-planning...')
-            if self._replan_from_here():
-                return
-            else:
-                self._stop_base()
-                self.get_logger().warn('[NAV] Re-plan failed — re-selecting.')
-                self.state = ExploreState.SELECTING
-                return
-
-        if self.nav_waypoint_idx >= len(self.nav_waypoints):
-            self._stop_base()
-            self.get_logger().info('[NAV] All waypoints reached — starting scan.')
-            self._start_scan()
-            return
-
-        wp_gx, wp_gy = self.nav_waypoints[self.nav_waypoint_idx]
-        wp_wx, wp_wy = self.grid_to_world(wp_gx, wp_gy)
-        dx, dy = wp_wx - bx, wp_wy - by
-        dist = np.hypot(dx, dy)
-
-        if dist < self.WAYPOINT_TOLERANCE:
-            self.nav_waypoint_idx += 1
-            self.nav_start_time = time.time()
-            if self.nav_waypoint_idx >= len(self.nav_waypoints):
-                self._stop_base()
-                self.get_logger().info('[NAV] Goal reached — starting scan.')
-                self._start_scan()
-                return
-            wp_gx, wp_gy = self.nav_waypoints[self.nav_waypoint_idx]
-            wp_wx, wp_wy = self.grid_to_world(wp_gx, wp_gy)
-            dx, dy = wp_wx - bx, wp_wy - by
-            dist = np.hypot(dx, dy)
-
-        desired_heading = np.arctan2(dy, dx)
-        heading_error = self._normalize_angle(desired_heading - actual_heading)
-
-        if not hasattr(self, '_nav_last_log') or now - self._nav_last_log > 2.0:
-            self._nav_last_log = now
-            self.get_logger().info(
-                f'[NAV] wp {self.nav_waypoint_idx}/{len(self.nav_waypoints)} '
-                f'dist={dist:.2f} hdg_err={np.degrees(heading_error):.0f} '
-                f'pos=({bx:.2f},{by:.2f})')
-
-        cmd = Twist()
-
-        clearance, distances = self._analyze_depth_obstacles()
-        left_clear, center_clear, right_clear = clearance
-        left_dist, center_dist, right_dist = distances
-        min_dist = min(left_dist, center_dist, right_dist)
-
-        if not center_clear:
-            if self.depth_steer_start is None:
-                self.depth_steer_start = now
-            elif now - self.depth_steer_start > self.DEPTH_STEER_TIMEOUT:
-                self.get_logger().info(
-                    '[NAV] Stuck on depth obstacle — forcing re-plan.')
-                self.depth_steer_start = None
-                self._stop_base()
-                if self._replan_from_here():
-                    return
-                self.get_logger().warn('[NAV] Re-plan failed — re-selecting.')
-                self.state = ExploreState.SELECTING
-                return
-            if not hasattr(self, '_steer_last_log') or now - self._steer_last_log > 1.0:
-                self._steer_last_log = now
-                self.get_logger().info(
-                    f'[NAV] Depth obstacle: L={left_dist:.2f} C={center_dist:.2f} '
-                    f'R={right_dist:.2f} — steering '
-                    f'({now - self.depth_steer_start:.1f}s/'
-                    f'{self.DEPTH_STEER_TIMEOUT:.1f}s)')
-            if left_dist > right_dist:
-                cmd.angular.z = 0.5
-            elif right_dist > left_dist:
-                cmd.angular.z = -0.5
-            else:
-                cmd.angular.z = 0.5
-            cmd.linear.x = 0.0
-        else:
-            self.depth_steer_start = None
-            alignment = max(0.0, np.cos(heading_error))
-            speed = self.NAV_LINEAR_SPEED * alignment
-            if min_dist < 1.5:
-                speed *= min(min_dist / 1.5, 1.0)
-            cmd.linear.x = float(min(speed, dist * 0.5))
-            cmd.angular.z = float(np.clip(1.0 * heading_error, -0.5, 0.5))
-
-        if min_dist < 0.35:
-            cmd.linear.x = 0.0
-
-        self.last_cmd_angular = cmd.angular.z
-        self.cmd_vel_pub.publish(cmd)
-
     def _state_approaching(self):
-        """Navigate to the detected object's world position."""
         now = time.time()
 
-        if now - self.nav_start_time > self.NAV_TIMEOUT:
+        if now - self.approach_start_time > self.APPROACH_TIMEOUT:
             self._stop_base()
-            self.get_logger().warn('[APPROACH] Timeout — re-selecting.')
-            self.state = ExploreState.SELECTING
-            return
-
-        pose = self.get_base_pose()
-        if pose is None:
-            return
-        bx, by, btheta = pose
-        actual_heading = btheta - np.pi / 2
-
-        # ── Refine object position while approaching ──────────────
-        # Re-detect the object to update position estimate as we get closer
-        # (depth accuracy improves at shorter range).
-        old_pos = self.object_world_pos
-        self._refine_object_position()
-        if self.object_world_pos != old_pos:
-            shift = np.hypot(
-                self.object_world_pos[0] - old_pos[0],
-                self.object_world_pos[1] - old_pos[1])
-            if shift > 0.15:
-                # Re-plan path to updated position
-                goal_gx, goal_gy = self.world_to_grid(
-                    self.object_world_pos[0], self.object_world_pos[1])
-                robot_gx, robot_gy = self.world_to_grid(bx, by)
-                for cl in [None, self.ROBOT_CLEARANCE * 0.5]:
-                    path = self._plan_path(
-                        robot_gx, robot_gy,
-                        goal_gx, goal_gy,
-                        clearance_m=cl)
-                    if path is not None:
-                        self.nav_waypoints = path
-                        self.nav_waypoint_idx = 0
-                        self.nav_clearance = cl
-                        self.publish_nav_path()
-                        break
-
-        # Check distance to object
-        ox, oy = self.object_world_pos
-        dist_to_obj = np.hypot(ox - bx, oy - by)
-        if dist_to_obj < self.APPROACH_DIST:
-            self._stop_base()
-            self.get_logger().info(
-                f'[APPROACH] Reached target object! '
-                f'dist={dist_to_obj:.2f}m')
+            self.get_logger().warn('[APPROACH] Timeout — declaring complete.')
             self.state = ExploreState.COMPLETE
             return
 
-        # Re-plan if path blocked — rate-limited to avoid thrashing
-        if (self._is_path_blocked() and
-                now - self.last_approach_replan > 2.0):
-            self.last_approach_replan = now
-            self.get_logger().info('[APPROACH] Path blocked — re-planning...')
-            if not self._replan_from_here():
-                self._stop_base()
-                self.get_logger().warn(
-                    '[APPROACH] Re-plan failed — re-selecting.')
-                self.state = ExploreState.SELECTING
-                return
+        pose = self.get_base_pose()
+        if pose is None:
+            return
+        bx, by, btheta = pose
+        actual_heading = btheta - np.pi / 2
 
-        if self.nav_waypoint_idx >= len(self.nav_waypoints):
-            # All waypoints reached but not within APPROACH_DIST
+        # Check distance to object via world position
+        if self.object_world_pos is not None:
+            ox, oy = self.object_world_pos
+            dist_to_obj = np.hypot(ox - bx, oy - by)
             if dist_to_obj < self.APPROACH_DIST:
                 self._stop_base()
+                self.get_logger().info(
+                    f'[APPROACH] Reached target! dist={dist_to_obj:.2f}m')
                 self.state = ExploreState.COMPLETE
                 return
-            # Try re-planning closer
-            goal_gx, goal_gy = self.world_to_grid(ox, oy)
-            robot_gx, robot_gy = self.world_to_grid(bx, by)
-            for clearance in [None, self.ROBOT_CLEARANCE * 0.5]:
-                path = self._plan_path(
-                    robot_gx, robot_gy, goal_gx, goal_gy,
-                    clearance_m=clearance)
-                if path is not None:
-                    self.nav_waypoints = path
-                    self.nav_waypoint_idx = 0
-                    self.nav_start_time = time.time()
-                    self.nav_clearance = clearance
-                    self.publish_nav_path()
-                    return
-            # Give up
-            self._stop_base()
-            self.get_logger().info(
-                f'[APPROACH] Close but not within {self.APPROACH_DIST}m '
-                f'(dist={dist_to_obj:.2f}m) — declaring complete.')
-            self.state = ExploreState.COMPLETE
-            return
 
-        wp_gx, wp_gy = self.nav_waypoints[self.nav_waypoint_idx]
-        wp_wx, wp_wy = self.grid_to_world(wp_gx, wp_gy)
-        dx, dy = wp_wx - bx, wp_wy - by
-        dist = np.hypot(dx, dy)
+        det = self.latest_yolo_detection
+        cmd = Twist()
 
-        if dist < self.WAYPOINT_TOLERANCE:
-            self.nav_waypoint_idx += 1
-            self.nav_start_time = time.time()
-            if self.nav_waypoint_idx >= len(self.nav_waypoints):
-                if dist_to_obj < self.APPROACH_DIST:
-                    self._stop_base()
-                    self.get_logger().info(
-                        f'[APPROACH] Reached target object! '
-                        f'dist={dist_to_obj:.2f}m')
-                    self.state = ExploreState.COMPLETE
-                    return
-                # Might need to re-plan — will handle on next tick
-                return
-            wp_gx, wp_gy = self.nav_waypoints[self.nav_waypoint_idx]
-            wp_wx, wp_wy = self.grid_to_world(wp_gx, wp_gy)
-            dx, dy = wp_wx - bx, wp_wy - by
-            dist = np.hypot(dx, dy)
+        if det is not None:
+            # ── Visual servoing: steer based on YOLO pixel offset ─────
+            u = int(det.bbox.center.position.x)
+            v = int(det.bbox.center.position.y)
 
-        desired_heading = np.arctan2(dy, dx)
-        heading_error = self._normalize_angle(desired_heading - actual_heading)
+            if self.latest_depth is not None:
+                img_h, img_w = self.latest_depth.shape
+                img_center_x = img_w / 2.0
+                img_center_y = img_h / 2.0
+                offset_x = u - img_center_x
+
+                # Steer proportionally to horizontal pixel offset
+                angular = -self.APPROACH_ANGULAR_GAIN * offset_x
+                cmd.angular.z = float(np.clip(
+                    angular, -self.APPROACH_MAX_ANGULAR, self.APPROACH_MAX_ANGULAR))
+
+                # Adjust tilt to keep object vertically centered
+                offset_y = v - img_center_y
+                if abs(offset_y) > self.CENTER_PIXEL_THRESH_V:
+                    if offset_y > 0:
+                        self._set_camera_tilt(
+                            self.current_tilt + self.APPROACH_TILT_STEP)
+                    else:
+                        self._set_camera_tilt(
+                            self.current_tilt - self.APPROACH_TILT_STEP)
+
+            # Refine world position
+            new_pos = self._estimate_object_position(u, v)
+            if new_pos is not None and self.object_world_pos is not None:
+                shift = np.hypot(
+                    new_pos[0] - self.object_world_pos[0],
+                    new_pos[1] - self.object_world_pos[1])
+                if shift < 1.5:
+                    self.object_world_pos = new_pos
+                    self.last_detection_pos = new_pos
+
+            # Also check depth directly from YOLO bbox center
+            if self.latest_depth is not None:
+                half_win = 4
+                v_lo = max(0, v - half_win)
+                v_hi = min(self.latest_depth.shape[0], v + half_win + 1)
+                u_lo = max(0, u - half_win)
+                u_hi = min(self.latest_depth.shape[1], u + half_win + 1)
+                patch = self.latest_depth[v_lo:v_hi, u_lo:u_hi].astype(np.float64)
+                valid_depths = patch[patch > 0]
+                if len(valid_depths) > 0:
+                    depth_m = float(np.median(valid_depths)) / 1000.0
+                    if depth_m < self.APPROACH_DIST:
+                        self._stop_base()
+                        self.get_logger().info(
+                            f'[APPROACH] Object depth={depth_m:.2f}m < '
+                            f'{self.APPROACH_DIST}m — reached!')
+                        self.state = ExploreState.COMPLETE
+                        return
+
+            self.latest_yolo_detection = None  # consume
+
+        else:
+            # ── No YOLO: fall back to world heading ───────────────────
+            if self.object_world_pos is not None:
+                ox, oy = self.object_world_pos
+                bearing = np.arctan2(oy - by, ox - bx)
+                heading_error = self._normalize_angle(bearing - actual_heading)
+                cmd.angular.z = float(np.clip(
+                    1.0 * heading_error,
+                    -self.APPROACH_MAX_ANGULAR,
+                    self.APPROACH_MAX_ANGULAR))
+            # else: drive straight (angular = 0)
+
+        cmd.linear.x = self.APPROACH_LINEAR_SPEED
+        self.cmd_vel_pub.publish(cmd)
 
         if not hasattr(self, '_approach_last_log') or now - self._approach_last_log > 2.0:
             self._approach_last_log = now
+            dist_str = ''
+            if self.object_world_pos is not None:
+                ox, oy = self.object_world_pos
+                dist_str = f' dist={np.hypot(ox-bx, oy-by):.2f}m'
+            yolo_str = 'YOLO' if det is not None else 'world-heading'
             self.get_logger().info(
-                f'[APPROACH] wp {self.nav_waypoint_idx}/{len(self.nav_waypoints)} '
-                f'dist_obj={dist_to_obj:.2f} pos=({bx:.2f},{by:.2f})')
-
-        cmd = Twist()
-
-        clearance, distances = self._analyze_depth_obstacles()
-        left_clear, center_clear, right_clear = clearance
-        left_dist, center_dist, right_dist = distances
-        min_dist = min(left_dist, center_dist, right_dist)
-
-        # During approach, trust the A* path for obstacle avoidance.
-        # Depth steering is skipped here because the floor and the target
-        # object itself cause persistent false "center blocked" readings.
-        # A hard safety stop is kept for truly close obstacles.
-        alignment = max(0.0, np.cos(heading_error))
-        speed = self.NAV_LINEAR_SPEED * alignment
-        if min_dist < 1.5:
-            speed *= min(min_dist / 1.5, 1.0)
-        cmd.linear.x = float(min(speed, dist * 0.5))
-        cmd.angular.z = float(np.clip(1.0 * heading_error, -0.5, 0.5))
-
-        if min_dist < 0.35:
-            cmd.linear.x = 0.0
-
-        self.last_cmd_angular = cmd.angular.z
-        self.cmd_vel_pub.publish(cmd)
+                f'[APPROACH] {yolo_str}{dist_str} '
+                f'pos=({bx:.2f},{by:.2f}) tilt={self.current_tilt:.2f}')
 
     def _state_complete(self):
         self._stop_base()
-        self.publish_map()
         if self.object_world_pos is not None:
             self.publish_object_marker()
-
-        free     = int(np.sum(self.log_odds <= self.LOG_ODDS_FREE_THRESH))
-        occupied = int(np.sum(
-            (self.log_odds  >= self.LOG_ODDS_OCC_THRESH) &
-            (self.hit_count >= self.MIN_HIT_COUNT)))
-        total    = self.GRID_SIZE ** 2
 
         name = self.current_object_name.upper() or 'TARGET'
         self.get_logger().info('=' * 55)
@@ -1907,12 +828,8 @@ class ExploreAndFind(Node):
                 f'FOUND {name} at ({ox:.2f}, {oy:.2f})')
         else:
             self.get_logger().info(f'{name} NOT FOUND')
-        self.get_logger().info(f'  Coverage : {(free+occupied)/total*100:.1f}%')
-        self.get_logger().info(f'  Free     : {free}')
-        self.get_logger().info(f'  Confirmed occupied : {occupied}')
         self.get_logger().info('=' * 55)
 
-        # If action is "get" and we found the object, try grasping
         if (self.current_action == 'get' and
                 self.object_world_pos is not None):
             self.get_logger().info(
@@ -1920,17 +837,14 @@ class ExploreAndFind(Node):
             self.state = ExploreState.GRASPING
             return
 
-        # Otherwise, move to next command
         self._start_next_command()
 
     # ── Grasping ─────────────────────────────────────────────────────────────
 
     def _state_grasping(self):
-        """Execute top-down grasp pipeline."""
         self.get_logger().info('=' * 55)
         self.get_logger().info('[GRASP] Starting grasp pipeline...')
 
-        # 1. Wait for motion planner service
         if not self.plan_client.wait_for_service(timeout_sec=5.0):
             self.get_logger().error(
                 '[GRASP] /plan_to_target service not available! '
@@ -1938,17 +852,16 @@ class ExploreAndFind(Node):
             self._start_next_command()
             return
 
-        # 2-3. Sweep camera tilt to find the object in frame
         det = None
-        tilt_angles = [i * 0.1 for i in range(0, 10)]  # 0.0 to 0.9
+        tilt_angles = [i * 0.1 for i in range(0, 10)]
         for tilt in tilt_angles:
             pt_msg = Float64MultiArray()
             pt_msg.data = [0.0, tilt]
             self.pan_tilt_pub.publish(pt_msg)
             self.get_logger().info(
                 f'[GRASP] Camera tilt={tilt:.1f}, waiting for YOLO...')
-            self.latest_yolo_detection = None  # clear stale
-            self._grasp_spin_for(1.0)  # wait for camera + fresh frame
+            self.latest_yolo_detection = None
+            self._grasp_spin_for(1.0)
             for _ in range(10):
                 self._grasp_spin_for(0.2)
                 if self.latest_yolo_detection is not None:
@@ -1966,7 +879,7 @@ class ExploreAndFind(Node):
             self._start_next_command()
             return
 
-        self.latest_yolo_detection = None  # consume
+        self.latest_yolo_detection = None
 
         cx = int(det.bbox.center.position.x)
         cy = int(det.bbox.center.position.y)
@@ -1976,7 +889,6 @@ class ExploreAndFind(Node):
             f'[GRASP] YOLO detection at pixel ({cx}, {cy}), '
             f'bbox {bbox_w:.0f}x{bbox_h:.0f}')
 
-        # 4. Crop depth to bbox and generate point cloud
         depth_roi, u_off, v_off = self._grasp_crop_depth(
             cx, cy, bbox_w, bbox_h)
         if depth_roi is None:
@@ -1997,14 +909,12 @@ class ExploreAndFind(Node):
         self.get_logger().info(
             f'[GRASP] Point cloud: {len(pts_base)} points')
 
-        # 5. Analyze object (centroid + grasp yaw)
         analysis = self._grasp_analyze_object(pts_base)
         centroid = analysis['centroid']
         self.get_logger().info(
             f'[GRASP] Centroid: ({centroid[0]:.3f}, {centroid[1]:.3f}, '
             f'{centroid[2]:.3f}), z_top={analysis["z_top"]:.3f}m')
 
-        # 6. Compute grasp + pre-grasp poses
         result = self._grasp_compute_poses(analysis)
         if result is None:
             self.get_logger().error('[GRASP] Pose computation failed')
@@ -2014,7 +924,6 @@ class ExploreAndFind(Node):
         grasp_pose, pre_grasp_pose, info = result
         self.get_logger().info(f'[GRASP] Params: {info}')
 
-        # 7. IK feasibility check
         use_orientation = True
         ok, msg = self._grasp_try_ik(grasp_pose, use_orientation=True)
         if not ok:
@@ -2033,7 +942,6 @@ class ExploreAndFind(Node):
                 self._start_next_command()
                 return
 
-        # 8. Execute grasp sequence
         self.get_logger().info('[GRASP] Opening gripper')
         self._grasp_set_gripper(0.0)
 
@@ -2060,7 +968,6 @@ class ExploreAndFind(Node):
         self.get_logger().info('[GRASP] Closing gripper (firm)')
         self._grasp_close_firm()
 
-        # 9. Lift
         self.get_logger().info('[GRASP] Lifting object')
         lift_pose = Pose()
         lift_pose.position.x = grasp_pose.position.x
@@ -2076,25 +983,21 @@ class ExploreAndFind(Node):
         self.get_logger().info('[GRASP] Grasp complete — holding object')
         self.get_logger().info('=' * 55)
 
-        # Hold for a moment then release and go home
         self._grasp_spin_for(3.0)
         self._grasp_set_gripper(0.0)
         self._grasp_spin_for(0.5)
         self._grasp_go_home()
 
-        # Transition to next command
         self._start_next_command()
 
     # ── Grasp helper methods ─────────────────────────────────────────────────
 
     def _grasp_spin_for(self, seconds):
-        """Spin callbacks for the given duration."""
         deadline = time.time() + seconds
         while time.time() < deadline:
             rclpy.spin_once(self, timeout_sec=0.05)
 
     def _grasp_set_gripper(self, position):
-        """Set gripper to position (0.0=open, 1.0=closed)."""
         msg = Float64MultiArray()
         msg.data = [position]
         for _ in range(10):
@@ -2103,7 +1006,6 @@ class ExploreAndFind(Node):
         time.sleep(0.5)
 
     def _grasp_close_firm(self):
-        """Close gripper with repeated commands for firm grasp."""
         msg = Float64MultiArray()
         msg.data = [1.0]
         for _ in range(self.GRASP_GRIPPER_CLOSE_REPEATS):
@@ -2115,7 +1017,6 @@ class ExploreAndFind(Node):
             rclpy.spin_once(self, timeout_sec=0.05)
 
     def _grasp_go_home(self, duration=3.0):
-        """Return arm to home (all zeros) position."""
         self.get_logger().info(
             f'[GRASP] Returning arm home over {duration}s')
         msg = ArmCommand()
@@ -2125,7 +1026,6 @@ class ExploreAndFind(Node):
         time.sleep(duration + 0.5)
 
     def _grasp_get_tf_matrix(self, target_frame, source_frame):
-        """Get 4x4 transformation matrix between frames."""
         try:
             transform = self.tf_buffer.lookup_transform(
                 target_frame, source_frame,
@@ -2143,7 +1043,6 @@ class ExploreAndFind(Node):
             return None
 
     def _grasp_crop_depth(self, cx, cy, bbox_w, bbox_h):
-        """Crop depth to padded YOLO bbox. Returns (roi, u_off, v_off)."""
         if self.latest_depth is None:
             return None, None, None
         h, w = self.latest_depth.shape
@@ -2156,7 +1055,6 @@ class ExploreAndFind(Node):
         return self.latest_depth[v0:v1, u0:u1], u0, v0
 
     def _grasp_depth_to_points(self, depth_roi, u_offset, v_offset):
-        """Back-project depth ROI to 3D points in base_link frame."""
         if self.camera_K is None:
             return None
 
@@ -2194,10 +1092,8 @@ class ExploreAndFind(Node):
         pts_h = np.hstack([points_cam, ones])
         pts_base = (tf_mat @ pts_h.T).T[:, :3]
 
-        # Filter: above table
         pts_base = pts_base[pts_base[:, 2] > self.GRASP_TABLE_Z_MIN]
 
-        # Filter: Z outliers
         if len(pts_base) > self.GRASP_MIN_POINTS:
             median_z = np.median(pts_base[:, 2])
             z_mask = (np.abs(pts_base[:, 2] - median_z)
@@ -2210,7 +1106,6 @@ class ExploreAndFind(Node):
         return pts_base
 
     def _grasp_analyze_object(self, points_base):
-        """Analyze point cloud: centroid, z_top, optimal grasp yaw."""
         centroid = np.mean(points_base, axis=0)
         z_top = float(np.max(points_base[:, 2]))
 
@@ -2247,7 +1142,6 @@ class ExploreAndFind(Node):
         }
 
     def _grasp_compute_poses(self, analysis):
-        """Compute grasp and pre-grasp poses from analysis dict."""
         centroid = analysis['centroid']
         grasp_yaw = analysis['grasp_yaw']
         grip_width = analysis['grip_width']
@@ -2280,7 +1174,6 @@ class ExploreAndFind(Node):
         return grasp_pose, pre_grasp_pose, info
 
     def _grasp_try_ik(self, pose, use_orientation=True):
-        """Dry-run IK check. Returns (success, message)."""
         req = PlanToTarget.Request()
         req.arm_name = self.GRASP_ARM_NAME
         req.target_pose = pose
@@ -2299,7 +1192,6 @@ class ExploreAndFind(Node):
         return result.success, result.message
 
     def _grasp_plan_and_execute(self, pose, label, use_orientation=True):
-        """Plan and execute a motion to the given pose."""
         req = PlanToTarget.Request()
         req.arm_name = self.GRASP_ARM_NAME
         req.target_pose = pose
@@ -2346,70 +1238,30 @@ class ExploreAndFind(Node):
 
         self.get_logger().info('Sensors ready!')
 
-        # If a command is already queued (skip_voice), start immediately
         if self.command_queue:
             self._start_next_command()
         else:
             self.get_logger().info(
                 'Waiting for voice command on /target_object ...')
 
-        self._dbg_last = 0.0
-        self._dbg_depth_count = 0
-        self._dbg_integrate_count = 0
-        self._dbg_yolo_count = 0
-
         while rclpy.ok():
-            # Process ALL pending callbacks (depth, YOLO, camera_info)
-            # before doing state-machine work.  A single spin_once only
-            # handles one callback and can starve depth if other topics
-            # also have pending messages.
             deadline = time.time() + 0.05
             while time.time() < deadline:
                 rclpy.spin_once(self, timeout_sec=0)
-                # spin_once with timeout=0 returns immediately if nothing
-                # is ready — give CPU back so the bridge can publish.
                 time.sleep(0.002)
 
-            now = time.time()
-
-            # ── periodic debug heartbeat (every 3 s) ──────────────
-            # if now - self._dbg_last >= 3.0:
-            #     self.get_logger().info(
-            #         f'[DBG] state={self.state.name} '
-            #         f'depth_cb={self._dbg_depth_count} '
-            #         f'integrate={self._dbg_integrate_count} '
-            #         f'yolo_cb={self._dbg_yolo_count} '
-            #         f'cmd_ang={self.last_cmd_angular:.2f} '
-            #         f'obj={self.object_world_pos}')
-            #     self._dbg_depth_count = 0
-            #     self._dbg_integrate_count = 0
-            #     self._dbg_yolo_count = 0
-            #     self._dbg_last = now
-
-            if now - self.last_map_publish >= 1.0 / self.MAP_PUBLISH_RATE:
-                self.publish_map()
-                if self.object_world_pos is not None:
-                    self.publish_object_marker()
-                self.last_map_publish = now
-
-            # Object detection runs during scanning (stores position
-            # for use in SELECTING) — doesn't interrupt the scan.
+            # Object detection runs during scanning
             if (self.state == ExploreState.SCANNING and
                     self.object_world_pos is None):
                 self._check_for_object()
 
             if self.state == ExploreState.WAITING_FOR_COMMAND:
-                # Check if a new command arrived via voice callback
                 if self.command_queue:
                     self._start_next_command()
             elif self.state == ExploreState.SCANNING:
                 self._state_scanning()
             elif self.state == ExploreState.CENTERING:
                 self._state_centering()
-            elif self.state == ExploreState.SELECTING:
-                self._state_selecting()
-            elif self.state == ExploreState.NAVIGATING:
-                self._state_navigating()
             elif self.state == ExploreState.APPROACHING:
                 self._state_approaching()
             elif self.state == ExploreState.COMPLETE:
