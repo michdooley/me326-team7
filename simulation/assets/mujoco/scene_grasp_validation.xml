@@ -1,7 +1,6 @@
-<mujoco model="tidybot banana only scene">
+<mujoco model="tidybot grasp validation scene">
   <include file="tidybot_wx250s_bimanual.xml"/>
 
-  <size njmax="256" nconmax="128"/>
   <statistic center="0 0 0.525" extent="1.1" meansize="0.05"/>
 
   <visual>
@@ -12,9 +11,9 @@
 
   <asset>
     <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
-    <material name="groundplane" rgba="0.5 0.5 0.5 1" specular="0" shininess="0" reflectance="0"/>
+    <texture type="2d" name="groundplane" builtin="flat" rgb1="0.45 0.45 0.45" width="1" height="1"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" reflectance="0.0"/>
     <material name="banana_mat" rgba="0.95 0.90 0.10 1"/>
-
     <mesh name="banana_mesh" file="fruit/banana.stl" scale="0.019 0.019 0.019"/>
   </asset>
 
@@ -22,20 +21,17 @@
     <light pos="0 0 1.5" directional="true"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
 
-    <body name="banana" pos="1.00 0.00 0.06">
+    <!-- Banana: initial pos doesn't matter much — weld constraint holds it to gripper -->
+    <body name="banana" pos="0.3 0 0.5">
       <freejoint name="banana_joint"/>
-      <geom name="banana_geom" type="mesh" mesh="banana_mesh" mass="0.12"
+      <geom name="banana_geom" type="mesh" mesh="banana_mesh" mass="0.012"
         material="banana_mat" friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
     </body>
   </worldbody>
 
-  <keyframe>
-    <key name="scene_home"
-      qpos="0 0 1.5708
-        0 0
-        0 0 0 0 0 0 0.037 0.037
-        0 0 0 0 0 0 0.037 0.037
-        1.00 0.00 0.06 0.7071 0 0 0.7071"
-      ctrl="0 0 1.5708 0 0 0 0 0 0 0 0 0.037 0.037 0 0 0 0 0 0 0.037 0.037"/>
-  </keyframe>
+  <!-- Weld banana rigidly to right gripper pinch site -->
+  <equality>
+    <weld body1="banana" body2="right_fingers_link"
+          relpose="0.027 0 0 1 0 0 0" solref="0.001 1"/>
+  </equality>
 </mujoco>
