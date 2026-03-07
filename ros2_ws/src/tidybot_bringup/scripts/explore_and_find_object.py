@@ -101,6 +101,56 @@ YOLO_CLASS_MAP = {
 }
 
 
+FLOOR_MARGIN = 0.008  # RANSAC inlier distance threshold for floor plane
+
+
+def _ransac_floor_separate(pts, distance_thresh=0.008, max_iterations=200,
+                            min_inlier_ratio=0.20, min_pts=20):
+    """RANSAC plane fit to find the dominant planar surface (floor/table).
+
+    Returns (floor_z, object_points).  floor_z is the median Z of inliers.
+    Works on tilted floors unlike a simple Z-histogram.
+    """
+    n = len(pts)
+    if n < min_pts:
+        return float(np.median(pts[:, 2])), pts
+
+    best_inlier_mask = None
+    best_count = 0
+
+    rng = np.random.default_rng(42)
+    for _ in range(max_iterations):
+        idx = rng.choice(n, 3, replace=False)
+        p0, p1, p2 = pts[idx]
+
+        v1 = p1 - p0
+        v2 = p2 - p0
+        normal = np.cross(v1, v2)
+        norm_len = np.linalg.norm(normal)
+        if norm_len < 1e-10:
+            continue
+        normal /= norm_len
+
+        dists = np.abs((pts - p0) @ normal)
+        inlier_mask = dists < distance_thresh
+        count = inlier_mask.sum()
+
+        if count > best_count:
+            best_count = count
+            best_inlier_mask = inlier_mask
+
+    if best_inlier_mask is None or best_count < min_inlier_ratio * n:
+        return float(np.min(pts[:, 2])), pts
+
+    floor_z = float(np.median(pts[best_inlier_mask, 2]))
+    outlier_mask = ~best_inlier_mask
+
+    if outlier_mask.sum() < min_pts:
+        return floor_z, pts
+
+    return floor_z, pts[outlier_mask]
+
+
 class ExploreAndFind(Node):
 
     # ── Depth filtering ───────────────────────────────────────────────────────
@@ -1011,6 +1061,8 @@ class ExploreAndFind(Node):
             self.get_logger().error('[GRASP] Pre-grasp failed')
             return False
 
+        self.get_logger().info('[GRASP] Re-opening gripper at pre-grasp')
+        self._grasp_set_gripper(0.0)
         self._grasp_spin_for(self.GRASP_SETTLE_TIME)
 
         self.get_logger().info('[GRASP] Descending to grasp')
@@ -1035,16 +1087,26 @@ class ExploreAndFind(Node):
             self.get_logger().warn(
                 '[GRASP] Lift failed, continuing anyway')
 
+        # Raise object high above the robot (trophy pose)
+        self.get_logger().info('[GRASP] Raising object high...')
+        trophy_pose = Pose()
+        trophy_pose.position.x = float(grasp_pose.position.x)
+        trophy_pose.position.y = float(grasp_pose.position.y)
+        trophy_pose.position.z = 0.40  # high above base
+        trophy_pose.orientation = grasp_pose.orientation
+        if not self._grasp_plan_and_execute(
+                trophy_pose, 'trophy', use_orientation):
+            # Try slightly lower if 0.40 fails IK
+            trophy_pose.position.z = 0.35
+            if not self._grasp_plan_and_execute(
+                    trophy_pose, 'trophy-lower', use_orientation):
+                self.get_logger().warn(
+                    '[GRASP] Trophy pose failed, staying at lift height')
+
         self.get_logger().info('=' * 55)
-        self.get_logger().info('[GRASP] Grasp complete — holding object')
+        self.get_logger().info('[GRASP] Grasp complete — holding object up!')
         self.get_logger().info('=' * 55)
 
-        self._grasp_spin_for(3.0)
-        self._grasp_set_gripper(0.0)
-        self._grasp_spin_for(0.5)
-        self._grasp_go_home()
-
-        self._start_next_command()
         return True
 
     # ── Grasp helper methods ─────────────────────────────────────────────────
@@ -1160,9 +1222,29 @@ class ExploreAndFind(Node):
         if len(pts_base) < self.GRASP_MIN_POINTS:
             return None
 
-        return pts_base
+        # RANSAC floor/table separation
+        floor_z, obj_pts = _ransac_floor_separate(
+            pts_base, distance_thresh=FLOOR_MARGIN,
+            min_pts=self.GRASP_MIN_POINTS)
+
+        if len(obj_pts) < self.GRASP_MIN_POINTS:
+            self.get_logger().warn(
+                f'[GRASP] Floor filter removed too many points '
+                f'({len(pts_base)} -> {len(obj_pts)}), using all points')
+            return pts_base
+
+        self.get_logger().info(
+            f'[GRASP] RANSAC floor filter: {len(pts_base)} -> {len(obj_pts)} pts, '
+            f'floor_z={floor_z:.3f}m')
+        return obj_pts
 
     def _grasp_analyze_object(self, points_base):
+        """Analyze point cloud to find optimal grasp angle maximizing clearance.
+
+        For each candidate yaw angle, computes the object extent along the
+        finger axis and finds the optimal grasp center that maximizes the
+        minimum clearance between object and gripper fingers.
+        """
         centroid = np.mean(points_base, axis=0)
         z_top = float(np.max(points_base[:, 2]))
 
@@ -1170,36 +1252,58 @@ class ExploreAndFind(Node):
         centered = pts_xy - centroid[:2]
 
         best_yaw = 0.0
-        min_width = float('inf')
+        best_clearance = -1.0
+        best_width = float('inf')
+        best_center_offset = 0.0
         max_width = 0.0
+
         for angle_deg in range(0, 180, 5):
             angle = np.radians(angle_deg)
-            direction = np.array([np.cos(angle), np.sin(angle)])
-            projections = centered @ direction
-            width = float(np.ptp(projections))
-            if width < min_width:
-                min_width = width
-                best_yaw = angle
+            finger_dir = np.array([np.cos(angle), np.sin(angle)])
+            projections = centered @ finger_dir
+            proj_min = float(projections.min())
+            proj_max = float(projections.max())
+            width = proj_max - proj_min
+
             if width > max_width:
                 max_width = width
 
+            # Optimal center: midpoint of extent (centers object in gripper)
+            center_offset = (proj_min + proj_max) / 2.0
+            clearance = (GRIPPER_MAX_OPENING_M - width) / 2.0
+
+            if clearance > best_clearance:
+                best_clearance = clearance
+                best_yaw = angle
+                best_width = width
+                best_center_offset = center_offset
+
+        # Compute adjusted grasp center in world XY
+        finger_dir = np.array([np.cos(best_yaw), np.sin(best_yaw)])
+        grasp_center = centroid.copy()
+        grasp_center[0] += best_center_offset * finger_dir[0]
+        grasp_center[1] += best_center_offset * finger_dir[1]
+
         self.get_logger().info(
-            f'[GRASP] Min-width sweep: '
+            f'[GRASP] Max-clearance sweep: '
             f'yaw={np.degrees(best_yaw):.0f}deg, '
-            f'grip={min_width*1000:.0f}mm, '
-            f'max={max_width*1000:.0f}mm')
+            f'grip={best_width*1000:.0f}mm, '
+            f'clearance={best_clearance*1000:.1f}mm, '
+            f'center_offset={best_center_offset*1000:.1f}mm')
 
         return {
             'centroid': centroid,
+            'grasp_center': grasp_center,
             'grasp_yaw': best_yaw,
-            'grip_width': min_width,
+            'grip_width': best_width,
+            'min_clearance': best_clearance,
             'max_width': max_width,
             'z_top': z_top,
             'num_points': len(points_base),
         }
 
     def _grasp_compute_poses(self, analysis):
-        centroid = analysis['centroid']
+        grasp_center = analysis.get('grasp_center', analysis['centroid'])
         grasp_yaw = analysis['grasp_yaw']
         grip_width = analysis['grip_width']
 
@@ -1214,14 +1318,14 @@ class ExploreAndFind(Node):
         grasp_z = analysis['z_top'] + self.GRASP_Z_OFFSET
 
         grasp_pose = Pose()
-        grasp_pose.position.x = float(centroid[0])
-        grasp_pose.position.y = float(centroid[1])
+        grasp_pose.position.x = float(grasp_center[0])
+        grasp_pose.position.y = float(grasp_center[1])
         grasp_pose.position.z = float(grasp_z)
         grasp_pose.orientation = Quaternion(w=qw, x=qx, y=qy, z=qz)
 
         pre_grasp_pose = Pose()
-        pre_grasp_pose.position.x = float(centroid[0])
-        pre_grasp_pose.position.y = float(centroid[1])
+        pre_grasp_pose.position.x = float(grasp_center[0])
+        pre_grasp_pose.position.y = float(grasp_center[1])
         pre_grasp_pose.position.z = float(grasp_z + self.GRASP_PRE_HEIGHT)
         pre_grasp_pose.orientation = Quaternion(w=qw, x=qx, y=qy, z=qz)
 
