@@ -632,6 +632,49 @@ class TopdownGraspDemo(Node):
 
         return obj_pts, floor_z, pts_base
 
+    def _full_scene_to_points_base(self):
+        """Back-project the FULL depth image to base_link for TF debugging.
+
+        Same intrinsics + TF as _depth_roi_to_points_base but no cropping,
+        no TABLE_Z_MIN, no outlier filter, no RANSAC. Returns (N,3) or None.
+        """
+        if self.latest_depth is None:
+            return None
+
+        if not self.is_sim and self.depth_camera_info is not None:
+            K = self.depth_camera_info.k
+            tf_frame = 'camera_depth_optical_frame'
+        else:
+            if self.camera_info is None:
+                return None
+            K = self.camera_info.k
+            tf_frame = 'camera_color_optical_frame'
+
+        fx, fy, cx, cy = K[0], K[4], K[2], K[5]
+        depth_m = self.latest_depth.astype(np.float32) / 1000.0
+        h, w = depth_m.shape
+
+        u_grid, v_grid = np.meshgrid(np.arange(w), np.arange(h))
+        mask = (depth_m > MIN_DEPTH_M) & (depth_m < MAX_DEPTH_M)
+        z = depth_m[mask]
+        u = u_grid[mask].astype(np.float32)
+        v = v_grid[mask].astype(np.float32)
+
+        if len(z) < MIN_POINTS:
+            return None
+
+        x_cam = (u - cx) * z / fx
+        y_cam = (v - cy) * z / fy
+        points_cam = np.stack([x_cam, y_cam, z], axis=1)
+
+        tf_mat = self._get_tf_matrix('base_link', tf_frame)
+        if tf_mat is None:
+            return None
+
+        ones = np.ones((len(points_cam), 1), dtype=np.float32)
+        pts_h = np.hstack([points_cam, ones])
+        return (tf_mat @ pts_h.T).T[:, :3]
+
     def _separate_floor(self, pts_base):
         """Detect the floor/table plane via RANSAC and separate object points.
 
@@ -868,6 +911,12 @@ class TopdownGraspDemo(Node):
                 target_object=self.target_object)
             if floor_z is not None:
                 save_kwargs['floor_z'] = floor_z
+            # Full scene cloud for TF debugging
+            pts_full = self._full_scene_to_points_base()
+            if pts_full is not None:
+                save_kwargs['points_full_scene'] = pts_full
+                self.get_logger().info(
+                    f'  Full scene: {len(pts_full)} points')
             np.savez(str(snap_path), **save_kwargs)
             self.get_logger().info(f'  Snapshot saved: {snap_path}')
 

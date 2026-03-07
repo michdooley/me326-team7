@@ -264,6 +264,8 @@ def load_snapshot(path: Path) -> dict:
     result = {'points_base': data['points_base']}
     if 'points_base_raw' in data:
         result['points_base_raw'] = data['points_base_raw']
+    if 'points_full_scene' in data:
+        result['points_full_scene'] = data['points_full_scene']
     for key in ['z_offset', 'z_bias', 'pre_grasp_height', 'target_object', 'floor_z']:
         if key in data:
             result[key] = data[key].item() if data[key].ndim == 0 else data[key]
@@ -373,6 +375,9 @@ class GraspVisualizer:
         self.points_base_raw = self.params.pop('points_base_raw', None)
         if self.points_base_raw is None:
             self.points_base_raw = points_base.copy()
+
+        # Store full scene cloud for TF debugging
+        self.points_full_scene = self.params.pop('points_full_scene', None)
 
         # Apply floor separation if not already done
         self.points_base, self.params = self._ensure_floor_filtered(
@@ -503,9 +508,26 @@ class GraspVisualizer:
                 point_size=0.002,
             )
         else:
-            # Remove by adding empty cloud
             self.server.scene.add_point_cloud(
                 name='/scene/pointcloud_raw',
+                points=np.zeros((0, 3), dtype=np.float32),
+                colors=np.zeros((0, 3), dtype=np.uint8),
+                point_size=0.002,
+            )
+
+    def _show_full_scene(self, visible: bool):
+        """Show or hide the full (uncropped) scene point cloud."""
+        if visible and self.points_full_scene is not None:
+            colors = np.full((len(self.points_full_scene), 3), 140, dtype=np.uint8)
+            self.server.scene.add_point_cloud(
+                name='/scene/pointcloud_full',
+                points=self.points_full_scene.astype(np.float32),
+                colors=colors,
+                point_size=0.002,
+            )
+        else:
+            self.server.scene.add_point_cloud(
+                name='/scene/pointcloud_full',
                 points=np.zeros((0, 3), dtype=np.float32),
                 colors=np.zeros((0, 3), dtype=np.uint8),
                 point_size=0.002,
@@ -558,6 +580,11 @@ class GraspVisualizer:
             show_raw_cb = self.server.gui.add_checkbox(
                 'Show raw (pre-floor-filter)', initial_value=False)
             show_raw_cb.on_update(lambda _: self._show_raw_cloud(show_raw_cb.value))
+            show_full_cb = self.server.gui.add_checkbox(
+                'Show full scene (TF debug)', initial_value=False)
+            show_full_cb.on_update(lambda _: self._show_full_scene(show_full_cb.value))
+            if self.points_full_scene is None:
+                show_full_cb.disabled = True
 
         with self.server.gui.add_folder('Parameters'):
             z_offset_slider = self.server.gui.add_slider(
@@ -625,13 +652,17 @@ class GraspVisualizer:
                 idx = snap_names.index(snap_dropdown.value)
                 snap = load_snapshot(snapshots[idx])
                 new_params = {k: v for k, v in snap.items()
-                              if k not in ('points_base', 'points_base_raw')}
+                              if k not in ('points_base', 'points_base_raw',
+                                           'points_full_scene')}
                 self.points_base_raw = snap.get('points_base_raw', snap['points_base'].copy())
+                self.points_full_scene = snap.get('points_full_scene')
                 self.points_base, new_params = self._ensure_floor_filtered(
                     snap['points_base'], new_params)
                 self.params.update(new_params)
-                # Update raw cloud if visible
+                # Update auxiliary clouds if visible
                 self._show_raw_cloud(show_raw_cb.value)
+                self._show_full_scene(show_full_cb.value)
+                show_full_cb.disabled = self.points_full_scene is None
 
                 # Update point cloud
                 new_colors = self._color_by_height(self.points_base)
