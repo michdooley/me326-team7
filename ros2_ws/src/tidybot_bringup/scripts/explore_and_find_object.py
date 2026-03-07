@@ -1802,13 +1802,21 @@ class ExploreAndFind(Node):
             self.state = ExploreState.COMPLETE
             return
 
-        # ── Visual servo: keep banana centered during approach ──────
-        # If we can see the banana but it's off-center, stop forward
-        # motion and rotate to re-center before continuing. This prevents
-        # drifting toward a stale position estimate (camera/YOLO lag).
+        # ── Visual servo: stop and rotate until banana is centered ─────
+        # Uses hysteresis: trigger re-centering when offset > RECENTER_THRESH,
+        # but don't resume forward motion until offset < CENTER_PIXEL_THRESH.
+        # This prevents the robot from drifting toward a stale position
+        # estimate while the banana is off-center (camera/YOLO lag).
         if approach_pixel_offset is not None:
-            if abs(approach_pixel_offset) > self.APPROACH_RECENTER_THRESH:
+            recentering = getattr(self, '_approach_recentering', False)
+            # Start re-centering at wide threshold, keep going until tight threshold
+            need_recenter = (
+                abs(approach_pixel_offset) > self.APPROACH_RECENTER_THRESH
+                or (recentering and abs(approach_pixel_offset) > self.CENTER_PIXEL_THRESH))
+
+            if need_recenter:
                 self._approach_recentering = True
+                self._stop_base()
                 cmd = Twist()
                 img_w = self.latest_depth.shape[1]
                 frac = min(abs(approach_pixel_offset) / (img_w / 2.0), 1.0)
@@ -1820,12 +1828,16 @@ class ExploreAndFind(Node):
                 if not hasattr(self, '_approach_servo_log') or now - self._approach_servo_log > 1.0:
                     self._approach_servo_log = now
                     self.get_logger().info(
-                        f'[APPROACH] Visual re-centering: offset={approach_pixel_offset:.0f}px, '
+                        f'[APPROACH] Stopped — re-centering: '
+                        f'offset={approach_pixel_offset:.0f}px, '
                         f'dist={dist_to_obj:.2f}m')
                 return
-            elif getattr(self, '_approach_recentering', False):
+            elif recentering:
                 # Just finished re-centering — re-plan with fresh position
                 self._approach_recentering = False
+                self.get_logger().info(
+                    f'[APPROACH] Centered (offset={approach_pixel_offset:.0f}px) '
+                    f'— re-planning path')
                 goal_gx, goal_gy = self.world_to_grid(ox, oy)
                 robot_gx, robot_gy = self.world_to_grid(bx, by)
                 for cl in [None, self.ROBOT_CLEARANCE * 0.5]:
@@ -1838,8 +1850,8 @@ class ExploreAndFind(Node):
                         self.nav_clearance = cl
                         self.publish_nav_path()
                         self.get_logger().info(
-                            f'[APPROACH] Re-planned after re-center: '
-                            f'{len(path)} waypoints to ({ox:.2f}, {oy:.2f})')
+                            f'[APPROACH] Re-planned: {len(path)} waypoints '
+                            f'to ({ox:.2f}, {oy:.2f})')
                         break
         else:
             # No YOLO detection this tick
