@@ -10,6 +10,7 @@ Simplified pipeline for unobstructed environments:
   5. COMPLETE            — object reached
   6. GRASPING            — top-down grasp pipeline
   7. RETURNING_HOME      — follow recorded waypoints back to start pose
+  8. WAITING_FOR_DROP     — wait for voice command to release the object
 
 Build
 cd ros2_ws && colcon build --packages-select tidybot_perception tidybot_bringup && source install/setup.bash
@@ -77,6 +78,7 @@ class ExploreState(Enum):
     COMPLETE    = 4
     GRASPING    = 5
     RETURNING_HOME = 7
+    WAITING_FOR_DROP = 8
 
 
 # YOLO class name -> ID mapping (COCO dataset)
@@ -259,6 +261,9 @@ class ExploreAndFind(Node):
         self.start_pose = None       # (x, y, theta) at command start
         self.waypoints = []          # list of (x, y) breadcrumbs
         self.return_waypoints = []   # reversed copy used during return
+
+        # Drop command flag (set by voice callback)
+        self._drop_pending = False
 
         # TF
         self.tf_buffer   = tf2_ros.Buffer()
@@ -446,15 +451,33 @@ class ExploreAndFind(Node):
 
     # ── Voice command callbacks ───────────────────────────────────────────
 
+    # Drop/release action keywords that trigger the drop behavior
+    DROP_ACTIONS = {'drop', 'release', 'let go', 'put down', 'place'}
+
     def _user_command_cb(self, msg: String):
+        action = msg.data.strip().lower()
+        if not action:
+            return
+
+        # Always accept drop commands (even in skip_voice mode)
+        if self.state == ExploreState.WAITING_FOR_DROP:
+            if any(kw in action for kw in self.DROP_ACTIONS):
+                self.get_logger().info(f'[VOICE] Drop command received: "{action}"')
+                self._drop_pending = True
+                return
+
         if self.skip_voice:
             return
-        action = msg.data.strip().lower()
-        if action:
-            self._last_voice_action = action
-            self.get_logger().info(f'[VOICE] Action received: {action}')
+        self._last_voice_action = action
+        self.get_logger().info(f'[VOICE] Action received: {action}')
 
     def _target_object_cb(self, msg: String):
+        # During WAITING_FOR_DROP, also check target_object messages for drop keywords
+        # (Gemini may publish action on /user_command and object on /target_object)
+        if self.state == ExploreState.WAITING_FOR_DROP:
+            # The _user_command_cb handles the trigger; just consume silently
+            return
+
         if self.skip_voice:
             return
         obj = msg.data.strip().lower()
@@ -1460,9 +1483,12 @@ class ExploreAndFind(Node):
             self._stop_base()
             self.get_logger().info('=' * 55)
             self.get_logger().info(
-                '[RETURN] Arrived home — holding object. Done!')
+                '[RETURN] Arrived home — holding object.')
+            self.get_logger().info(
+                '[RETURN] Waiting for voice command to drop/release...')
             self.get_logger().info('=' * 55)
-            self.state = ExploreState.WAITING_FOR_COMMAND
+            self._drop_pending = False
+            self.state = ExploreState.WAITING_FOR_DROP
             return
 
         pose = self.get_base_pose()
@@ -1511,6 +1537,30 @@ class ExploreAndFind(Node):
                 f'[RETURN] Heading to ({tx:.2f},{ty:.2f}), '
                 f'dist={dist:.2f}m, err={np.degrees(heading_error):.0f}deg, '
                 f'{len(self.return_waypoints)} wp left')
+
+    # ── Wait for drop command ────────────────────────────────────────────
+
+    def _state_waiting_for_drop(self):
+        """Wait for a voice command to release the object."""
+        if not self._drop_pending:
+            return
+
+        self.get_logger().info('[DROP] Drop command received — releasing object')
+
+        # Open gripper
+        self._grasp_set_gripper(0.0)
+        self._grasp_spin_for(1.0)
+
+        # Return arm to sleep pose
+        self.get_logger().info('[DROP] Returning arm to sleep pose')
+        self._grasp_go_home(duration=3.0)
+
+        self.get_logger().info('=' * 55)
+        self.get_logger().info('[DROP] Object released. Task complete!')
+        self.get_logger().info('=' * 55)
+
+        self._drop_pending = False
+        self.state = ExploreState.WAITING_FOR_COMMAND
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -1567,6 +1617,8 @@ class ExploreAndFind(Node):
                 self._state_grasping()
             elif self.state == ExploreState.RETURNING_HOME:
                 self._state_returning_home()
+            elif self.state == ExploreState.WAITING_FOR_DROP:
+                self._state_waiting_for_drop()
 
 
 def main(args=None):
