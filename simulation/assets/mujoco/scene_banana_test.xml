@@ -34,7 +34,7 @@
     <geom name="wall_west"  type="box" pos="-3.0 2.5 0.25" size="0.05 3.55 0.25" material="wall_material"/>
 
     <!-- Banana ~1.5m ahead, offset to the right -->
-    <body name="banana" pos="0.5 1.5 0.06">
+    <body name="banana" pos="0.3 0.8 0.06">
       <freejoint name="banana_joint"/>
       <geom name="banana_geom" type="mesh" mesh="banana_mesh" mass="0.012"
         material="banana_mat" friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
@@ -48,7 +48,7 @@
         0 0.7854
         0 0 0 0 0 0 0.037 0.037
         0 0 0 0 0 0 0.037 0.037
-        0.5 1.5 0.06 0.707 0 0.707 0"
+        0.3 0.8 0.06 0.707 0 0.707 0"
       ctrl="0 0 1.5708 0 0.7854 0 0 0 0 0 0 0.037 0.037 0 0 0 0 0 0 0.037 0.037"/>
   </keyframe>
 </mujoco>

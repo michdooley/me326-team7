@@ -932,30 +932,21 @@ class ExploreAndFind(Node):
 
     def _grasp_attempt(self):
         """Single grasp attempt. Returns True on success, False on failure."""
-        # Sweep tilt to find the object
+        # Keep current camera pose and look for the object
+        self.get_logger().info(
+            f'[GRASP] Looking for object at current tilt={self.current_tilt:.2f}...')
         det = None
-        tilt_angles = [i * 0.1 for i in range(0, 10)]
-        for tilt in tilt_angles:
-            pt_msg = Float64MultiArray()
-            pt_msg.data = [0.0, tilt]
-            self.pan_tilt_pub.publish(pt_msg)
-            self.get_logger().info(
-                f'[GRASP] Camera tilt={tilt:.1f}, waiting for YOLO...')
-            self.latest_yolo_detection = None
-            self._grasp_spin_for(1.0)
-            for _ in range(10):
-                self._grasp_spin_for(0.2)
-                if self.latest_yolo_detection is not None:
-                    det = self.latest_yolo_detection
-                    break
-            if det is not None:
-                self.get_logger().info(
-                    f'[GRASP] Found object at tilt={tilt:.1f}')
+        self.latest_yolo_detection = None
+        self._grasp_spin_for(0.5)
+        for _ in range(15):
+            self._grasp_spin_for(0.2)
+            if self.latest_yolo_detection is not None:
+                det = self.latest_yolo_detection
                 break
 
         if det is None:
             self.get_logger().error(
-                '[GRASP] No YOLO detection at any tilt')
+                '[GRASP] No YOLO detection at current camera pose')
             return False
 
         # Center the object in the camera frame by adjusting tilt

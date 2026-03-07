@@ -26,15 +26,8 @@ def generate_launch_description():
         target_object_arg,
         user_command_arg,
 
-        # 1. The YOLO Object Classifier (The "Eyes")
-        # Subscribes /camera/color/image_raw, publishes /objbbox
-        Node(
-            package='object_classification',
-            executable='classifier',
-            name='classifier',
-            output='screen',
-            parameters=[{'use_sim_time': False}]
-        ),
+        # 1. The YOLO Object Classifier — run separately:
+        #   ros2 run object_classification classifier
 
         # 2. The Explore and Find Node (The "Brain")
         # Subscribes /objbbox + depth, publishes /cmd_vel
