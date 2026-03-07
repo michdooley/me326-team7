@@ -9,6 +9,7 @@ Simplified pipeline for unobstructed environments:
   4. APPROACHING         — drive straight toward object with visual servoing
   5. COMPLETE            — object reached
   6. GRASPING            — top-down grasp pipeline
+  7. RETURNING_HOME      — follow recorded waypoints back to start pose
 
 Build
 cd ros2_ws && colcon build --packages-select tidybot_perception tidybot_bringup && source install/setup.bash
@@ -75,6 +76,7 @@ class ExploreState(Enum):
     APPROACHING = 3
     COMPLETE    = 4
     GRASPING    = 5
+    RETURNING_HOME = 7
 
 
 # YOLO class name -> ID mapping (COCO dataset)
@@ -182,12 +184,21 @@ class ExploreAndFind(Node):
     APPROACH_TIMEOUT      = 60.0  # s
     APPROACH_TILT_STEP    = 0.03  # rad — tilt adjustment during approach
 
+    # ── Return home ────────────────────────────────────────────────────────
+    WAYPOINT_INTERVAL     = 0.20  # m — record a waypoint every this distance
+    RETURN_LINEAR_SPEED   = 0.10  # m/s
+    RETURN_ANGULAR_GAIN   = 2.0   # proportional gain for heading correction
+    RETURN_MAX_ANGULAR    = 0.4   # rad/s
+    RETURN_WAYPOINT_REACH = 0.10  # m — close enough to pop a waypoint
+
     # ── Grasp parameters ─────────────────────────────────────────────────────
     GRASP_ARM_NAME               = 'right'
     GRASP_MOVE_DURATION          = 2.0
     GRASP_PRE_HEIGHT             = 0.10
     GRASP_LIFT_HEIGHT            = 0.15
-    GRASP_Z_OFFSET               = -0.02
+    GRASP_Z_OFFSET               = -0.01   # m — vertical offset from z_top (+ = higher)
+    GRASP_X_OFFSET               = 0.0    # m — offset along base_link X (+ = forward)
+    GRASP_Y_OFFSET               = 0.0    # m — offset along base_link Y (+ = left)
     GRASP_BBOX_PAD               = 1.3
     GRASP_SETTLE_TIME            = 1.0
     GRASP_GRIPPER_CLOSE_REPEATS  = 20
@@ -243,6 +254,11 @@ class ExploreAndFind(Node):
 
         # Approach state
         self.approach_start_time = None
+
+        # Waypoint recording for return-home
+        self.start_pose = None       # (x, y, theta) at command start
+        self.waypoints = []          # list of (x, y) breadcrumbs
+        self.return_waypoints = []   # reversed copy used during return
 
         # TF
         self.tf_buffer   = tf2_ros.Buffer()
@@ -469,6 +485,15 @@ class ExploreAndFind(Node):
 
         self.target_class_id = class_id
         self._reset_detection_state()
+
+        # Record starting pose for return-home
+        self.start_pose = self.get_base_pose()
+        self.waypoints = []
+        if self.start_pose is not None:
+            self.waypoints.append((self.start_pose[0], self.start_pose[1]))
+            self.get_logger().info(
+                f'[NAV] Start pose recorded: '
+                f'({self.start_pose[0]:.2f}, {self.start_pose[1]:.2f})')
 
         # Tilt camera down so it can see the ground/objects ahead
         self.current_tilt = 0.3
@@ -1096,8 +1121,10 @@ class ExploreAndFind(Node):
 
         self.get_logger().info('=' * 55)
         self.get_logger().info('[GRASP] Grasp complete — holding object up!')
+        self.get_logger().info('[GRASP] Transitioning to RETURNING_HOME...')
         self.get_logger().info('=' * 55)
 
+        self._start_returning_home()
         return True
 
     # ── Grasp helper methods ─────────────────────────────────────────────────
@@ -1134,6 +1161,28 @@ class ExploreAndFind(Node):
         msg.duration = duration
         self.arm_pub.publish(msg)
         time.sleep(duration + 0.5)
+
+    def _grasp_retract_holding(self, duration=3.0):
+        """Retract arm to a raised overhead pose while keeping gripper closed.
+
+        Joint order: [waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate]
+        This pose tucks the arm straight up with the object held high.
+        """
+        self.get_logger().info(
+            f'[GRASP] Retracting arm to overhead pose over {duration}s')
+        msg = ArmCommand()
+        # waist=0 (centered), shoulder=-1.0 (tilted back),
+        # elbow=0.6 (bent up), forearm_roll=0, wrist_angle=0.4 (level), wrist_rotate=0
+        msg.joint_positions = [0.0, -1.0, 0.6, 0.0, 0.4, 0.0]
+        msg.duration = duration
+        self.arm_pub.publish(msg)
+        # Keep gripper firmly closed during retraction
+        grip_msg = Float64MultiArray()
+        grip_msg.data = [1.0]
+        for _ in range(int(duration / 0.1)):
+            self.gripper_pub.publish(grip_msg)
+            rclpy.spin_once(self, timeout_sec=0.1)
+        time.sleep(0.5)
 
     def _grasp_get_tf_matrix(self, target_frame, source_frame):
         try:
@@ -1306,22 +1355,28 @@ class ExploreAndFind(Node):
 
         qw, qx, qy, qz = yaw_to_grasp_quaternion(grasp_yaw)
 
+        grasp_x = float(grasp_center[0]) + self.GRASP_X_OFFSET
+        grasp_y = float(grasp_center[1]) + self.GRASP_Y_OFFSET
         grasp_z = analysis['z_top'] + self.GRASP_Z_OFFSET
 
         grasp_pose = Pose()
-        grasp_pose.position.x = float(grasp_center[0])
-        grasp_pose.position.y = float(grasp_center[1])
+        grasp_pose.position.x = grasp_x
+        grasp_pose.position.y = grasp_y
         grasp_pose.position.z = float(grasp_z)
         grasp_pose.orientation = Quaternion(w=qw, x=qx, y=qy, z=qz)
 
         pre_grasp_pose = Pose()
-        pre_grasp_pose.position.x = float(grasp_center[0])
-        pre_grasp_pose.position.y = float(grasp_center[1])
+        pre_grasp_pose.position.x = grasp_x
+        pre_grasp_pose.position.y = grasp_y
         pre_grasp_pose.position.z = float(grasp_z + self.GRASP_PRE_HEIGHT)
         pre_grasp_pose.orientation = Quaternion(w=qw, x=qx, y=qy, z=qz)
 
         info = (f'yaw={np.degrees(grasp_yaw):.0f}deg, '
-                f'z={grasp_z:.3f}m, width={grip_width*1000:.0f}mm')
+                f'xyz=({grasp_x:.3f}, {grasp_y:.3f}, {grasp_z:.3f})m, '
+                f'offsets=({self.GRASP_X_OFFSET*1000:.0f}, '
+                f'{self.GRASP_Y_OFFSET*1000:.0f}, '
+                f'{self.GRASP_Z_OFFSET*1000:.0f})mm, '
+                f'width={grip_width*1000:.0f}mm')
 
         return grasp_pose, pre_grasp_pose, info
 
@@ -1373,6 +1428,90 @@ class ExploreAndFind(Node):
             f'  [{label}] Failed: {result.message}')
         return False
 
+    # ── Waypoint recording ─────────────────────────────────────────────────
+
+    def _maybe_record_waypoint(self):
+        """Record a breadcrumb waypoint if we've moved far enough."""
+        pose = self.get_base_pose()
+        if pose is None:
+            return
+        x, y, _ = pose
+        if self.waypoints:
+            last_x, last_y = self.waypoints[-1]
+            dist = np.hypot(x - last_x, y - last_y)
+            if dist < self.WAYPOINT_INTERVAL:
+                return
+        self.waypoints.append((x, y))
+
+    # ── Return home state ────────────────────────────────────────────────
+
+    def _start_returning_home(self):
+        """Retract arm overhead, then reverse waypoints and drive back."""
+        self._grasp_retract_holding()
+
+        self.return_waypoints = list(reversed(self.waypoints))
+        self.state = ExploreState.RETURNING_HOME
+        n = len(self.return_waypoints)
+        self.get_logger().info(
+            f'[RETURN] Heading home via {n} waypoints')
+
+    def _state_returning_home(self):
+        if not self.return_waypoints:
+            self._stop_base()
+            self.get_logger().info('=' * 55)
+            self.get_logger().info(
+                '[RETURN] Arrived home — holding object. Done!')
+            self.get_logger().info('=' * 55)
+            self.state = ExploreState.WAITING_FOR_COMMAND
+            return
+
+        pose = self.get_base_pose()
+        if pose is None:
+            return
+        bx, by, btheta = pose
+
+        # Target is next waypoint
+        tx, ty = self.return_waypoints[0]
+        dist = np.hypot(tx - bx, ty - by)
+
+        if dist < self.RETURN_WAYPOINT_REACH:
+            popped = self.return_waypoints.pop(0)
+            remaining = len(self.return_waypoints)
+            self.get_logger().info(
+                f'[RETURN] Reached waypoint ({popped[0]:.2f}, {popped[1]:.2f}), '
+                f'{remaining} remaining')
+            return
+
+        # Drive toward the waypoint
+        bearing = np.arctan2(ty - by, tx - bx)
+        # Robot forward is +Y in odom when theta=pi/2, so actual heading
+        # for the "front" of the robot is theta - pi/2
+        actual_heading = btheta - np.pi / 2
+        heading_error = self._normalize_angle(bearing - actual_heading)
+
+        cmd = Twist()
+
+        # If heading error is large, rotate in place first
+        if abs(heading_error) > np.radians(30):
+            cmd.angular.z = float(np.clip(
+                self.RETURN_ANGULAR_GAIN * heading_error,
+                -self.RETURN_MAX_ANGULAR, self.RETURN_MAX_ANGULAR))
+        else:
+            cmd.linear.x = self.RETURN_LINEAR_SPEED
+            cmd.angular.z = float(np.clip(
+                self.RETURN_ANGULAR_GAIN * heading_error,
+                -self.RETURN_MAX_ANGULAR, self.RETURN_MAX_ANGULAR))
+
+        self.cmd_vel_pub.publish(cmd)
+
+        now = time.time()
+        if not hasattr(self, '_return_last_log') or now - self._return_last_log > 2.0:
+            self._return_last_log = now
+            self.get_logger().info(
+                f'[RETURN] Heading to ({tx:.2f},{ty:.2f}), '
+                f'dist={dist:.2f}m, err={np.degrees(heading_error):.0f}deg, '
+                f'{len(self.return_waypoints)} wp left')
+
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run(self):
@@ -1407,6 +1546,12 @@ class ExploreAndFind(Node):
                     self.object_world_pos is None):
                 self._check_for_object()
 
+            # Record breadcrumb waypoints while navigating
+            if self.state in (ExploreState.SCANNING,
+                              ExploreState.CENTERING,
+                              ExploreState.APPROACHING):
+                self._maybe_record_waypoint()
+
             if self.state == ExploreState.WAITING_FOR_COMMAND:
                 if self.command_queue:
                     self._start_next_command()
@@ -1420,6 +1565,8 @@ class ExploreAndFind(Node):
                 self._state_complete()
             elif self.state == ExploreState.GRASPING:
                 self._state_grasping()
+            elif self.state == ExploreState.RETURNING_HOME:
+                self._state_returning_home()
 
 
 def main(args=None):
