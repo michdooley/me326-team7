@@ -34,6 +34,7 @@ Usage:
 
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -43,9 +44,9 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 import tf2_ros
 
-from sensor_msgs.msg import Image, CameraInfo, JointState
+from sensor_msgs.msg import Image, CameraInfo, JointState, PointCloud2, PointField
 from vision_msgs.msg import Detection2DArray
-from geometry_msgs.msg import Pose, Quaternion
+from geometry_msgs.msg import Pose, Point, Quaternion
 from std_msgs.msg import Float64MultiArray
 from visualization_msgs.msg import Marker
 from std_msgs.msg import ColorRGBA
@@ -78,6 +79,61 @@ MAX_DEPTH_M = 2.0
 MIN_POINTS = 20
 TABLE_Z_MIN = 0.005
 OUTLIER_Z_THRESH = 0.05  # keep points within +/-5cm of median Z
+FLOOR_BIN_WIDTH = 0.003  # 3mm bins for floor detection histogram
+FLOOR_MARGIN = 0.008     # RANSAC inlier distance threshold for floor plane
+
+
+def _ransac_floor_separate(pts, distance_thresh=0.008, max_iterations=200,
+                            min_inlier_ratio=0.20, min_pts=20):
+    """RANSAC plane fit to find the dominant planar surface (floor/table).
+
+    Returns (floor_z, object_points).  floor_z is the median Z of inliers.
+    Works on tilted floors unlike a simple Z-histogram.
+    """
+    n = len(pts)
+    if n < min_pts:
+        return float(np.median(pts[:, 2])), pts
+
+    best_inlier_mask = None
+    best_count = 0
+
+    rng = np.random.default_rng(42)
+    for _ in range(max_iterations):
+        # Sample 3 random points
+        idx = rng.choice(n, 3, replace=False)
+        p0, p1, p2 = pts[idx]
+
+        # Fit plane: normal = (p1-p0) x (p2-p0)
+        v1 = p1 - p0
+        v2 = p2 - p0
+        normal = np.cross(v1, v2)
+        norm_len = np.linalg.norm(normal)
+        if norm_len < 1e-10:
+            continue
+        normal /= norm_len
+
+        # Distance from all points to the plane
+        dists = np.abs((pts - p0) @ normal)
+        inlier_mask = dists < distance_thresh
+        count = inlier_mask.sum()
+
+        if count > best_count:
+            best_count = count
+            best_inlier_mask = inlier_mask
+
+    if best_inlier_mask is None or best_count < min_inlier_ratio * n:
+        # No dominant plane found — fall back to Z-histogram style
+        return float(np.min(pts[:, 2])), pts
+
+    floor_z = float(np.median(pts[best_inlier_mask, 2]))
+    outlier_mask = ~best_inlier_mask
+
+    if outlier_mask.sum() < min_pts:
+        # Almost everything is floor — return all points
+        return floor_z, pts
+
+    return floor_z, pts[outlier_mask]
+
 
 # Real hardware: safe tucked position for arm return
 SLEEP_POSE = [0.0, -1.80, 1.55, 0.0, 0.8, 0.0]
@@ -102,6 +158,7 @@ class TopdownGraspDemo(Node):
         self.declare_parameter('z_offset', -0.02)
         self.declare_parameter('z_bias', 0.0)
         self.declare_parameter('bbox_pad', 1.3)
+        self.declare_parameter('save_snapshot', True)
         self.target_object = self.get_parameter('target').value
         self.arm_name = self.get_parameter('arm').value
         self.move_duration = self.get_parameter('duration').value
@@ -110,6 +167,7 @@ class TopdownGraspDemo(Node):
         self.z_offset = self.get_parameter('z_offset').value
         self.z_bias = self.get_parameter('z_bias').value
         self.bbox_pad = self.get_parameter('bbox_pad').value
+        self.save_snapshot = self.get_parameter('save_snapshot').value
 
         # TF2
         self.tf_buffer = tf2_ros.Buffer()
@@ -141,6 +199,7 @@ class TopdownGraspDemo(Node):
         self.arm_pub = self.create_publisher(
             ArmCommand, f'/{self.arm_name}_arm/cmd', 10)
         self.marker_pub = self.create_publisher(Marker, '/grasp_debug_markers', 10)
+        self.pc_pub = self.create_publisher(PointCloud2, '/grasp_debug/pointcloud', 10)
         self.marker_id = 0
 
         # Real hardware: JointGroupCommand publisher + joint state tracking
@@ -334,6 +393,64 @@ class TopdownGraspDemo(Node):
             m.text = label
         self.marker_pub.publish(m)
 
+    def publish_pointcloud(self, points):
+        """Publish (N,3) numpy array as PointCloud2 on /grasp_debug/pointcloud."""
+        pts = points.astype(np.float32)
+        msg = PointCloud2()
+        msg.header.frame_id = 'base_link'
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.height = 1
+        msg.width = len(pts)
+        msg.fields = [
+            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+        ]
+        msg.is_bigendian = False
+        msg.point_step = 12
+        msg.row_step = 12 * len(pts)
+        msg.data = pts.tobytes()
+        msg.is_dense = True
+        self.pc_pub.publish(msg)
+
+    def publish_grasp_marker(self, grasp_pose, grip_width, grasp_yaw):
+        """Publish LINE_LIST marker showing gripper finger positions at grasp."""
+        qw, qx, qy, qz = yaw_to_grasp_quaternion(grasp_yaw)
+        rot = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
+        center = np.array([grasp_pose.position.x,
+                           grasp_pose.position.y,
+                           grasp_pose.position.z])
+        # Finger axis is local Y
+        finger_dir = rot[:, 1]
+        half_w = grip_width / 2
+        finger_len = 0.04
+
+        m = Marker()
+        m.header.frame_id = 'base_link'
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = 'grasp_fingers'
+        m.id = self.marker_id
+        self.marker_id += 1
+        m.type = Marker.LINE_LIST
+        m.action = Marker.ADD
+        m.scale.x = 0.004  # line width
+        m.color = ColorRGBA(r=1.0, g=0.5, b=0.0, a=0.9)
+        m.lifetime.sec = 60
+
+        approach_dir = rot[:, 0]  # local X = approach
+        for sign in [1, -1]:
+            base = center + sign * (half_w + 0.003) * finger_dir
+            tip = base + finger_len * approach_dir
+            m.points.append(Point(x=float(base[0]), y=float(base[1]), z=float(base[2])))
+            m.points.append(Point(x=float(tip[0]), y=float(tip[1]), z=float(tip[2])))
+        # Palm connecting the two fingers
+        p1 = center + (half_w + 0.003) * finger_dir
+        p2 = center - (half_w + 0.003) * finger_dir
+        m.points.append(Point(x=float(p1[0]), y=float(p1[1]), z=float(p1[2])))
+        m.points.append(Point(x=float(p2[0]), y=float(p2[1]), z=float(p2[2])))
+
+        self.marker_pub.publish(m)
+
     # -- TF ----------------------------------------------------------------
 
     def _get_tf_matrix(self, target_frame, source_frame):
@@ -506,15 +623,16 @@ class TopdownGraspDemo(Node):
         On real hardware, uses depth camera intrinsics and depth optical frame.
         In simulation, uses RGB camera intrinsics (same virtual camera).
 
-        Returns (N, 3) numpy array or None.
+        Returns (obj_pts, floor_z, pts_base_raw) or (None, None, None).
         """
-        # Select intrinsics: depth on real hw, RGB (same camera) in sim
+        # On real hw: use depth intrinsics + depth optical frame (no alignment).
+        # In sim: depth and color share the same virtual camera.
         if not self.is_sim and self.depth_camera_info is not None:
             K = self.depth_camera_info.k
             tf_frame = 'camera_depth_optical_frame'
         else:
             if self.camera_info is None:
-                return None
+                return None, None, None
             K = self.camera_info.k
             tf_frame = 'camera_color_optical_frame'
 
@@ -534,7 +652,7 @@ class TopdownGraspDemo(Node):
         v = v_grid[mask].astype(np.float32)
 
         if len(z) < MIN_POINTS:
-            return None
+            return None, None, None
 
         # Pinhole back-projection to camera frame
         x_cam = (u - cx) * z / fx
@@ -544,7 +662,7 @@ class TopdownGraspDemo(Node):
         # Transform to base_link
         tf_mat = self._get_tf_matrix('base_link', tf_frame)
         if tf_mat is None:
-            return None
+            return None, None, None
 
         ones = np.ones((len(points_cam), 1), dtype=np.float32)
         pts_h = np.hstack([points_cam, ones])
@@ -560,50 +678,136 @@ class TopdownGraspDemo(Node):
             pts_base = pts_base[z_mask]
 
         if len(pts_base) < MIN_POINTS:
+            return None, None, None
+
+        # Separate floor/table surface from object points via Z histogram
+        floor_z, obj_pts = self._separate_floor(pts_base)
+
+        if len(obj_pts) < MIN_POINTS:
+            self.get_logger().warn(
+                f'  Floor filter removed too many points '
+                f'({len(pts_base)} -> {len(obj_pts)}), using all points')
+            return pts_base, floor_z, pts_base
+
+        return obj_pts, floor_z, pts_base
+
+    def _full_scene_to_points_base(self):
+        """Back-project the FULL depth image to base_link for TF debugging.
+
+        Same intrinsics + TF as _depth_roi_to_points_base but no cropping,
+        no TABLE_Z_MIN, no outlier filter, no RANSAC. Returns (N,3) or None.
+        """
+        if self.latest_depth is None:
             return None
 
-        return pts_base
+        if not self.is_sim and self.depth_camera_info is not None:
+            K = self.depth_camera_info.k
+            tf_frame = 'camera_depth_optical_frame'
+        else:
+            if self.camera_info is None:
+                return None
+            K = self.camera_info.k
+            tf_frame = 'camera_color_optical_frame'
+
+        fx, fy, cx, cy = K[0], K[4], K[2], K[5]
+        depth_m = self.latest_depth.astype(np.float32) / 1000.0
+        h, w = depth_m.shape
+
+        u_grid, v_grid = np.meshgrid(np.arange(w), np.arange(h))
+        mask = (depth_m > MIN_DEPTH_M) & (depth_m < MAX_DEPTH_M)
+        z = depth_m[mask]
+        u = u_grid[mask].astype(np.float32)
+        v = v_grid[mask].astype(np.float32)
+
+        if len(z) < MIN_POINTS:
+            return None
+
+        x_cam = (u - cx) * z / fx
+        y_cam = (v - cy) * z / fy
+        points_cam = np.stack([x_cam, y_cam, z], axis=1)
+
+        tf_mat = self._get_tf_matrix('base_link', tf_frame)
+        if tf_mat is None:
+            return None
+
+        ones = np.ones((len(points_cam), 1), dtype=np.float32)
+        pts_h = np.hstack([points_cam, ones])
+        return (tf_mat @ pts_h.T).T[:, :3]
+
+    def _separate_floor(self, pts_base):
+        """Detect the floor/table plane via RANSAC and separate object points.
+
+        Fits a plane to the largest planar surface (floor/table), then
+        returns (floor_z, object_points) where floor_z is the median Z
+        of inlier points and object_points are those above the plane.
+        """
+        floor_z, obj_pts = _ransac_floor_separate(
+            pts_base, distance_thresh=FLOOR_MARGIN, min_pts=MIN_POINTS)
+        return floor_z, obj_pts
 
     def _analyze_object(self, points_base):
-        """Analyze point cloud to find centroid, z_top, and optimal grasp angle.
+        """Analyze point cloud to find optimal grasp angle maximizing clearance.
 
-        Sweeps candidate yaw angles and picks the one that gives the
-        minimum grip width (narrowest cross-section through the centroid).
-        This directly finds the best grasp direction regardless of object shape.
+        For each candidate yaw angle, computes the object extent along the
+        finger axis and finds the optimal grasp center that maximizes the
+        minimum clearance between object and gripper fingers.
 
-        Returns dict with centroid, grasp_yaw, grip_width, max_width, z_top, num_points.
+        Returns dict with centroid, grasp_center, grasp_yaw, grip_width,
+        max_width, z_top, num_points, min_clearance.
         """
         centroid = np.mean(points_base, axis=0)
         z_top = float(np.max(points_base[:, 2]))
 
-        # Work in 2D (XY plane)
         pts_xy = points_base[:, :2]
         centered = pts_xy - centroid[:2]
 
-        # Sweep angles 0-180° (symmetric — 180° is same as 0° for parallel jaw)
         best_yaw = 0.0
-        min_width = float('inf')
+        best_clearance = -1.0
+        best_width = float('inf')
+        best_center_offset = 0.0  # offset along finger axis from centroid
         max_width = 0.0
+
         for angle_deg in range(0, 180, 5):
             angle = np.radians(angle_deg)
-            direction = np.array([np.cos(angle), np.sin(angle)])
-            projections = centered @ direction
-            width = float(np.ptp(projections))
-            if width < min_width:
-                min_width = width
-                best_yaw = angle
+            # Finger axis direction (perpendicular to the approach in XY)
+            finger_dir = np.array([np.cos(angle), np.sin(angle)])
+            projections = centered @ finger_dir
+            proj_min = float(projections.min())
+            proj_max = float(projections.max())
+            width = proj_max - proj_min
+
             if width > max_width:
                 max_width = width
 
+            # Optimal center: midpoint of extent (centers object in gripper)
+            center_offset = (proj_min + proj_max) / 2.0
+            # Min clearance when optimally centered
+            clearance = (GRIPPER_MAX_OPENING_M - width) / 2.0
+
+            if clearance > best_clearance:
+                best_clearance = clearance
+                best_yaw = angle
+                best_width = width
+                best_center_offset = center_offset
+
+        # Compute adjusted grasp center in world XY
+        finger_dir = np.array([np.cos(best_yaw), np.sin(best_yaw)])
+        grasp_center = centroid.copy()
+        grasp_center[0] += best_center_offset * finger_dir[0]
+        grasp_center[1] += best_center_offset * finger_dir[1]
+
         self.get_logger().info(
-            f'  Min-width sweep: best_yaw={np.degrees(best_yaw):.0f}deg, '
-            f'grip_width={min_width*1000:.0f}mm, '
-            f'max_width={max_width*1000:.0f}mm')
+            f'  Max-clearance sweep: best_yaw={np.degrees(best_yaw):.0f}deg, '
+            f'grip_width={best_width*1000:.0f}mm, '
+            f'clearance={best_clearance*1000:.1f}mm, '
+            f'center_offset={best_center_offset*1000:.1f}mm')
 
         return {
             'centroid': centroid,
+            'grasp_center': grasp_center,
             'grasp_yaw': best_yaw,
-            'grip_width': min_width,
+            'grip_width': best_width,
+            'min_clearance': best_clearance,
             'max_width': max_width,
             'z_top': z_top,
             'num_points': len(points_base),
@@ -614,7 +818,7 @@ class TopdownGraspDemo(Node):
 
         Returns (grasp_pose, pre_grasp_pose, info_str) or None.
         """
-        centroid = analysis['centroid']
+        grasp_center = analysis.get('grasp_center', analysis['centroid'])
         grasp_yaw = analysis['grasp_yaw']
         grip_width = analysis['grip_width']
 
@@ -632,19 +836,19 @@ class TopdownGraspDemo(Node):
         # Grasp orientation
         qw, qx, qy, qz = yaw_to_grasp_quaternion(grasp_yaw)
 
-        # Grasp position: centroid XY, slightly below top surface
+        # Grasp position: centered on object extent, slightly below top surface
         grasp_z = analysis['z_top'] + self.z_offset + self.z_bias
 
         grasp_pose = Pose()
-        grasp_pose.position.x = float(centroid[0])
-        grasp_pose.position.y = float(centroid[1])
+        grasp_pose.position.x = float(grasp_center[0])
+        grasp_pose.position.y = float(grasp_center[1])
         grasp_pose.position.z = float(grasp_z)
         grasp_pose.orientation = Quaternion(w=qw, x=qx, y=qy, z=qz)
 
         # Pre-grasp: same XY, higher Z
         pre_grasp_pose = Pose()
-        pre_grasp_pose.position.x = float(centroid[0])
-        pre_grasp_pose.position.y = float(centroid[1])
+        pre_grasp_pose.position.x = float(grasp_center[0])
+        pre_grasp_pose.position.y = float(grasp_center[1])
         pre_grasp_pose.position.z = float(grasp_z + self.pre_grasp_height)
         pre_grasp_pose.orientation = Quaternion(w=qw, x=qx, y=qy, z=qz)
 
@@ -714,10 +918,6 @@ class TopdownGraspDemo(Node):
         if self.latest_depth is None or self.camera_info is None:
             self.get_logger().error('No depth/camera_info received -- aborting')
             return False
-        if not self.is_sim and self.depth_camera_info is None:
-            self.get_logger().warn(
-                'No depth camera_info received -- '
-                'falling back to RGB intrinsics for back-projection')
 
         # -- Step 1: YOLO detection ----------------------------------------
         self.spin_for(1.0)  # let data flow
@@ -744,13 +944,13 @@ class TopdownGraspDemo(Node):
             f'bbox {bbox_w:.0f}x{bbox_h:.0f}')
 
         # -- Step 2: Depth point cloud from bbox ROI -----------------------
-        if not self.is_sim:
-            # Transform YOLO bbox from RGB pixel space to depth pixel space
+        # YOLO detects in RGB pixel space; depth is in its native frame
+        # (align_depth disabled), so transform bbox from RGB→depth pixels.
+        if not self.is_sim and self.depth_camera_info is not None:
             self.get_logger().info(
                 'Transforming bbox from RGB to depth pixel space...')
             u, v = self._rgb_pixel_to_depth_pixel(u, v)
             u, v = int(round(u)), int(round(v))
-            # Scale bbox size by focal length ratio (RGB→depth)
             K_rgb = np.array(self.camera_info.k).reshape(3, 3)
             K_depth = np.array(self.depth_camera_info.k).reshape(3, 3)
             scale_x = K_depth[0, 0] / K_rgb[0, 0]
@@ -769,13 +969,18 @@ class TopdownGraspDemo(Node):
             self.get_logger().error('Failed to crop depth image')
             return False
 
-        pts_base = self._depth_roi_to_points_base(depth_roi, u_off, v_off)
+        pts_base, floor_z, pts_base_raw = self._depth_roi_to_points_base(depth_roi, u_off, v_off)
         if pts_base is None:
             self.get_logger().error(
                 f'Insufficient points in depth ROI (need >= {MIN_POINTS})')
             return False
 
-        self.get_logger().info(f'  Point cloud: {len(pts_base)} points')
+        self.get_logger().info(f'  Point cloud: {len(pts_base)} points (raw: {len(pts_base_raw)})')
+        if floor_z is not None:
+            self.get_logger().info(f'  Floor Z: {floor_z:.3f}m')
+
+        # Publish point cloud to RViz
+        self.publish_pointcloud(pts_base)
 
         # -- Step 3: Analyze object (centroid + min-width grasp angle) ------
         self.get_logger().info('Analyzing object point cloud...')
@@ -807,6 +1012,36 @@ class TopdownGraspDemo(Node):
         self.publish_marker(
             pp.x, pp.y, pp.z,
             0.0, 0.0, 1.0, label='pre_grasp', scale=0.02)
+        self.publish_grasp_marker(
+            grasp_pose, analysis['grip_width'], analysis['grasp_yaw'])
+
+        # Save snapshot for offline visualization (after pose computation)
+        if self.save_snapshot:
+            snap_dir = Path.home() / '.tidybot_grasp_snapshots'
+            snap_dir.mkdir(exist_ok=True)
+            snap_path = snap_dir / f'{datetime.now().strftime("%Y-%m-%d_%H%M%S")}.npz'
+            gp = grasp_pose.position
+            go = grasp_pose.orientation
+            pp = pre_grasp_pose.position
+            po = pre_grasp_pose.orientation
+            save_kwargs = dict(
+                points_base=pts_base,
+                points_base_raw=pts_base_raw,
+                z_offset=self.z_offset,
+                z_bias=self.z_bias,
+                pre_grasp_height=self.pre_grasp_height,
+                target_object=self.target_object,
+                grasp_pose=np.array([gp.x, gp.y, gp.z, go.w, go.x, go.y, go.z]),
+                pre_grasp_pose=np.array([pp.x, pp.y, pp.z, po.w, po.x, po.y, po.z]),
+                grasp_yaw=analysis['grasp_yaw'],
+                grip_width=analysis['grip_width'])
+            if floor_z is not None:
+                save_kwargs['floor_z'] = floor_z
+            pts_full = self._full_scene_to_points_base()
+            if pts_full is not None:
+                save_kwargs['points_full_scene'] = pts_full
+            np.savez(str(snap_path), **save_kwargs)
+            self.get_logger().info(f'  Snapshot saved: {snap_path}')
 
         # -- Step 5: Workspace distance check + IK -------------------------
         # Warn early if the target is outside the arm's reach so the user
@@ -869,6 +1104,8 @@ class TopdownGraspDemo(Node):
             self.go_home()
             return False
 
+        self.get_logger().info('Opening gripper at pre-grasp')
+        self.set_gripper(0.0)
         self.get_logger().info('Settling at pre-grasp...')
         time.sleep(SETTLE_TIME)
 
