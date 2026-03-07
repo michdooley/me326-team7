@@ -48,7 +48,7 @@ class ObjectClassifier(Node):
         self.last_inference_time = now
 
         frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-        results = self.model(frame, classes=[0, 46, 47], conf=0.5, verbose=False)
+        results = self.model(frame, classes=[0, 46, 47], conf=0.02, verbose=False)
 
         # Initialize the array message
         detection_array = Detection2DArray()

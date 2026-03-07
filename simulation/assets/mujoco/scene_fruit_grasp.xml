@@ -48,4 +48,17 @@
         material="banana_mat" friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
     </body>
   </worldbody>
+
+  <keyframe>
+    <!-- qpos: robot (21) + 3 fruit freejoints (7 each) = 42 total -->
+    <key name="scene_home"
+      qpos="0 0 1.5708
+        0 0.7854
+        0 0 0 0 0 0 0.037 0.037
+        0 0 0 0 0 0 0.037 0.037
+        0.45 -0.10 0.04 1 0 0 0
+        0.50  0.00 0.04 1 0 0 0
+        0.42  0.08 0.025 1 0 0 0"
+      ctrl="0 0 1.5708 0 0.7854 0 0 0 0 0 0 0.037 0.037 0 0 0 0 0 0 0.037 0.037"/>
+  </keyframe>
 </mujoco>
