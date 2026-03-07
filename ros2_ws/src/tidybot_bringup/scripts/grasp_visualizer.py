@@ -221,15 +221,15 @@ def create_wx250s_gripper_mesh(
     The gripper approaches from above (fingers-down) with finger axis
     rotated by `yaw` in the XY plane.
 
-    yaw_to_grasp_quaternion EE frame convention:
-        local X -> approach direction (maps to world -Z, i.e. downward)
-        local Y -> finger axis (maps to world yaw direction)
-        local Z -> wrist up (maps to world perpendicular)
+    yaw_to_grasp_quaternion maps (via 180° about X then yaw about Z):
+        local X -> world X (then rotated by yaw)
+        local Y -> world -Y (then rotated by yaw)
+        local Z -> world -Z (downward = approach direction)
 
-    So we build the mesh with:
-        - fingers spread along local Y (at ±half_w)
-        - fingers extend along local +X (approach/closing direction)
-        - stem extends along local -X (away from object)
+    So we build the mesh in the EE frame with:
+        - fingers spread along local X (at ±half_w)
+        - fingers extend along local -Z (approach/closing direction, downward)
+        - stem extends along local +Z (away from object, upward)
     """
     finger_length = 0.04
     finger_thickness = 0.006
@@ -238,21 +238,21 @@ def create_wx250s_gripper_mesh(
 
     half_w = width / 2
 
-    # Left finger — offset along +Y, extends along +X
-    lf = trimesh.creation.box([finger_length, finger_thickness, finger_thickness])
-    lf.apply_translation([finger_length / 2, half_w + finger_thickness / 2, 0])
+    # Left finger — offset along +X, extends along +Z (maps to world -Z after rotation)
+    lf = trimesh.creation.box([finger_thickness, finger_thickness, finger_length])
+    lf.apply_translation([half_w + finger_thickness / 2, 0, finger_length / 2])
 
-    # Right finger — offset along -Y, extends along +X
-    rf = trimesh.creation.box([finger_length, finger_thickness, finger_thickness])
-    rf.apply_translation([finger_length / 2, -(half_w + finger_thickness / 2), 0])
+    # Right finger — offset along -X, extends along +Z
+    rf = trimesh.creation.box([finger_thickness, finger_thickness, finger_length])
+    rf.apply_translation([-(half_w + finger_thickness / 2), 0, finger_length / 2])
 
-    # Palm — connects fingers, along Y at X=0
-    palm = trimesh.creation.box([palm_thickness, width + 2 * finger_thickness, finger_thickness])
+    # Palm — connects fingers, along X at Z=0
+    palm = trimesh.creation.box([width + 2 * finger_thickness, finger_thickness, palm_thickness])
     palm.apply_translation([0, 0, 0])
 
-    # Stem — extends along -X (away from grasp point)
-    stem = trimesh.creation.box([stem_length, finger_thickness, finger_thickness])
-    stem.apply_translation([-stem_length / 2, 0, 0])
+    # Stem — extends along -Z (maps to world +Z after rotation, away from object)
+    stem = trimesh.creation.box([finger_thickness, finger_thickness, stem_length])
+    stem.apply_translation([0, 0, -stem_length / 2])
 
     gripper = trimesh.util.concatenate([lf, rf, palm, stem])
 
