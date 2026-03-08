@@ -37,7 +37,9 @@ To manually publish a voice command instead of using the mic (terminal 3):
     ros2 topic pub --once /target_object std_msgs/msg/String "data: 'banana'"
 """
 
+import os
 import time
+from datetime import datetime
 from collections import deque
 from enum import Enum
 
@@ -167,13 +169,14 @@ class ExploreAndFind(Node):
     MAX_SCAN_ATTEMPTS = 3
 
     # ── Centering ───────────────────────────────────────────────────────────
-    CENTER_PIXEL_THRESH = 40    # px — how close to image center is "centered"
+    CENTER_PIXEL_THRESH = 80    # px — how close to image center is "centered"
     CENTER_PIXEL_THRESH_V = 60  # px — vertical threshold (more lenient)
-    CENTER_ANGULAR_VEL  = 0.25  # rad/s
-    CENTER_TILT_STEP    = 0.05  # rad — camera tilt adjustment per tick
+    CENTER_ANGULAR_VEL  = 0.25  # rad/s — keep gentle to avoid overshoot
+    CENTER_TILT_STEP    = 0.02  # rad — camera tilt adjustment per tick (slowed)
     CENTER_TIMEOUT      = 15.0  # s
 
     # ── Object detection ──────────────────────────────────────────────────────
+    MIN_CONFIDENCE     = 0.25  # YOLO confidence threshold
     MIN_DETECTION_AREA = 50    # px²
     APPROACH_DIST      = 0.35  # m — stop before reaching the object
     DETECT_WINDOW      = 2.0   # s
@@ -198,9 +201,9 @@ class ExploreAndFind(Node):
     GRASP_MOVE_DURATION          = 2.0
     GRASP_PRE_HEIGHT             = 0.10
     GRASP_LIFT_HEIGHT            = 0.15
-    GRASP_Z_OFFSET               = -0.01   # m — vertical offset from z_top (+ = higher)
-    GRASP_X_OFFSET               = 0.0    # m — offset along base_link X (+ = forward)
-    GRASP_Y_OFFSET               = 0.0    # m — offset along base_link Y (+ = left)
+    GRASP_Z_OFFSET               = 0.00   # m — vertical offset from z_top (+ = higher)
+    GRASP_X_OFFSET               = -0.05    # m — offset along base_link X (+ = forward)
+    GRASP_Y_OFFSET               = -0.05    # m — offset along base_link Y (+ = left)
     GRASP_BBOX_PAD               = 1.3
     GRASP_SETTLE_TIME            = 1.0
     GRASP_GRIPPER_CLOSE_REPEATS  = 20
@@ -210,6 +213,12 @@ class ExploreAndFind(Node):
     GRASP_MIN_POINTS             = 20
     GRASP_TABLE_Z_MIN            = 0.005
     GRASP_OUTLIER_Z_THRESH       = 0.05
+
+    # ── Sweet spot (update after running map_arm_workspace.py) ──────────────
+    GRASP_SWEET_SPOT_X      = 0.04   # m — ideal object X in base_link (from workspace map)
+    GRASP_SWEET_SPOT_Y      = -0.26  # m — ideal object Y in base_link (from workspace map)
+    GRASP_SWEET_SPOT_RADIUS = 0.12   # m — large; workspace map shows wide reachable zone
+    GRASP_NUDGE_SPEED       = 0.04   # m/s — gentle base speed during nudge
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -273,8 +282,10 @@ class ExploreAndFind(Node):
         sensor_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
         self.create_subscription(Image,      '/camera/depth/image_raw',
                                  self._depth_cb,       sensor_qos)
-        self.create_subscription(CameraInfo, '/camera/depth/camera_info',
+        self.create_subscription(CameraInfo, '/camera/color/camera_info',
                                  self._camera_info_cb, sensor_qos)
+        self.create_subscription(Image,      '/camera/rgb/image_raw',
+                                 self._rgb_cb,         sensor_qos)
 
         yolo_qos = QoSProfile(
             depth=1, reliability=ReliabilityPolicy.RELIABLE)
@@ -291,6 +302,12 @@ class ExploreAndFind(Node):
             String, '/user_command', self._user_command_cb, voice_qos)
         self.create_subscription(
             String, '/target_object', self._target_object_cb, voice_qos)
+
+        # Safe-stop listener
+        self._safe_stop_requested = False
+        self.create_subscription(
+            String, '/safe_stop', self._safe_stop_cb,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
 
         # If skip_voice, queue the hardcoded command immediately
         if self.skip_voice:
@@ -341,6 +358,12 @@ class ExploreAndFind(Node):
         self.latest_depth       = depth
         self.latest_depth_stamp = msg.header.stamp
 
+    def _rgb_cb(self, msg: Image):
+        try:
+            self.latest_rgb = self.cv_bridge.imgmsg_to_cv2(msg, 'bgr8')
+        except Exception:
+            pass
+
     def _camera_info_cb(self, msg: CameraInfo):
         self.camera_K = np.array(msg.k).reshape(3, 3)
 
@@ -378,8 +401,9 @@ class ExploreAndFind(Node):
         for detection in msg.detections:
             if not detection.results:
                 continue
-            class_id = int(detection.results[0].hypothesis.class_id)
-            if class_id == self.target_class_id:
+            hyp = detection.results[0].hypothesis
+            class_id = int(hyp.class_id)
+            if class_id == self.target_class_id and hyp.score >= self.MIN_CONFIDENCE:
                 self.latest_yolo_detection = detection
                 return
 
@@ -631,7 +655,7 @@ class ExploreAndFind(Node):
 
         try:
             tf_bc = self.tf_buffer.lookup_transform(
-                'base_link', 'camera_depth_optical_frame',
+                'base_link', 'camera_color_optical_frame',
                 rclpy.time.Time(), timeout=Duration(seconds=0.1))
         except Exception:
             return None
@@ -684,7 +708,9 @@ class ExploreAndFind(Node):
         self.current_tilt = float(np.clip(tilt, 0.0, 0.9))
         pt_msg = Float64MultiArray()
         pt_msg.data = [0.0, self.current_tilt]
-        self.pan_tilt_pub.publish(pt_msg)
+        for _ in range(5):
+            self.pan_tilt_pub.publish(pt_msg)
+            rclpy.spin_once(self, timeout_sec=0.02)
 
     # ── State machine ─────────────────────────────────────────────────────────
 
@@ -693,6 +719,7 @@ class ExploreAndFind(Node):
         self.scan_last_heading = None
         self.scan_settle_start = None
         self.scan_attempt_count += 1
+        self._set_camera_tilt(0.3)  # reset tilt so camera can see during scan
         self.state = ExploreState.SCANNING
         self.get_logger().info(
             f'[SCAN] Starting 360 rotation scan '
@@ -700,6 +727,43 @@ class ExploreAndFind(Node):
 
     def _stop_base(self):
         self.cmd_vel_pub.publish(Twist())
+
+    def _safe_stop_cb(self, msg):
+        self.get_logger().warn('[SAFE STOP] Received safe_stop signal!')
+        self._safe_stop_requested = True
+
+    def _execute_safe_shutdown(self):
+        """Stop all motion and return robot to safe home position."""
+        self.get_logger().warn('[SAFE STOP] Executing safe shutdown...')
+
+        # Stop the base
+        for _ in range(10):
+            self.cmd_vel_pub.publish(Twist())
+            time.sleep(0.05)
+
+        # Open gripper
+        grip_msg = Float64MultiArray()
+        grip_msg.data = [0.0]
+        for _ in range(10):
+            self.gripper_pub.publish(grip_msg)
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+        # Return arm to home
+        arm_msg = ArmCommand()
+        arm_msg.joint_positions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        arm_msg.duration = 3.0
+        self.arm_pub.publish(arm_msg)
+
+        # Reset camera tilt to neutral
+        self._set_camera_tilt(0.3)
+
+        # Wait for arm to finish, keep spinning so commands are sent
+        t0 = time.time()
+        while time.time() - t0 < 3.5:
+            self.cmd_vel_pub.publish(Twist())
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        self.get_logger().warn('[SAFE STOP] Shutdown complete.')
 
     def _state_scanning(self):
         # Early exit: object spotted mid-scan — stop and center immediately
@@ -755,9 +819,15 @@ class ExploreAndFind(Node):
 
         if now - self.center_start_time > self.CENTER_TIMEOUT:
             self._stop_base()
-            self.get_logger().warn(
-                '[CENTER] Timeout — re-scanning.')
-            self._start_scan()
+            if self.object_world_pos is not None:
+                self.get_logger().warn(
+                    '[CENTER] Timeout — object known, approaching anyway.')
+                self.approach_start_time = time.time()
+                self.state = ExploreState.APPROACHING
+            else:
+                self.get_logger().warn(
+                    '[CENTER] Timeout — re-scanning.')
+                self._start_scan()
             return
 
         pose = self.get_base_pose()
@@ -815,7 +885,7 @@ class ExploreAndFind(Node):
             if not h_centered:
                 cmd = Twist()
                 frac = min(abs(offset_x) / (img_w / 2.0), 1.0)
-                speed = self.CENTER_ANGULAR_VEL * (0.4 + 0.6 * frac)
+                speed = self.CENTER_ANGULAR_VEL * (0.2 + 0.8 * frac * frac)
                 cmd.angular.z = -speed if offset_x > 0 else speed
                 self.cmd_vel_pub.publish(cmd)
 
@@ -836,7 +906,7 @@ class ExploreAndFind(Node):
                             '[CENTER] No world pos yet, waiting for YOLO...')
                     return
                 self._stop_base()
-                self.get_logger().warn('[CENTER] Lost object, re-scanning.')
+                self.get_logger().warn('[CENTER] Lost object — re-scanning.')
                 self._start_scan()
                 return
 
@@ -1039,8 +1109,11 @@ class ExploreAndFind(Node):
         self._grasp_go_home()
         self._start_next_command()
 
-    def _grasp_attempt(self):
+    def _grasp_attempt(self, _nudge_done=False):
         """Single grasp attempt. Returns True on success, False on failure."""
+        # Save a snapshot for debugging
+        self._save_grasp_snapshot()
+
         # Keep current camera pose and look for the object
         self.get_logger().info(
             f'[GRASP] Looking for object at current tilt={self.current_tilt:.2f}...')
@@ -1136,20 +1209,39 @@ class ExploreAndFind(Node):
         grasp_pose, pre_grasp_pose, info = result
         self.get_logger().info(f'[GRASP] Params: {info}')
 
+        # Nudge robot if object is outside the arm's sweet spot
+        if not _nudge_done:
+            grasp_x = float(grasp_pose.position.x)
+            grasp_y = float(grasp_pose.position.y)
+            if self._grasp_reposition_for_sweet_spot(grasp_x, grasp_y):
+                self.get_logger().info(
+                    '[GRASP] Re-detecting after nudge...')
+                return self._grasp_attempt(_nudge_done=True)
+
         use_orientation = True
         ok, msg = self._grasp_try_ik(grasp_pose, use_orientation=True)
         if not ok:
             self.get_logger().warn(
                 f'[GRASP] IK with orientation failed: {msg}')
-            self.get_logger().info(
-                '[GRASP] Trying position-only IK...')
-            ok, msg = self._grasp_try_ik(
-                grasp_pose, use_orientation=False)
-            if ok:
-                use_orientation = False
-            else:
+            # Try alternative yaw orientations before falling back to
+            # position-only IK (which causes arm twisting)
+            grasp_yaw = analysis['grasp_yaw']
+            alt_found = False
+            for alt_yaw_offset in [np.pi/2, -np.pi/2, np.pi]:
+                alt_yaw = grasp_yaw + alt_yaw_offset
+                qw, qx, qy, qz = yaw_to_grasp_quaternion(alt_yaw)
+                alt_quat = Quaternion(w=qw, x=qx, y=qy, z=qz)
+                grasp_pose.orientation = alt_quat
+                pre_grasp_pose.orientation = alt_quat
+                ok2, msg2 = self._grasp_try_ik(grasp_pose, use_orientation=True)
+                if ok2:
+                    self.get_logger().info(
+                        f'[GRASP] Alt yaw {np.degrees(alt_yaw_offset):.0f}deg offset works!')
+                    alt_found = True
+                    break
+            if not alt_found:
                 self.get_logger().error(
-                    f'[GRASP] Position-only IK also failed: {msg}')
+                    '[GRASP] All orientations failed — object may be unreachable')
                 return False
 
         self.get_logger().info('[GRASP] Opening gripper')
@@ -1157,7 +1249,8 @@ class ExploreAndFind(Node):
 
         self.get_logger().info('[GRASP] Moving to pre-grasp')
         if not self._grasp_plan_and_execute(
-                pre_grasp_pose, 'pre-grasp', use_orientation):
+                pre_grasp_pose, 'pre-grasp', use_orientation,
+                keep_gripper_open=True):
             self.get_logger().error('[GRASP] Pre-grasp failed')
             return False
 
@@ -1167,7 +1260,8 @@ class ExploreAndFind(Node):
 
         self.get_logger().info('[GRASP] Descending to grasp')
         if not self._grasp_plan_and_execute(
-                grasp_pose, 'grasp', use_orientation):
+                grasp_pose, 'grasp', use_orientation,
+                keep_gripper_open=True):
             self.get_logger().error('[GRASP] Descent failed')
             return False
 
@@ -1204,14 +1298,82 @@ class ExploreAndFind(Node):
                     '[GRASP] Trophy pose failed, staying at lift height')
 
         self.get_logger().info('=' * 55)
-        self.get_logger().info('[GRASP] Grasp complete — holding object up!')
-        self.get_logger().info('[GRASP] Transitioning to RETURNING_HOME...')
+        self.get_logger().info('[GRASP] Grasp complete — holding object!')
+        self.get_logger().info('[GRASP] Say "drop" to release.')
         self.get_logger().info('=' * 55)
 
-        self._start_returning_home()
+        self._grasp_retract_holding()
+        self._drop_pending = False
+        self.state = ExploreState.WAITING_FOR_DROP
         return True
 
     # ── Grasp helper methods ─────────────────────────────────────────────────
+
+    def _save_grasp_snapshot(self):
+        """Save current RGB frame as a timestamped snapshot for debugging."""
+        # Spin to process any pending image messages
+        self._grasp_spin_for(0.3)
+        if self.latest_rgb is None:
+            self.get_logger().warn('[GRASP] No RGB image available for snapshot')
+            return
+        snap_dir = os.path.expanduser('~/grasp_snapshots')
+        os.makedirs(snap_dir, exist_ok=True)
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        path = os.path.join(snap_dir, f'grasp_{stamp}.jpg')
+        import cv2
+        cv2.imwrite(path, self.latest_rgb)
+        self.get_logger().info(f'[GRASP] Snapshot saved: {path}')
+
+    def _grasp_reposition_for_sweet_spot(self, obj_x, obj_y):
+        """Nudge the base so the object lands in the arm's sweet spot.
+
+        Uses rotation to shift the object laterally in base_link frame,
+        and small forward/backward motion for X corrections.
+        Returns True if a nudge was executed (caller should re-detect),
+        False if already close enough.
+        """
+        dx = obj_x - self.GRASP_SWEET_SPOT_X
+        dy = obj_y - self.GRASP_SWEET_SPOT_Y
+        dist = np.hypot(dx, dy)
+
+        if dist <= self.GRASP_SWEET_SPOT_RADIUS:
+            self.get_logger().info(
+                f'[GRASP] Object at ({obj_x:.3f}, {obj_y:.3f}) '
+                f'is within sweet spot (dist={dist:.3f}m)')
+            return False
+
+        self.get_logger().info(
+            f'[GRASP] Object at ({obj_x:.3f}, {obj_y:.3f}) '
+            f'is {dist:.3f}m from sweet spot '
+            f'({self.GRASP_SWEET_SPOT_X:.3f}, {self.GRASP_SWEET_SPOT_Y:.3f})')
+
+        # Rotate to shift object laterally in base_link frame.
+        # Positive angular.z = CCW rotation = object moves toward -Y in base_link.
+        # dy > 0 means object is too far left (too positive Y) → rotate CW (negative angular.z)
+        # dy < 0 means object is too far right → rotate CCW (positive angular.z)
+        cmd = Twist()
+        drive_time = 1.0  # short, gentle correction
+
+        # Lateral correction via rotation (primary)
+        if abs(dy) > 0.03:
+            cmd.angular.z = float(np.clip(-dy * 0.8, -0.15, 0.15))
+
+        # Forward/backward correction (secondary, gentle)
+        if abs(dx) > 0.03:
+            cmd.linear.x = float(np.clip(dx * 0.5, -0.05, 0.05))
+
+        self.get_logger().info(
+            f'[GRASP] Nudging: vx={cmd.linear.x:.3f}, '
+            f'wz={cmd.angular.z:.3f} for {drive_time:.1f}s')
+
+        deadline = time.time() + drive_time
+        while time.time() < deadline and rclpy.ok():
+            self.cmd_vel_pub.publish(cmd)
+            rclpy.spin_once(self, timeout_sec=0.05)
+        self._stop_base()
+        self._grasp_spin_for(0.5)
+
+        return True
 
     def _grasp_spin_for(self, seconds):
         deadline = time.time() + seconds
@@ -1327,7 +1489,7 @@ class ExploreAndFind(Node):
         points_cam = np.stack([x_cam, y_cam, z], axis=1)
 
         tf_mat = self._grasp_get_tf_matrix(
-            'base_link', 'camera_depth_optical_frame')
+            'base_link', 'camera_color_optical_frame')
         if tf_mat is None:
             return None
 
@@ -1471,7 +1633,7 @@ class ExploreAndFind(Node):
         req.use_orientation = use_orientation
         req.execute = False
         req.duration = self.GRASP_MOVE_DURATION
-        req.max_condition_number = 200.0
+        req.max_condition_number = 500.0
 
         future = self.plan_client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
@@ -1482,14 +1644,15 @@ class ExploreAndFind(Node):
         result = future.result()
         return result.success, result.message
 
-    def _grasp_plan_and_execute(self, pose, label, use_orientation=True):
+    def _grasp_plan_and_execute(self, pose, label, use_orientation=True,
+                               keep_gripper_open=False):
         req = PlanToTarget.Request()
         req.arm_name = self.GRASP_ARM_NAME
         req.target_pose = pose
         req.use_orientation = use_orientation
         req.execute = True
         req.duration = self.GRASP_MOVE_DURATION
-        req.max_condition_number = 100.0
+        req.max_condition_number = 500.0
 
         self.get_logger().info(
             f'  [{label}] Planning + executing...')
@@ -1505,7 +1668,17 @@ class ExploreAndFind(Node):
         result = future.result()
         if result.success:
             if result.executed:
-                time.sleep(self.GRASP_MOVE_DURATION + 0.5)
+                # While waiting for the arm to move, keep gripper open
+                # to prevent it from drifting back to its neutral (half-closed) state
+                if keep_gripper_open:
+                    grip_msg = Float64MultiArray()
+                    grip_msg.data = [0.0]
+                    deadline = time.time() + self.GRASP_MOVE_DURATION + 0.5
+                    while time.time() < deadline:
+                        self.gripper_pub.publish(grip_msg)
+                        rclpy.spin_once(self, timeout_sec=0.1)
+                else:
+                    time.sleep(self.GRASP_MOVE_DURATION + 0.5)
             return True
 
         self.get_logger().warn(
@@ -1632,7 +1805,7 @@ class ExploreAndFind(Node):
             if self.latest_depth is not None and self.camera_K is not None:
                 try:
                     self.tf_buffer.lookup_transform(
-                        'odom', 'camera_depth_optical_frame',
+                        'odom', 'camera_color_optical_frame',
                         rclpy.time.Time(), timeout=Duration(seconds=0.1))
                     break
                 except Exception:
@@ -1651,6 +1824,11 @@ class ExploreAndFind(Node):
             while time.time() < deadline:
                 rclpy.spin_once(self, timeout_sec=0)
                 time.sleep(0.002)
+
+            # Check for safe-stop signal
+            if self._safe_stop_requested:
+                self._execute_safe_shutdown()
+                return
 
             # Object detection runs during scanning
             if (self.state == ExploreState.SCANNING and
@@ -1688,7 +1866,11 @@ def main(args=None):
     try:
         node.run()
     except KeyboardInterrupt:
-        pass
+        node.get_logger().warn('KeyboardInterrupt — executing safe shutdown...')
+        try:
+            node._execute_safe_shutdown()
+        except Exception as e:
+            node.get_logger().error(f'Error during safe shutdown: {e}')
     finally:
         node.destroy_node()
         rclpy.shutdown()

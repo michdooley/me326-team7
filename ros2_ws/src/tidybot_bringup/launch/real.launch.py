@@ -234,7 +234,7 @@ def launch_setup(context, *args, **kwargs):
                 'publish_tf': True,
                 'rgb_camera.color_profile': '640x480x15',
                 'depth_module.depth_profile': '640x480x15',
-                'align_depth.enable': False,
+                'align_depth.enable': True,
             }],
             remappings=[
                 ('/camera/realsense/color/image_raw', '/camera/color/image_raw'),

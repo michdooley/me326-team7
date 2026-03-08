@@ -51,6 +51,9 @@ install(PROGRAMS
   scripts/objective1_task.py
   # scripts/test_grasp_validation.py
   scripts/grasp_and_verify_demo.py
+  scripts/safe_stop.py
+  scripts/map_arm_workspace.py
+  scripts/test_grasp_calibration.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
