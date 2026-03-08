@@ -454,35 +454,49 @@ class ExploreAndFind(Node):
     # Drop/release action keywords that trigger the drop behavior
     DROP_ACTIONS = {'drop', 'release', 'let go', 'put down', 'place'}
 
+    def _accepting_voice(self):
+        """True when voice commands should be accepted (even in skip_voice mode)."""
+        return (not self.skip_voice or
+                self.state in (ExploreState.WAITING_FOR_COMMAND,
+                               ExploreState.WAITING_FOR_DROP))
+
     def _user_command_cb(self, msg: String):
         action = msg.data.strip().lower()
         if not action:
             return
 
-        # Always accept drop commands (even in skip_voice mode)
+        # In WAITING_FOR_DROP: check for drop commands
         if self.state == ExploreState.WAITING_FOR_DROP:
             if any(kw in action for kw in self.DROP_ACTIONS):
                 self.get_logger().info(f'[VOICE] Drop command received: "{action}"')
                 self._drop_pending = True
                 return
+            # Non-drop action (e.g. "get") — store it, let target_object complete it
+            self._last_voice_action = action
+            self.get_logger().info(f'[VOICE] Action received (while holding): {action}')
+            return
 
-        if self.skip_voice:
+        if not self._accepting_voice():
             return
         self._last_voice_action = action
         self.get_logger().info(f'[VOICE] Action received: {action}')
 
     def _target_object_cb(self, msg: String):
-        # During WAITING_FOR_DROP, also check target_object messages for drop keywords
-        # (Gemini may publish action on /user_command and object on /target_object)
-        if self.state == ExploreState.WAITING_FOR_DROP:
-            # The _user_command_cb handles the trigger; just consume silently
-            return
-
-        if self.skip_voice:
+        if not self._accepting_voice():
             return
         obj = msg.data.strip().lower()
         if not obj:
             return
+
+        # If waiting for drop but got a new task command, release and re-task
+        if self.state == ExploreState.WAITING_FOR_DROP:
+            self.get_logger().info(
+                f'[VOICE] New task while holding — releasing first')
+            self._grasp_set_gripper(0.0)
+            self._grasp_spin_for(1.0)
+            self._grasp_go_home(duration=3.0)
+            self.state = ExploreState.WAITING_FOR_COMMAND
+
         action = self._last_voice_action
         self.command_queue.append((action, obj))
         self.get_logger().info(f'[VOICE] Queued command: {action} {obj}')
@@ -518,16 +532,55 @@ class ExploreAndFind(Node):
                 f'[NAV] Start pose recorded: '
                 f'({self.start_pose[0]:.2f}, {self.start_pose[1]:.2f})')
 
-        # Tilt camera down so it can see the ground/objects ahead
-        self.current_tilt = 0.3
-        pt_msg = Float64MultiArray()
-        pt_msg.data = [0.0, self.current_tilt]
-        self.pan_tilt_pub.publish(pt_msg)
-
         self.get_logger().info('=' * 55)
         self.get_logger().info(
             f'NEW COMMAND: {action} {obj_name} (YOLO class {class_id})')
         self.get_logger().info('=' * 55)
+
+        # Tilt camera 45 degrees down and check if object is already visible
+        self.get_logger().info(
+            '[CMD] Tilting camera to 45deg and checking for object...')
+        self._set_camera_tilt(0.7854)
+        self._grasp_spin_for(1.0)  # let camera physically settle
+
+        # Poll YOLO for up to 3 seconds (classifier runs at ~1 Hz)
+        # Use a simpler check: just look for any matching YOLO detection,
+        # don't require depth position estimation (which can fail).
+        self.latest_yolo_detection = None
+        found = False
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            self._grasp_spin_for(0.2)
+            det = self.latest_yolo_detection
+            if det is not None:
+                self.latest_yolo_detection = None
+                u = int(det.bbox.center.position.x)
+                v = int(det.bbox.center.position.y)
+                self.get_logger().info(
+                    f'[CMD] YOLO detection at pixel ({u}, {v})')
+                # Try to get world position; proceed even if it fails
+                pos = self._estimate_object_position(u, v)
+                if pos is not None:
+                    self.object_world_pos = pos
+                    self.last_detection_pos = pos
+                    self.get_logger().info(
+                        f'[CMD] Object at ({pos[0]:.2f}, {pos[1]:.2f})')
+                else:
+                    self.get_logger().info(
+                        '[CMD] Depth estimate failed but YOLO sees it')
+                found = True
+                break
+
+        if found:
+            self.get_logger().info(
+                '[CMD] Object already visible — skipping scan!')
+            self._start_centering()
+            return
+
+        # Not visible — tilt back up for scanning and proceed
+        self.get_logger().info(
+            '[CMD] Object not visible — starting scan')
+        self._set_camera_tilt(0.3)
         self.scan_attempt_count = 0
         self._start_scan()
 
@@ -774,6 +827,14 @@ class ExploreAndFind(Node):
         else:
             # ── No YOLO detection: rotate toward known world position ─
             if self.object_world_pos is None:
+                # Give YOLO a chance — only bail if we've been waiting a while
+                elapsed = now - self.center_start_time
+                if elapsed < 3.0:
+                    if not hasattr(self, '_center_last_log') or now - self._center_last_log > 1.0:
+                        self._center_last_log = now
+                        self.get_logger().info(
+                            '[CENTER] No world pos yet, waiting for YOLO...')
+                    return
                 self._stop_base()
                 self.get_logger().warn('[CENTER] Lost object, re-scanning.')
                 self._start_scan()
@@ -924,11 +985,11 @@ class ExploreAndFind(Node):
             self.get_logger().info(
                 f'FOUND {name} at ({ox:.2f}, {oy:.2f})')
         else:
-            self.get_logger().info(f'{name} NOT FOUND')
+            self.get_logger().info(
+                f'{name} reached (no world pos, but close enough)')
         self.get_logger().info('=' * 55)
 
-        if (self.current_action == 'get' and
-                self.object_world_pos is not None):
+        if self.current_action == 'get':
             self.get_logger().info(
                 '[COMPLETE] Action is "get" — transitioning to GRASPING')
             self.state = ExploreState.GRASPING
