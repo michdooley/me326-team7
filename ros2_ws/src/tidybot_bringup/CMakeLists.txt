@@ -58,6 +58,7 @@ install(PROGRAMS
   scripts/test_grasp_calibration.py
   scripts/ik_workspace_scan.py
   scripts/grasp_calibration_test.py
+  scripts/cube_calibration_test.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

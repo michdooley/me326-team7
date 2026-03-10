@@ -162,7 +162,7 @@ def _ransac_floor_separate(pts, distance_thresh=0.008, max_iterations=200,
 class PickAndPlace(Node):
 
     # ── Depth filtering ───────────────────────────────────────────────────────
-    MIN_DEPTH_M       = 0.40
+    MIN_DEPTH_M       = 0.15
     MAX_DEPTH_M       = 5.00
 
     # ── 360 scan ─────────────────────────────────────────────────────────────
@@ -200,8 +200,8 @@ class PickAndPlace(Node):
     GRASP_PRE_HEIGHT             = 0.10
     GRASP_LIFT_HEIGHT            = 0.15
     GRASP_Z_OFFSET               = 0.00
-    GRASP_X_OFFSET               = -0.05
-    GRASP_Y_OFFSET               = -0.05
+    GRASP_X_OFFSET               = -0.00
+    GRASP_Y_OFFSET               = -0.00
     GRASP_BBOX_PAD               = 1.3
     GRASP_SETTLE_TIME            = 1.0
     GRASP_GRIPPER_CLOSE_REPEATS  = 20
@@ -223,6 +223,7 @@ class PickAndPlace(Node):
     BIN_HEIGHT          = 0.3048   # 12 inches
     BIN_HALF_HEIGHT     = 0.1524
     DROP_HEIGHT_ABOVE   = 0.10     # m above bin top edge
+    BIN_DEPTH_OFFSET    = 0.07     # m — offset past the tag into bin center (~2.75 inches)
     BIN_SWEET_SPOT_X    = 0.04
     BIN_SWEET_SPOT_Y    = -0.26
     BIN_SWEET_SPOT_RADIUS = 0.15
@@ -517,11 +518,17 @@ class PickAndPlace(Node):
         patch = depth[v_lo:v_hi, u_lo:u_hi].astype(np.float64)
         valid = patch[patch > 0]
         if len(valid) == 0:
+            self.get_logger().warn(
+                f'[DEPTH] No valid depth at pixel ({u},{v}), '
+                f'patch shape={patch.shape}, depth img shape={depth.shape}')
             return None
         depth_m = float(np.median(valid)) / 1000.0
 
         min_d = 0.20 if self._phase == 'bin' else self.MIN_DEPTH_M
         if depth_m < min_d or depth_m > self.MAX_DEPTH_M:
+            self.get_logger().warn(
+                f'[DEPTH] depth={depth_m:.3f}m out of range '
+                f'[{min_d:.2f}, {self.MAX_DEPTH_M:.2f}] at pixel ({u},{v})')
             return None
 
         fx = self.camera_K[0, 0]
@@ -1929,8 +1936,9 @@ class PickAndPlace(Node):
                 return
 
         # Compute drop target above bin opening
+        # Tag is on the front face; offset +X past it into the bin center
         drop_z = bin_base[2] + self.BIN_HALF_HEIGHT + self.DROP_HEIGHT_ABOVE
-        drop_x = bin_base[0]
+        drop_x = bin_base[0] + self.BIN_DEPTH_OFFSET
         drop_y = bin_base[1]
 
         self.get_logger().info(
@@ -1959,7 +1967,7 @@ class PickAndPlace(Node):
                 if new_base is not None:
                     bin_base = new_base
                     drop_z = bin_base[2] + self.BIN_HALF_HEIGHT + self.DROP_HEIGHT_ABOVE
-                    drop_x = bin_base[0]
+                    drop_x = bin_base[0] + self.BIN_DEPTH_OFFSET
                     drop_y = bin_base[1]
                     self.get_logger().info(
                         f'[POSITION] Updated drop target: '
