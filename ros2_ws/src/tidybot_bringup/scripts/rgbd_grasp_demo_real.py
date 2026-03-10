@@ -241,7 +241,7 @@ class RGBDGraspDemoReal(Node):
         req.use_orientation = use_orientation
         req.execute = True
         req.duration = self.move_duration
-        req.max_condition_number = 100.0
+        req.max_condition_number = 500.0
 
         self.get_logger().info(
             f'  [{label}] pos=({pose.position.x:.3f}, {pose.position.y:.3f}, '

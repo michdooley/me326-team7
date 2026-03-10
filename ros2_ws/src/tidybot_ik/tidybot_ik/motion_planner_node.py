@@ -230,8 +230,14 @@ class MotionPlannerNode(Node):
 
             # Use default seed if positions are all near zero (uninitialized or singular config)
             if use_default_if_zero and np.allclose(positions, 0.0, atol=0.01):
+                seed = self.DEFAULT_SEED.copy()
+                # Mirror waist and forearm_roll for the left arm (arms are
+                # mirror-mounted in X but share identical joint axes).
+                if arm_name == 'left':
+                    seed[0] = -seed[0]  # waist
+                    seed[3] = -seed[3]  # forearm_roll
                 self.get_logger().info(f'Using default seed for {arm_name} arm (current positions near zero)')
-                return self.DEFAULT_SEED.copy()
+                return seed
 
             return positions
 

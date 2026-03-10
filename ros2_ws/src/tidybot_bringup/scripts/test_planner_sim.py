@@ -94,7 +94,7 @@ class TestPlanner(Node):
         request.use_orientation = use_orientation
         request.execute = True
         request.duration = duration
-        request.max_condition_number = 100.0
+        request.max_condition_number = 500.0
 
         pos_str = f'({pose.position.x:.3f}, {pose.position.y:.3f}, {pose.position.z:.3f})'
         if use_orientation:

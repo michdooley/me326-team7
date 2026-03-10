@@ -405,7 +405,7 @@ class PickUpObject:
         request.use_orientation = use_orientation
         request.execute = True
         request.duration = duration
-        request.max_condition_number = 100.0
+        request.max_condition_number = 500.0
 
         pos = pose.position
         n.get_logger().info(

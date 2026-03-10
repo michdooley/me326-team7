@@ -544,7 +544,7 @@ class TopdownGraspDemo(Node):
         req.use_orientation = use_orientation
         req.execute = True
         req.duration = self.move_duration
-        req.max_condition_number = 100.0
+        req.max_condition_number = 500.0
 
         self.get_logger().info(
             f'  [{label}] Planning + executing...')
@@ -572,7 +572,7 @@ class TopdownGraspDemo(Node):
         req.use_orientation = use_orientation
         req.execute = False
         req.duration = self.move_duration
-        req.max_condition_number = 200.0
+        req.max_condition_number = 500.0
 
         future = self.plan_client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)

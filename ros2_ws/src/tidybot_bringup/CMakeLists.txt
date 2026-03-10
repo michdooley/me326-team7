@@ -53,8 +53,11 @@ install(PROGRAMS
   scripts/grasp_and_verify_demo.py
   scripts/safe_stop.py
   scripts/find_bin_and_drop.py
+  scripts/pick_and_place.py
   scripts/map_arm_workspace.py
   scripts/test_grasp_calibration.py
+  scripts/ik_workspace_scan.py
+  scripts/grasp_calibration_test.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

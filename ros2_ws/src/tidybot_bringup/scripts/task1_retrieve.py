@@ -346,7 +346,7 @@ class Task1Retrieve(Node):
         req.use_orientation = True
         req.execute = True
         req.duration = GRASP_MOVE_DURATION
-        req.max_condition_number = 100.0
+        req.max_condition_number = 500.0
 
         self.get_logger().info(
             f'  [{label}] Calling /plan_to_target '
