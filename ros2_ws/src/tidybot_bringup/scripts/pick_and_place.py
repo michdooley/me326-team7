@@ -211,7 +211,8 @@ class PickAndPlace(Node):
     GRASP_MIN_POINTS             = 20
     GRASP_TABLE_Z_MIN            = 0.005
     GRASP_OUTLIER_Z_THRESH       = 0.05
-    GRASP_MAX_ATTEMPTS           = 3
+    GRASP_MAX_ATTEMPTS           = 4
+    GRASP_MAX_IK_NUDGES          = 6   # nudge-and-retry cycles per attempt
 
     # ── Sweet spot (grasp + bin positioning) ──────────────────────────────────
     GRASP_SWEET_SPOT_X      = 0.04
@@ -1259,12 +1260,19 @@ class PickAndPlace(Node):
 
             if attempt > 1:
                 self._go_home()
+                # Alternate nudge directions between retries
+                nudge_patterns = [
+                    (0.04, -0.08, 'forward-right'),
+                    (-0.03, 0.08, 'back-left'),
+                    (0.05, 0.0, 'forward'),
+                ]
+                vx, wz, label = nudge_patterns[(attempt - 2) % len(nudge_patterns)]
                 self.get_logger().info(
-                    '[GRASP] Nudging robot forward + right for retry...')
+                    f'[GRASP] Retry nudge: {label} (vx={vx}, wz={wz}) for 0.6s')
                 cmd = Twist()
-                cmd.linear.x = 0.05
-                cmd.angular.z = -0.1
-                end = time.time() + 0.5
+                cmd.linear.x = vx
+                cmd.angular.z = wz
+                end = time.time() + 0.6
                 while time.time() < end and rclpy.ok():
                     self.cmd_vel_pub.publish(cmd)
                     rclpy.spin_once(self, timeout_sec=0.05)
@@ -1279,10 +1287,8 @@ class PickAndPlace(Node):
         self._go_home()
         self._start_next_command()
 
-    def _grasp_attempt(self, _nudge_done=False):
-        """Single grasp attempt. Returns True on success."""
-        self._save_grasp_snapshot()
-
+    def _grasp_detect_and_center(self):
+        """Detect object, center it in frame, and return (cx, cy, bbox_w, bbox_h) or None."""
         self.get_logger().info(
             f'[GRASP] Looking for object at current tilt={self.current_tilt:.2f}...')
         det = None
@@ -1297,7 +1303,7 @@ class PickAndPlace(Node):
         if det is None:
             self.get_logger().error(
                 '[GRASP] No YOLO detection at current camera pose')
-            return False
+            return None
 
         # Center the object in the camera frame by adjusting tilt
         self.get_logger().info('[GRASP] Centering object in frame...')
@@ -1335,14 +1341,16 @@ class PickAndPlace(Node):
         det = self.latest_yolo_detection
         if det is None:
             self.get_logger().error('[GRASP] Lost object after centering')
-            return False
+            return None
 
         self.latest_yolo_detection = None
+        return (int(det.bbox.center.position.x),
+                int(det.bbox.center.position.y),
+                float(det.bbox.size_x),
+                float(det.bbox.size_y))
 
-        cx = int(det.bbox.center.position.x)
-        cy = int(det.bbox.center.position.y)
-        bbox_w = float(det.bbox.size_x)
-        bbox_h = float(det.bbox.size_y)
+    def _grasp_compute_from_detection(self, cx, cy, bbox_w, bbox_h):
+        """From a detection, compute grasp/pre-grasp poses. Returns (grasp_pose, pre_grasp_pose, analysis, info) or None."""
         self.get_logger().info(
             f'[GRASP] YOLO detection at pixel ({cx}, {cy}), '
             f'bbox {bbox_w:.0f}x{bbox_h:.0f}')
@@ -1351,14 +1359,14 @@ class PickAndPlace(Node):
             cx, cy, bbox_w, bbox_h)
         if depth_roi is None:
             self.get_logger().error('[GRASP] Failed to crop depth image')
-            return False
+            return None
 
         pts_base = self._grasp_depth_to_points(depth_roi, u_off, v_off)
         if pts_base is None:
             self.get_logger().error(
                 f'[GRASP] Insufficient points in depth ROI '
                 f'(need >= {self.GRASP_MIN_POINTS})')
-            return False
+            return None
 
         self.get_logger().info(
             f'[GRASP] Point cloud: {len(pts_base)} points')
@@ -1372,41 +1380,123 @@ class PickAndPlace(Node):
         result = self._grasp_compute_poses(analysis)
         if result is None:
             self.get_logger().error('[GRASP] Pose computation failed')
-            return False
+            return None
         grasp_pose, pre_grasp_pose, info = result
         self.get_logger().info(f'[GRASP] Params: {info}')
+        return grasp_pose, pre_grasp_pose, analysis, info
 
-        # Nudge robot if object is outside the arm's sweet spot
-        if not _nudge_done:
-            grasp_x = float(grasp_pose.position.x)
-            grasp_y = float(grasp_pose.position.y)
-            if self._grasp_reposition_for_sweet_spot(grasp_x, grasp_y):
-                self.get_logger().info(
-                    '[GRASP] Re-detecting after nudge...')
-                return self._grasp_attempt(_nudge_done=True)
+    def _grasp_ik_nudge(self, grasp_x, grasp_y):
+        """Compute a nudge direction to move the grasp point into the IK sweet spot.
+        Based on IK workspace scan: best zone is x=0.05-0.23, y=-0.20 to -0.30."""
+        # Target center of the IK-friendly zone
+        target_x = 0.12   # center of reliable IK x range
+        target_y = -0.24  # center of reliable IK y range
 
+        dx = target_x - grasp_x   # positive = need to move object forward (robot backward)
+        dy = target_y - grasp_y   # positive = need to move object right (robot turn right)
+
+        # The robot moves, not the object — so to shift the object's position
+        # in base_link frame, we move the robot in the opposite direction:
+        # - To increase grasp_x (push object forward in base frame): drive backward
+        # - To decrease grasp_y (push object right in base frame): turn left
+        # But actually: moving the robot forward makes the object appear further back (lower x)
+        # and turning left makes the object shift right (more negative y).
+        # So: drive forward to decrease grasp_x, turn right to increase grasp_y.
+        # We want: robot moves so that grasp point → target.
+        # grasp_x too small → drive backward (decrease linear.x)
+        # grasp_x too large → drive forward (increase linear.x)
+        # grasp_y too positive → turn right (negative angular.z)
+        # grasp_y too negative → turn left (positive angular.z)
+
+        # Actually, moving the robot forward shifts the object backward in base_link.
+        # So to increase grasp_x, robot should back up (linear.x < 0).
+        # To make grasp_y more negative, robot should turn left (angular.z > 0).
+        cmd = Twist()
+        cmd.linear.x = float(np.clip(-dx * 0.5, -0.06, 0.06))
+        cmd.angular.z = float(np.clip(dy * 0.8, -0.15, 0.15))
+
+        dist = np.hypot(dx, dy)
+        drive_time = float(np.clip(dist / 0.05, 0.3, 1.5))
+
+        self.get_logger().info(
+            f'[GRASP] IK nudge: grasp=({grasp_x:.3f}, {grasp_y:.3f}), '
+            f'target=({target_x:.3f}, {target_y:.3f}), '
+            f'cmd=(vx={cmd.linear.x:.3f}, wz={cmd.angular.z:.3f}), '
+            f'drive={drive_time:.1f}s')
+
+        deadline = time.time() + drive_time
+        while time.time() < deadline and rclpy.ok():
+            self.cmd_vel_pub.publish(cmd)
+            rclpy.spin_once(self, timeout_sec=0.05)
+        self._stop_base()
+        self._spin_for(0.5)
+
+    def _grasp_attempt(self):
+        """Single grasp attempt with multiple nudge-and-retry cycles. Returns True on success."""
+        self._save_grasp_snapshot()
+
+        detection = self._grasp_detect_and_center()
+        if detection is None:
+            return False
+        cx, cy, bbox_w, bbox_h = detection
+
+        computed = self._grasp_compute_from_detection(cx, cy, bbox_w, bbox_h)
+        if computed is None:
+            return False
+        grasp_pose, pre_grasp_pose, analysis, info = computed
+
+        # Initial sweet-spot nudge
+        grasp_x = float(grasp_pose.position.x)
+        grasp_y = float(grasp_pose.position.y)
+        if self._grasp_reposition_for_sweet_spot(grasp_x, grasp_y):
+            self.get_logger().info('[GRASP] Re-detecting after sweet-spot nudge...')
+            detection = self._grasp_detect_and_center()
+            if detection is None:
+                return False
+            cx, cy, bbox_w, bbox_h = detection
+            computed = self._grasp_compute_from_detection(cx, cy, bbox_w, bbox_h)
+            if computed is None:
+                return False
+            grasp_pose, pre_grasp_pose, analysis, info = computed
+
+        # Try IK — if it fails, nudge and retry up to GRASP_MAX_IK_NUDGES times
         use_orientation = True
         ok, msg = self._try_ik(grasp_pose, use_orientation=True)
+
         if not ok:
-            self.get_logger().warn(
-                f'[GRASP] IK with orientation failed: {msg}')
-            grasp_yaw = analysis['grasp_yaw']
-            alt_found = False
-            for alt_yaw_offset in [np.pi/2, -np.pi/2, np.pi]:
-                alt_yaw = grasp_yaw + alt_yaw_offset
-                qw, qx, qy, qz = yaw_to_grasp_quaternion(alt_yaw)
-                alt_quat = Quaternion(w=qw, x=qx, y=qy, z=qz)
-                grasp_pose.orientation = alt_quat
-                pre_grasp_pose.orientation = alt_quat
-                ok2, msg2 = self._try_ik(grasp_pose, use_orientation=True)
-                if ok2:
+            self.get_logger().warn(f'[GRASP] IK failed: {msg}')
+            for nudge_i in range(1, self.GRASP_MAX_IK_NUDGES + 1):
+                grasp_x = float(grasp_pose.position.x)
+                grasp_y = float(grasp_pose.position.y)
+                self.get_logger().info(
+                    f'[GRASP] IK nudge {nudge_i}/{self.GRASP_MAX_IK_NUDGES} '
+                    f'— repositioning robot...')
+                self._grasp_ik_nudge(grasp_x, grasp_y)
+
+                # Re-detect and recompute after nudge
+                detection = self._grasp_detect_and_center()
+                if detection is None:
+                    self.get_logger().warn(
+                        f'[GRASP] Lost object after nudge {nudge_i}')
+                    continue
+                cx, cy, bbox_w, bbox_h = detection
+                computed = self._grasp_compute_from_detection(
+                    cx, cy, bbox_w, bbox_h)
+                if computed is None:
+                    continue
+                grasp_pose, pre_grasp_pose, analysis, info = computed
+
+                ok, msg = self._try_ik(grasp_pose, use_orientation=True)
+                if ok:
                     self.get_logger().info(
-                        f'[GRASP] Alt yaw {np.degrees(alt_yaw_offset):.0f}deg offset works!')
-                    alt_found = True
+                        f'[GRASP] IK succeeded after nudge {nudge_i}!')
                     break
-            if not alt_found:
+                self.get_logger().warn(
+                    f'[GRASP] IK still failed after nudge {nudge_i}: {msg}')
+
+            if not ok:
                 self.get_logger().error(
-                    '[GRASP] All orientations failed — object may be unreachable')
+                    '[GRASP] All IK nudge attempts failed — object may be unreachable')
                 return False
 
         self.get_logger().info('[GRASP] Opening gripper')
