@@ -2026,27 +2026,64 @@ class PickAndPlace(Node):
                 return
 
         # Compute drop target above bin opening
-        # Tag is on the front face; offset +X past it into the bin center
+        # Offset along approach direction (robot → tag) to reach bin center
+        # Handles front face, side face, and angled approaches
+        approach_xy = np.array([bin_base[0], bin_base[1]])
+        approach_dist = np.linalg.norm(approach_xy)
+        if approach_dist > 0.01:
+            approach_unit = approach_xy / approach_dist
+        else:
+            approach_unit = np.array([1.0, 0.0])  # fallback: forward
         drop_z = bin_base[2] + self.BIN_HALF_HEIGHT + self.DROP_HEIGHT_ABOVE
-        drop_x = bin_base[0] + self.BIN_DEPTH_OFFSET
-        drop_y = bin_base[1]
+        drop_x = bin_base[0] + self.BIN_DEPTH_OFFSET * approach_unit[0]
+        drop_y = bin_base[1] + self.BIN_DEPTH_OFFSET * approach_unit[1]
+        approach_angle = np.degrees(np.arctan2(approach_unit[1], approach_unit[0]))
 
         self.get_logger().info(
             f'[POSITION] Drop target in base_link: '
-            f'({drop_x:.3f}, {drop_y:.3f}, {drop_z:.3f})')
+            f'({drop_x:.3f}, {drop_y:.3f}, {drop_z:.3f}), '
+            f'approach_angle={approach_angle:.0f}deg')
 
-        # Check if bin is within arm sweet spot
-        dist_to_sweet = np.hypot(
-            drop_x - self.BIN_SWEET_SPOT_X,
-            drop_y - self.BIN_SWEET_SPOT_Y)
+        # Try IK for drop pose, nudging closer if needed (up to 4 attempts)
+        MAX_DROP_NUDGES = 4
+        qw, qx, qy, qz = yaw_to_grasp_quaternion(0.0)
 
-        if dist_to_sweet > self.BIN_SWEET_SPOT_RADIUS:
+        for nudge_i in range(MAX_DROP_NUDGES + 1):
+            drop_pose = Pose()
+            drop_pose.position.x = drop_x
+            drop_pose.position.y = drop_y
+            drop_pose.position.z = float(drop_z)
+            drop_pose.orientation = Quaternion(w=qw, x=qx, y=qy, z=qz)
+
+            success, msg = self._try_ik(drop_pose)
+            if not success:
+                # Try a bit higher
+                drop_pose.position.z = float(drop_z + 0.05)
+                success, msg = self._try_ik(drop_pose)
+            if not success:
+                # Try without orientation constraint
+                success, msg = self._try_ik(drop_pose, use_orientation=False)
+
+            if success:
+                self.get_logger().info(
+                    f'[POSITION] IK OK for drop pose '
+                    f'({drop_x:.3f}, {drop_y:.3f}, {float(drop_pose.position.z):.3f})')
+                break
+
+            if nudge_i >= MAX_DROP_NUDGES:
+                self.get_logger().error(
+                    f'[POSITION] IK failed after {MAX_DROP_NUDGES} nudges — '
+                    f'dropping where arm is')
+                self.state = TaskState.DROPPING
+                return
+
+            # Nudge closer to the bin by driving toward it
             self.get_logger().info(
-                f'[POSITION] Bin outside sweet spot '
-                f'(dist={dist_to_sweet:.3f}m > {self.BIN_SWEET_SPOT_RADIUS}m). '
-                f'Nudging base...')
-            self._bin_nudge_toward_sweet_spot(drop_x, drop_y)
-            # Re-detect after nudge
+                f'[POSITION] IK failed ({msg}), nudging closer '
+                f'({nudge_i + 1}/{MAX_DROP_NUDGES})...')
+            self._bin_nudge_closer(bin_base[0], bin_base[1])
+
+            # Re-detect tag after nudge
             self._spin_for(1.0)
             det = self.latest_tag_detection
             if det is not None:
@@ -2056,44 +2093,24 @@ class PickAndPlace(Node):
                 new_base = self._get_position_in_base_link(u, v)
                 if new_base is not None:
                     bin_base = new_base
+                    approach_xy = np.array([bin_base[0], bin_base[1]])
+                    approach_dist = np.linalg.norm(approach_xy)
+                    if approach_dist > 0.01:
+                        approach_unit = approach_xy / approach_dist
+                    else:
+                        approach_unit = np.array([1.0, 0.0])
                     drop_z = bin_base[2] + self.BIN_HALF_HEIGHT + self.DROP_HEIGHT_ABOVE
-                    drop_x = bin_base[0] + self.BIN_DEPTH_OFFSET
-                    drop_y = bin_base[1]
+                    drop_x = bin_base[0] + self.BIN_DEPTH_OFFSET * approach_unit[0]
+                    drop_y = bin_base[1] + self.BIN_DEPTH_OFFSET * approach_unit[1]
                     self.get_logger().info(
                         f'[POSITION] Updated drop target: '
                         f'({drop_x:.3f}, {drop_y:.3f}, {drop_z:.3f})')
-
-        # Build a downward-facing gripper pose
-        qw, qx, qy, qz = yaw_to_grasp_quaternion(0.0)
-
-        drop_pose = Pose()
-        drop_pose.position.x = drop_x
-        drop_pose.position.y = drop_y
-        drop_pose.position.z = float(drop_z)
-        drop_pose.orientation = Quaternion(w=qw, x=qx, y=qy, z=qz)
-
-        # Try IK
-        success, msg = self._try_ik(drop_pose)
-        if not success:
-            self.get_logger().warn(
-                f'[POSITION] IK failed for drop pose: {msg}')
-            drop_pose.position.z = float(drop_z + 0.05)
-            success, msg = self._try_ik(drop_pose)
-            if not success:
-                self.get_logger().warn(
-                    f'[POSITION] IK still failed at higher z: {msg}')
-                success, msg = self._try_ik(drop_pose, use_orientation=False)
-                if not success:
-                    self.get_logger().error(
-                        '[POSITION] Cannot reach drop position — dropping where arm is')
-                    self.state = TaskState.DROPPING
-                    return
 
         # Move to pre-drop position (higher)
         pre_drop_pose = Pose()
         pre_drop_pose.position.x = drop_x
         pre_drop_pose.position.y = drop_y
-        pre_drop_pose.position.z = float(drop_z + 0.10)
+        pre_drop_pose.position.z = float(drop_pose.position.z + 0.10)
         pre_drop_pose.orientation = drop_pose.orientation
 
         self.get_logger().info('[POSITION] Moving to pre-drop position...')
@@ -2111,24 +2128,20 @@ class PickAndPlace(Node):
         self._spin_for(1.0)
         self.state = TaskState.DROPPING
 
-    def _bin_nudge_toward_sweet_spot(self, obj_x, obj_y):
-        error_x = obj_x - self.BIN_SWEET_SPOT_X
-        error_y = obj_y - self.BIN_SWEET_SPOT_Y
-
-        duration = min(abs(error_x) / self.BIN_NUDGE_SPEED + 0.5, 3.0)
-
+    def _bin_nudge_closer(self, tag_x, tag_y):
+        """Drive the robot closer to the bin tag position in base_link.
+        Uses angular.z to turn toward the tag and linear.x to drive forward."""
+        # Turn toward the tag (tag_y < 0 means tag is to the right → turn right)
         cmd = Twist()
-        if abs(error_x) > 0.03:
-            cmd.linear.x = self.BIN_NUDGE_SPEED if error_x > 0 else -self.BIN_NUDGE_SPEED
-        if abs(error_y) > 0.03:
-            cmd.angular.z = -0.15 if error_y < 0 else 0.15
+        cmd.linear.x = 0.06  # always creep forward
+        if abs(tag_y) > 0.05:
+            cmd.angular.z = float(np.clip(tag_y * 0.5, -0.15, 0.15))
 
         self.get_logger().info(
-            f'[NUDGE] error=({error_x:.3f}, {error_y:.3f}), '
-            f'cmd=({cmd.linear.x:.2f}, {cmd.angular.z:.2f}), '
-            f'dur={duration:.1f}s')
+            f'[NUDGE-CLOSER] tag_base=({tag_x:.3f}, {tag_y:.3f}), '
+            f'cmd=(vx={cmd.linear.x:.2f}, wz={cmd.angular.z:.2f}), dur=0.8s')
 
-        deadline = time.time() + duration
+        deadline = time.time() + 0.8
         while time.time() < deadline and rclpy.ok():
             self.cmd_vel_pub.publish(cmd)
             rclpy.spin_once(self, timeout_sec=0.05)
