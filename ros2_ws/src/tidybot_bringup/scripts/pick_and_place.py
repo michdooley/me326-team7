@@ -1395,25 +1395,12 @@ class PickAndPlace(Node):
         dx = target_x - grasp_x   # positive = need to move object forward (robot backward)
         dy = target_y - grasp_y   # positive = need to move object right (robot turn right)
 
-        # The robot moves, not the object — so to shift the object's position
-        # in base_link frame, we move the robot in the opposite direction:
-        # - To increase grasp_x (push object forward in base frame): drive backward
-        # - To decrease grasp_y (push object right in base frame): turn left
-        # But actually: moving the robot forward makes the object appear further back (lower x)
-        # and turning left makes the object shift right (more negative y).
-        # So: drive forward to decrease grasp_x, turn right to increase grasp_y.
-        # We want: robot moves so that grasp point → target.
-        # grasp_x too small → drive backward (decrease linear.x)
-        # grasp_x too large → drive forward (increase linear.x)
-        # grasp_y too positive → turn right (negative angular.z)
-        # grasp_y too negative → turn left (positive angular.z)
-
-        # Actually, moving the robot forward shifts the object backward in base_link.
-        # So to increase grasp_x, robot should back up (linear.x < 0).
-        # To make grasp_y more negative, robot should turn left (angular.z > 0).
+        # Robot forward (linear.x>0) → object x decreases in base_link
+        # Robot turn left (angular.z>0) → object y decreases (shifts right)
+        # Convention matches _bin_nudge_closer: angular.z sign = dy sign
         cmd = Twist()
         cmd.linear.x = float(np.clip(-dx * 0.5, -0.06, 0.06))
-        cmd.angular.z = float(np.clip(dy * 0.8, -0.15, 0.15))
+        cmd.angular.z = float(np.clip(-dy * 0.8, -0.15, 0.15))
 
         dist = np.hypot(dx, dy)
         drive_time = float(np.clip(dist / 0.05, 0.3, 1.5))
@@ -1660,7 +1647,7 @@ class PickAndPlace(Node):
         drive_time = 1.0
 
         if abs(dy) > 0.03:
-            cmd.angular.z = float(np.clip(-dy * 0.8, -0.15, 0.15))
+            cmd.angular.z = float(np.clip(dy * 0.8, -0.15, 0.15))
         if abs(dx) > 0.03:
             cmd.linear.x = float(np.clip(dx * 0.5, -0.05, 0.05))
 
