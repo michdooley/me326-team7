@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, QoSPresetProfiles
 from sensor_msgs.msg import Image
 from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
 
@@ -50,8 +50,10 @@ class AprilTagDetectorNode(Node):
         self.det_pub = self.create_publisher(
             Detection2DArray, '/apriltag_detections', 10)
 
-        # Subscribe to camera with RELIABLE QoS to match MuJoCo bridge
-        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
+        # Subscribe with BEST_EFFORT QoS — compatible with both
+        # RealSense (BEST_EFFORT default) and MuJoCo bridge (RELIABLE).
+        # A BEST_EFFORT subscriber can receive from any publisher.
+        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.subscription = self.create_subscription(
             Image, '/camera/color/image_raw', self._image_cb, qos)
 

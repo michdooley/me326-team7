@@ -119,7 +119,9 @@ VOICE_PHRASE = "get the banana and place it in the bin"
 
 # Saved joint poses  [waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate]
 GRASP_VALIDATION_POS = [0.0, -1.0, 0.6, 0.0, 0.4, 0.0]   # good pose for grasp validation (future use)
-RETRACT_HOLDING_POS  = [0.0, -1.35, 0.6, 0.0, 0.75, 0.0]  # high overhead hold — clears camera & bin
+RETRACT_HOLDING_POS  = [0.0, -1.80, 1.55, 0.0, 0.75, 0.0]  # high overhead hold — clears camera & bin
+
+GRIPPER_OPEN_POS = 0.10  # max physical opening (0.0 is closed-ish, 0.85 is widest)
 
 FLOOR_MARGIN = 0.008  # RANSAC inlier distance threshold for floor plane
 
@@ -171,7 +173,7 @@ class PickAndPlace(Node):
 
     # ── Depth filtering ───────────────────────────────────────────────────────
     MIN_DEPTH_M       = 0.15
-    MAX_DEPTH_M       = 5.00
+    MAX_DEPTH_M       = 8.00
 
     # ── 360 scan ─────────────────────────────────────────────────────────────
     SCAN_ANGULAR_VEL = -0.3   # rad/s
@@ -209,7 +211,7 @@ class PickAndPlace(Node):
     GRASP_LIFT_HEIGHT            = 0.15
     GRASP_Z_OFFSET               = 0.00
     GRASP_X_OFFSET               = -0.00
-    GRASP_Y_OFFSET               = -0.00
+    GRASP_Y_OFFSET               = -0.05
     GRASP_BBOX_PAD               = 1.3
     GRASP_SETTLE_TIME            = 1.0
     GRASP_GRIPPER_CLOSE_REPEATS  = 20
@@ -295,6 +297,11 @@ class PickAndPlace(Node):
         self.GRASP_ARM_NAME = (
             self.get_parameter('arm_name')
             .get_parameter_value().string_value.lower())
+
+        # Mirror sweet-spot Y for left arm (opposite side of robot)
+        if self.GRASP_ARM_NAME == 'left':
+            self.GRASP_SWEET_SPOT_Y = -self.GRASP_SWEET_SPOT_Y
+            self.BIN_SWEET_SPOT_Y   = -self.BIN_SWEET_SPOT_Y
 
         # Command queue for sequential voice targets
         self.command_queue       = deque()
@@ -1395,19 +1402,18 @@ class PickAndPlace(Node):
     def _grasp_ik_nudge(self, grasp_x, grasp_y):
         """Compute a nudge direction to move the grasp point into the IK sweet spot.
         Based on IK workspace scan: best zone is x=0.05-0.23, y=-0.20 to -0.30."""
-        # Target center of the IK-friendly zone
-        target_x = 0.12   # center of reliable IK x range
-        target_y = -0.24  # center of reliable IK y range
+        # Target center of the IK-friendly zone (mirrors with sweet spot for left arm)
+        target_x = 0.12
+        target_y = -0.24 if self.GRASP_ARM_NAME == 'right' else 0.24
 
-        dx = target_x - grasp_x   # positive = need to move object forward (robot backward)
-        dy = target_y - grasp_y   # positive = need to move object right (robot turn right)
+        dx = grasp_x - target_x
+        dy = grasp_y - target_y
 
-        # Robot forward (linear.x>0) → object x decreases in base_link
-        # Robot turn left (angular.z>0) → object y decreases (shifts right)
-        # Convention matches _bin_nudge_closer: angular.z sign = dy sign
+        # Same convention as _grasp_reposition_for_sweet_spot:
+        #   angular.z = dy * gain  → positive dy rotates left, negative dy rotates right
         cmd = Twist()
-        cmd.linear.x = float(np.clip(-dx * 0.5, -0.06, 0.06))
-        cmd.angular.z = float(np.clip(-dy * 0.8, -0.15, 0.15))
+        cmd.linear.x = float(np.clip(dx * 0.5, -0.06, 0.06))
+        cmd.angular.z = float(np.clip(dy * 1.2, -0.20, 0.20))
 
         dist = np.hypot(dx, dy)
         drive_time = float(np.clip(dist / 0.05, 0.3, 1.5))
@@ -1494,7 +1500,7 @@ class PickAndPlace(Node):
                 return False
 
         self.get_logger().info('[GRASP] Opening gripper')
-        self._set_gripper(0.0)
+        self._set_gripper(GRIPPER_OPEN_POS)
 
         self.get_logger().info('[GRASP] Moving to pre-grasp')
         if not self._grasp_plan_and_execute(
@@ -1504,7 +1510,7 @@ class PickAndPlace(Node):
             return False
 
         self.get_logger().info('[GRASP] Re-opening gripper at pre-grasp')
-        self._set_gripper(0.0)
+        self._set_gripper(GRIPPER_OPEN_POS)
         self._spin_for(self.GRASP_SETTLE_TIME)
 
         self.get_logger().info('[GRASP] Descending to grasp')
@@ -1902,7 +1908,7 @@ class PickAndPlace(Node):
             if result.executed:
                 if keep_gripper_open:
                     grip_msg = Float64MultiArray()
-                    grip_msg.data = [0.0]
+                    grip_msg.data = [GRIPPER_OPEN_POS]
                     deadline = time.time() + self.GRASP_MOVE_DURATION + 0.5
                     while time.time() < deadline:
                         self.gripper_pub.publish(grip_msg)
