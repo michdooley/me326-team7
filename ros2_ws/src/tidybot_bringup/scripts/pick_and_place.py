@@ -113,6 +113,14 @@ YOLO_CLASS_MAP = {
 # AprilTag ID -> fruit name mapping
 TAG_MAP = {"banana": "0", "apple": "1", "orange": "2"}
 
+# Voice command: "get the banana and place it in the bin"
+#   Parsed keywords → action="get", object="banana", action="place", location="bin"
+VOICE_PHRASE = "get the banana and place it in the bin"
+
+# Saved joint poses  [waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate]
+GRASP_VALIDATION_POS = [0.0, -1.0, 0.6, 0.0, 0.4, 0.0]   # good pose for grasp validation (future use)
+RETRACT_HOLDING_POS  = [0.0, -1.35, 0.6, 0.0, 0.75, 0.0]  # high overhead hold — clears camera & bin
+
 FLOOR_MARGIN = 0.008  # RANSAC inlier distance threshold for floor plane
 
 
@@ -1234,13 +1242,12 @@ class PickAndPlace(Node):
                 f'{name} reached (no world pos, but close enough)')
         self.get_logger().info('=' * 55)
 
-        if self.current_action == 'get':
-            self.get_logger().info(
-                '[COMPLETE] Action is "get" — transitioning to GRASPING')
-            self.state = TaskState.GRASPING
-            return
-
-        self._start_next_command()
+        # This pipeline always does full pick-and-place (get → grasp → bin → drop).
+        # Accept any action (get, place, etc.) since multi-step voice commands
+        # may arrive with "place" overwriting "get" due to rapid publishing.
+        self.get_logger().info(
+            f'[COMPLETE] Action is "{self.current_action}" — transitioning to GRASPING')
+        self.state = TaskState.GRASPING
 
     # ── Grasping (Phase 1) ─────────────────────────────────────────────────
 
@@ -1943,7 +1950,7 @@ class PickAndPlace(Node):
         self.get_logger().info(
             f'[ARM] Retracting arm to overhead pose over {duration}s')
         msg = ArmCommand()
-        msg.joint_positions = [0.0, -1.0, 0.6, 0.0, 0.4, 0.0]
+        msg.joint_positions = list(RETRACT_HOLDING_POS)
         msg.duration = duration
         self.arm_pub.publish(msg)
         grip_msg = Float64MultiArray()

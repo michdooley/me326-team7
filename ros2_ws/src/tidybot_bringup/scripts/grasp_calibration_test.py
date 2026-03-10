@@ -284,13 +284,25 @@ class GraspCalibrationNode(Node):
         msg = ArmCommand()
         msg.joint_positions = joints
         msg.duration = duration
-        self.arm_pub.publish(msg)
+        # Publish multiple times to ensure the message is received
+        for _ in range(5):
+            self.arm_pub.publish(msg)
+            rclpy.spin_once(self, timeout_sec=0.05)
         self._spin_for(duration + 0.5)
 
     def _retract_arm(self):
         """Move arm to sleep pose (out of camera view)."""
         self.get_logger().info('Retracting arm to sleep pose...')
-        self._move_arm_joints(self.SLEEP_JOINTS, duration=3.0)
+        # Hard-coded sleep pose: [waist, shoulder, elbow, forearm_roll, wrist_angle, wrist_rotate]
+        sleep = [0.0, -1.80, 1.55, 0.0, 0.8, 0.0]
+        msg = ArmCommand()
+        msg.joint_positions = sleep
+        msg.duration = 3.0
+        # Publish many times to guarantee delivery
+        for _ in range(10):
+            self.arm_pub.publish(msg)
+            rclpy.spin_once(self, timeout_sec=0.05)
+        self._spin_for(3.5)
 
     def _plan_and_execute(self, pose, use_orientation=True):
         """Plan IK and execute motion to target pose in base_link."""
@@ -818,7 +830,7 @@ class GraspCalibrationNode(Node):
             print('WARNING: No depth camera_info — depth_native mode will not work')
 
         # Set initial camera tilt for looking at objects
-        self._set_camera_tilt(0.3)
+        self._set_camera_tilt(0.8)
         self._spin_for(1.0)
 
         self._print_status()
