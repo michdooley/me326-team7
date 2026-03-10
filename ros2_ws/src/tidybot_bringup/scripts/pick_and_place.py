@@ -245,7 +245,7 @@ class PickAndPlace(Node):
         'bin': {
             'center_pixel_thresh': 40,
             'center_pixel_thresh_v': 40,
-            'approach_stop_dist': 0.35,
+            'approach_stop_dist': 0.30,
             'approach_linear_speed': 0.10,
             'initial_tilt': 0.5,
             'scan_tilt': 0.3,
