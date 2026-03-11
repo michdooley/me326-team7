@@ -192,7 +192,7 @@ class PickAndPlace(Node):
     # ── Approach ─────────────────────────────────────────────────────────────
     APPROACH_ANGULAR_GAIN      = 0.003
     APPROACH_MAX_ANGULAR       = 0.3
-    APPROACH_TIMEOUT           = 60.0
+    APPROACH_TIMEOUT           = 120.0
     APPROACH_TILT_STEP         = 0.03
     BIN_APPROACH_CENTER_PIXELS = 120   # pixel offset at which bin approach forward speed reaches 0
 
@@ -1839,6 +1839,13 @@ class PickAndPlace(Node):
         grasp_center = analysis.get('grasp_center', analysis['centroid'])
         grasp_yaw = analysis['grasp_yaw']
         grip_width = analysis['grip_width']
+
+        # The gripper is 180°-symmetric, so yaw and yaw±π produce identical grasps.
+        # _grasp_analyze_object returns yaw in [0, π), but yaw > π/2 means the arm
+        # would rotate far from neutral.  Wrap to (-π/2, π/2] so forearm_roll always
+        # takes the short path (e.g. yaw=170° → -10° instead of +170°).
+        if grasp_yaw > np.pi / 2:
+            grasp_yaw -= np.pi
 
         if grip_width > GRIPPER_MAX_OPENING_M:
             self.get_logger().warn(
