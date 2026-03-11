@@ -208,8 +208,8 @@ class PickAndPlace(Node):
     GRASP_MOVE_DURATION          = 2.0
     GRASP_PRE_HEIGHT             = 0.10
     GRASP_LIFT_HEIGHT            = 0.15
-    GRASP_Z_OFFSET               = 0.00
-    GRASP_X_OFFSET               = -0.00
+    GRASP_Z_OFFSET               = 0.03
+    GRASP_X_OFFSET               = -0.03
     GRASP_Y_OFFSET               = -0.00
     GRASP_BBOX_PAD               = 1.3
     GRASP_SETTLE_TIME            = 1.0
@@ -702,7 +702,7 @@ class PickAndPlace(Node):
             time.sleep(0.05)
 
         grip_msg = Float64MultiArray()
-        grip_msg.data = [0.0]
+        grip_msg.data = [0.05]
         for _ in range(10):
             self.gripper_pub.publish(grip_msg)
             rclpy.spin_once(self, timeout_sec=0.05)
@@ -1509,7 +1509,7 @@ class PickAndPlace(Node):
                 return False
 
         self.get_logger().info('[GRASP] Opening gripper')
-        self._set_gripper(0.0)
+        self._set_gripper(0.05)
 
         self.get_logger().info('[GRASP] Moving to pre-grasp')
         if not self._grasp_plan_and_execute(
@@ -1519,7 +1519,7 @@ class PickAndPlace(Node):
             return False
 
         self.get_logger().info('[GRASP] Re-opening gripper at pre-grasp')
-        self._set_gripper(0.0)
+        self._set_gripper(0.05)
         self._spin_for(self.GRASP_SETTLE_TIME)
 
         self.get_logger().info('[GRASP] Descending to grasp')
@@ -1581,7 +1581,7 @@ class PickAndPlace(Node):
                 f'[TRANSITION] No bin tag mapping for "{self.current_object_name}" '
                 f'(known: {list(TAG_MAP.keys())}). Skipping bin phase.')
             # Release object and go back to waiting
-            self._set_gripper(0.0)
+            self._set_gripper(0.05)
             self._spin_for(1.0)
             self._go_home(duration=3.0)
             self._phase = 'object'
@@ -1924,7 +1924,7 @@ class PickAndPlace(Node):
             if result.executed:
                 if keep_gripper_open:
                     grip_msg = Float64MultiArray()
-                    grip_msg.data = [0.0]
+                    grip_msg.data = [0.05]
                     deadline = time.time() + self.GRASP_MOVE_DURATION + 0.5
                     while time.time() < deadline:
                         self.gripper_pub.publish(grip_msg)
