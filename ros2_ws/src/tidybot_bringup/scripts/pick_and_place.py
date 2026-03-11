@@ -6,7 +6,7 @@ Integrated pipeline that chains object finding/grasping with bin finding/droppin
   Phase 1 (YOLO): find object -> center -> approach -> grasp
   Phase 2 (AprilTag): find bin -> center -> approach -> position arm -> drop
 
-Runs alongside:
+Runs alongside: might've fixed
   - ros2 run object_classification classifier   (YOLO, publishes /objbbox)
   - ros2 run tidybot_bringup voice_command.py   (publishes /target_object, /user_command)
 
