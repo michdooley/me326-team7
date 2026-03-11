@@ -190,10 +190,11 @@ class PickAndPlace(Node):
     DETECT_COUNT_REQ   = 1
 
     # ── Approach ─────────────────────────────────────────────────────────────
-    APPROACH_ANGULAR_GAIN = 0.003
-    APPROACH_MAX_ANGULAR  = 0.3
-    APPROACH_TIMEOUT      = 60.0
-    APPROACH_TILT_STEP    = 0.03
+    APPROACH_ANGULAR_GAIN      = 0.003
+    APPROACH_MAX_ANGULAR       = 0.3
+    APPROACH_TIMEOUT           = 60.0
+    APPROACH_TILT_STEP         = 0.03
+    BIN_APPROACH_CENTER_PIXELS = 120   # pixel offset at which bin approach forward speed reaches 0
 
     # ── Return home ────────────────────────────────────────────────────────
     WAYPOINT_INTERVAL     = 0.20
@@ -295,6 +296,12 @@ class PickAndPlace(Node):
         self.GRASP_ARM_NAME = (
             self.get_parameter('arm_name')
             .get_parameter_value().string_value.lower())
+
+        # Mirror sweet-spot X for arm symmetry: left arm is at +X, right arm at -X
+        _arm_x_sign = 1.0 if self.GRASP_ARM_NAME == 'left' else -1.0
+        self.GRASP_SWEET_SPOT_X  = self.__class__.GRASP_SWEET_SPOT_X  * _arm_x_sign
+        self.BIN_SWEET_SPOT_X    = self.__class__.BIN_SWEET_SPOT_X    * _arm_x_sign
+        self._ik_nudge_target_x  = 0.12 * _arm_x_sign
 
         # Command queue for sequential voice targets
         self.command_queue       = deque()
@@ -1162,6 +1169,13 @@ class PickAndPlace(Node):
                 cmd.angular.z = float(np.clip(
                     angular, -self.APPROACH_MAX_ANGULAR, self.APPROACH_MAX_ANGULAR))
 
+                # For bin approach: scale forward speed by how centered the tag is,
+                # so heading drift is corrected before getting too close.
+                if self._phase == 'bin':
+                    center_fraction = max(
+                        0.0, 1.0 - abs(offset_x) / self.BIN_APPROACH_CENTER_PIXELS)
+                    linear_speed = self._pp('approach_linear_speed') * center_fraction
+
                 # Adjust tilt to keep target vertically centered
                 offset_y = v - img_center_y
                 if abs(offset_y) > thresh_v:
@@ -1394,9 +1408,10 @@ class PickAndPlace(Node):
 
     def _grasp_ik_nudge(self, grasp_x, grasp_y):
         """Compute a nudge direction to move the grasp point into the IK sweet spot.
-        Based on IK workspace scan: best zone is x=0.05-0.23, y=-0.20 to -0.30."""
-        # Target center of the IK-friendly zone
-        target_x = 0.12   # center of reliable IK x range
+        Based on IK workspace scan: best zone is x=±0.12, y=-0.20 to -0.30.
+        target_x sign is arm-dependent (left=+, right=-)."""
+        # Target center of the IK-friendly zone (arm-specific x, set in __init__)
+        target_x = self._ik_nudge_target_x
         target_y = -0.24  # center of reliable IK y range
 
         dx = target_x - grasp_x   # positive = need to move object forward (robot backward)
