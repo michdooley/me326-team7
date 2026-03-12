@@ -38,6 +38,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 from interbotix_xs_msgs.msg import JointGroupCommand
+from tidybot_msgs.msg import ArmCommand
 
 
 class ArmWrapperNode(Node):
@@ -120,6 +121,16 @@ class ArmWrapperNode(Node):
             Float64MultiArray, '/left_arm/joint_cmd',
             lambda msg: self._arm_target_callback(msg, 'left'), 10
         )
+        # ArmCommand subscribers — allows pick_and_place.py and other high-level
+        # nodes to send joint-space commands directly without arm_controller_node
+        self.right_arm_cmd_sub = self.create_subscription(
+            ArmCommand, '/right_arm/cmd',
+            lambda msg: self._arm_cmd_callback(msg, 'right'), 10
+        )
+        self.left_arm_cmd_sub = self.create_subscription(
+            ArmCommand, '/left_arm/cmd',
+            lambda msg: self._arm_cmd_callback(msg, 'left'), 10
+        )
         self.pan_tilt_cmd_sub = self.create_subscription(
             Float64MultiArray, '/camera/pan_tilt_cmd',
             self._pan_tilt_target_callback, 10
@@ -200,6 +211,22 @@ class ArmWrapperNode(Node):
             self.ARM_JOINT_LIMITS[:, 1],
         )
 
+        if side == 'right':
+            self.right_target = target
+        else:
+            self.left_target = target
+
+    def _arm_cmd_callback(self, msg: ArmCommand, side: str):
+        """Handle ArmCommand messages (joint positions + duration). Duration is
+        ignored — velocity limiting in the control loop provides smooth motion."""
+        if len(msg.joint_positions) != 6:
+            self.get_logger().warn(f'{side} arm: expected 6 joints, got {len(msg.joint_positions)}')
+            return
+        target = np.clip(
+            np.array(msg.joint_positions),
+            self.ARM_JOINT_LIMITS[:, 0],
+            self.ARM_JOINT_LIMITS[:, 1],
+        )
         if side == 'right':
             self.right_target = target
         else:
