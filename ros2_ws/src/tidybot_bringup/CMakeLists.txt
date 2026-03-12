@@ -58,6 +58,7 @@ install(PROGRAMS
   scripts/pick_and_bring_v2.py
   scripts/pick_and_bring_face.py
   scripts/pick_and_bring_v3.py
+  scripts/pick_and_bring_v4.py
   scripts/map_arm_workspace.py
   scripts/test_grasp_calibration.py
   scripts/ik_workspace_scan.py
