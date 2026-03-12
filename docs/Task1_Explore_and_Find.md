@@ -29,8 +29,8 @@ WAITING_FOR_COMMAND → SCANNING → CENTERING → APPROACHING → GRASPING → 
 # Terminal 1: sim
 ros2 launch tidybot_bringup sim.launch.py scene:=scene_banana_test.xml
 
-# Terminal 2: YOLO
-ros2 run object_classification classifier
+# Terminal 2: perception (YOLO only for Task 1)
+ros2 launch tidybot_bringup perception.launch.py use_face_recognition:=false use_apriltag:=false
 
 # Terminal 3: task
 ros2 run tidybot_bringup task1_explore_and_find.py --ros-args -p skip_voice:=true -p target_object:=banana
@@ -41,8 +41,8 @@ ros2 run tidybot_bringup task1_explore_and_find.py --ros-args -p skip_voice:=tru
 # Terminal 1: robot
 ros2 launch tidybot_bringup real.launch.py use_planner:=true
 
-# Terminal 2: YOLO
-ros2 run object_classification classifier
+# Terminal 2: perception (YOLO only for Task 1)
+ros2 launch tidybot_bringup perception.launch.py use_face_recognition:=false use_apriltag:=false
 
 # Terminal 3: task
 ros2 run tidybot_bringup task1_explore_and_find.py --ros-args -p skip_voice:=false
