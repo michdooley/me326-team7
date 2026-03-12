@@ -181,28 +181,50 @@ def separate_floor(points: np.ndarray, distance_thresh: float = 0.008,
     return plane_info, points[outlier_mask]
 
 
-def method_minwidth_sweep(points: np.ndarray, angle_step: int = 5
-                          ) -> List[GraspResult]:
-    """Max-clearance yaw sweep. Returns grasps sorted by score (best first).
+def build_plane_basis(normal: np.ndarray):
+    """Build an orthonormal basis (u, v, n) from a plane normal.
 
-    Works in whatever frame points are in (camera frame here).
-    Sweep is done in the XY plane of that frame.
+    Returns (u, v) tangent vectors in the plane. u is chosen to be as
+    close to the world X-axis as possible for a stable reference.
+    """
+    n = normal / np.linalg.norm(normal)
+    # Pick a reference that isn't parallel to the normal
+    ref = np.array([1.0, 0.0, 0.0])
+    if abs(np.dot(n, ref)) > 0.9:
+        ref = np.array([0.0, 1.0, 0.0])
+    u = np.cross(n, ref)
+    u /= np.linalg.norm(u)
+    v = np.cross(n, u)
+    v /= np.linalg.norm(v)
+    return u, v
+
+
+def method_minwidth_sweep(points: np.ndarray, plane_normal: np.ndarray,
+                          angle_step: int = 5) -> List[GraspResult]:
+    """Max-clearance yaw sweep aligned to the detected floor plane.
+
+    The sweep is done in the plane defined by plane_normal (the table
+    surface). Fingers spread in the tangent plane; the gripper approaches
+    along the plane normal (perpendicular to the table).
     """
     if len(points) < 20:
         return []
 
+    # Build tangent basis in the floor plane
+    u_axis, v_axis = build_plane_basis(plane_normal)
+
     centroid = np.mean(points, axis=0)
-    # For camera frame: X is right, Y is down, Z is forward
-    # We sweep yaw around the Z axis (approach from camera direction)
-    # Project points onto XY plane for sweep
-    pts_xy = points[:, :2]
-    centered = pts_xy - centroid[:2]
+    # Project points into the tangent plane (2D)
+    centered_3d = points - centroid
+    proj_u = centered_3d @ u_axis
+    proj_v = centered_3d @ v_axis
 
     results = []
     for angle_deg in range(0, 180, angle_step):
         angle = np.radians(angle_deg)
-        finger_dir = np.array([np.cos(angle), np.sin(angle)])
-        projections = centered @ finger_dir
+        # Finger direction in the tangent plane
+        finger_2d = np.array([np.cos(angle), np.sin(angle)])
+        projections = proj_u * finger_2d[0] + proj_v * finger_2d[1]
         proj_min = float(projections.min())
         proj_max = float(projections.max())
         width = proj_max - proj_min
@@ -212,10 +234,10 @@ def method_minwidth_sweep(points: np.ndarray, angle_step: int = 5
         feasible = width <= GRIPPER_MAX_OPENING_M
         score = max(0.0, clearance / (GRIPPER_MAX_OPENING_M / 2.0)) if feasible else 0.0
 
-        grasp_center = np.array([
-            centroid[0] + center_offset * finger_dir[0],
-            centroid[1] + center_offset * finger_dir[1],
-            centroid[2]])
+        # Grasp center in 3D: centroid + offset along finger direction in plane
+        finger_3d = finger_2d[0] * u_axis + finger_2d[1] * v_axis
+        grasp_center = centroid + center_offset * finger_3d
+
         results.append(GraspResult(
             center=grasp_center,
             yaw=angle,
@@ -230,13 +252,13 @@ def method_minwidth_sweep(points: np.ndarray, angle_step: int = 5
 
 
 def create_gripper_mesh(center: np.ndarray, yaw: float, width: float,
+                        plane_normal: np.ndarray,
                         color: tuple = (0, 200, 0), alpha: int = 200
                         ) -> trimesh.Trimesh:
-    """Create a simplified WX250s gripper mesh at a grasp pose.
+    """Create a WX250s gripper mesh approaching along the plane normal.
 
-    In camera frame: Z is forward (approach), X is right, Y is down.
-    The gripper approaches along +Z with fingers spread along the
-    finger_dir (rotated by yaw in the XY plane).
+    The gripper approaches perpendicular to the table (along plane_normal),
+    with fingers spread in the tangent plane at the given yaw angle.
     """
     finger_length = 0.04
     finger_thickness = 0.006
@@ -245,7 +267,9 @@ def create_gripper_mesh(center: np.ndarray, yaw: float, width: float,
 
     half_w = width / 2
 
-    # Build gripper in local frame: fingers along X, approach along -Z
+    # Build gripper in local frame:
+    #   local X = finger spread axis
+    #   local Z = approach direction (fingers extend along +Z, stem along -Z)
     lf = trimesh.creation.box([finger_thickness, finger_thickness, finger_length])
     lf.apply_translation([half_w + finger_thickness / 2, 0, finger_length / 2])
 
@@ -260,11 +284,13 @@ def create_gripper_mesh(center: np.ndarray, yaw: float, width: float,
 
     gripper = trimesh.util.concatenate([lf, rf, palm, stem])
 
-    # In camera frame: approach is along -Z (towards camera).
-    # Rotate 180 about X to flip Z, then rotate by yaw around Z.
-    rot_flip = Rotation.from_euler('x', 180, degrees=True)
-    rot_yaw = Rotation.from_euler('z', np.degrees(yaw), degrees=True)
-    rot = (rot_yaw * rot_flip).as_matrix()
+    # Build rotation: local +Z maps to -plane_normal (approach INTO table),
+    # local X maps to finger direction in the tangent plane
+    u_axis, v_axis = build_plane_basis(plane_normal)
+    finger_3d = np.cos(yaw) * u_axis + np.sin(yaw) * v_axis
+    perp_3d = np.cross(-plane_normal, finger_3d)  # local Y
+
+    rot = np.column_stack([finger_3d, perp_3d, -plane_normal])
 
     transform = np.eye(4)
     transform[:3, :3] = rot
@@ -498,8 +524,11 @@ def compute_pipeline(depth_mm_raw: np.ndarray, rgb_bgr: np.ndarray,
         results['plane_info'] = None
         results['points_filtered'] = points_cam
 
-    # Stage 6: Min-sweep grasps
-    grasps = method_minwidth_sweep(results['points_filtered'])
+    # Stage 6: Min-sweep grasps (in the floor plane coordinate system)
+    plane_info = results.get('plane_info')
+    plane_normal = plane_info['normal'] if plane_info is not None else np.array([0., -1., 0.])
+    results['plane_normal'] = plane_normal
+    grasps = method_minwidth_sweep(results['points_filtered'], plane_normal)
     results['all_grasps'] = grasps
     print(f'Stage 6: {len(grasps)} grasp candidates')
 
@@ -620,6 +649,7 @@ class PipelineVisualizer:
         self._scene_handles['stage5'] = handles5
 
         # Stage 6: All grasps + point cloud
+        plane_normal = p['plane_normal']
         handles6 = []
         if len(pts_filt) > 0:
             h = self.server.scene.add_point_cloud(
@@ -629,7 +659,8 @@ class PipelineVisualizer:
 
         for i, g in enumerate(p['all_grasps'][:36]):  # show up to 36
             c = score_to_color(g.score)
-            mesh = create_gripper_mesh(g.center, g.yaw, g.width, color=c)
+            mesh = create_gripper_mesh(g.center, g.yaw, g.width,
+                                       plane_normal, color=c)
             h = self.server.scene.add_mesh_trimesh(f'/stage6/gripper_{i:02d}', mesh)
             handles6.append(h)
         self._scene_handles['stage6'] = handles6
@@ -645,6 +676,7 @@ class PipelineVisualizer:
         if p['best_grasp'] is not None:
             g = p['best_grasp']
             mesh = create_gripper_mesh(g.center, g.yaw, g.width,
+                                       plane_normal,
                                        color=(0, 220, 0), alpha=230)
             h = self.server.scene.add_mesh_trimesh('/stage7/gripper_best', mesh)
             handles7.append(h)
