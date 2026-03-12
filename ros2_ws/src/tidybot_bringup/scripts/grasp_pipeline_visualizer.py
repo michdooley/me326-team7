@@ -29,7 +29,6 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
-import PIL.Image
 import trimesh
 import viser
 from scipy.io import loadmat
@@ -287,46 +286,45 @@ def color_by_depth(points: np.ndarray) -> np.ndarray:
 
 # ── Image-as-plane rendering ───────────────────────────────────────────────
 
-def image_to_textured_mesh(image_bgr: np.ndarray, z_depth: float,
-                           fx: float, fy: float, cx: float, cy: float,
-                           u0: int = 0, v0: int = 0,
-                           u1: Optional[int] = None, v1: Optional[int] = None
-                           ) -> trimesh.Trimesh:
-    """Create a textured quad in camera frame at z_depth.
+def add_image_plane(server: viser.ViserServer, name: str,
+                    image_bgr: np.ndarray, z_depth: float,
+                    fx: float, fy: float, cx: float, cy: float,
+                    full_w: int, full_h: int,
+                    u0: int = 0, v0: int = 0,
+                    u1: Optional[int] = None, v1: Optional[int] = None,
+                    visible: bool = True):
+    """Place an image in the 3D scene using viser's add_image.
 
-    The quad corners are computed via the pinhole model so that the image
+    Computes world-space dimensions from the pinhole model so that the image
     pixels align exactly with back-projected 3D points at the same depth.
 
     u0,v0,u1,v1 specify the pixel region this image covers in the full frame.
+    The image is positioned so its center matches the correct 3D location.
     """
-    img_h, img_w = image_bgr.shape[:2]
     if u1 is None:
-        u1 = img_w
+        u1 = full_w
     if v1 is None:
-        v1 = img_h
+        v1 = full_h
 
-    # Full-frame pixel coordinates of the image corners
-    # (these are the original pixel coords, not 0-based within the crop)
-    x_left = (u0 - cx) * z_depth / fx
-    x_right = (u1 - cx) * z_depth / fx
-    y_top = (v0 - cy) * z_depth / fy
-    y_bot = (v1 - cy) * z_depth / fy
+    # World-space width and height of the pixel region at z_depth
+    render_width = (u1 - u0) * z_depth / fx
+    render_height = (v1 - v0) * z_depth / fy
 
-    vertices = np.array([
-        [x_left, y_top, z_depth],
-        [x_right, y_top, z_depth],
-        [x_right, y_bot, z_depth],
-        [x_left, y_bot, z_depth],
-    ], dtype=np.float64)
-    faces = np.array([[0, 1, 2], [0, 2, 3]])
-    uv = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float64)
+    # Center of the pixel region in world coords
+    u_center = (u0 + u1) / 2.0
+    v_center = (v0 + v1) / 2.0
+    x_center = (u_center - cx) * z_depth / fx
+    y_center = (v_center - cy) * z_depth / fy
 
+    # Convert BGR to RGB for viser
     rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    pil_img = PIL.Image.fromarray(rgb)
 
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
-    mesh.visual = trimesh.visual.TextureVisuals(uv=uv, image=pil_img)
-    return mesh
+    return server.scene.add_image(
+        name, image=rgb,
+        render_width=render_width, render_height=render_height,
+        position=(x_center, y_center, z_depth),
+        visible=visible,
+    )
 
 
 # ── YOLO detection ──────────────────────────────────────────────────────────
@@ -485,26 +483,27 @@ class PipelineVisualizer:
         p = self.pipeline
         z = self.plane_z
 
-        # Stage 1: Depth image as textured plane
-        mesh1 = image_to_textured_mesh(
+        # Stage 1: Depth image as plane in 3D scene
+        h = add_image_plane(
+            self.server, '/stage1/depth_plane',
             p['depth_colored'], z, self.fx, self.fy, self.cx, self.cy,
-            u0=0, v0=0, u1=self.img_w, v1=self.img_h)
-        h = self.server.scene.add_mesh_trimesh('/stage1/depth_plane', mesh1)
+            self.img_w, self.img_h)
         self._scene_handles['stage1'] = [h]
 
-        # Stage 2: RGB + YOLO bbox as textured plane
-        mesh2 = image_to_textured_mesh(
+        # Stage 2: RGB + YOLO bbox as plane in 3D scene
+        h = add_image_plane(
+            self.server, '/stage2/rgb_plane',
             p['rgb_bbox'], z, self.fx, self.fy, self.cx, self.cy,
-            u0=0, v0=0, u1=self.img_w, v1=self.img_h)
-        h = self.server.scene.add_mesh_trimesh('/stage2/rgb_plane', mesh2)
+            self.img_w, self.img_h)
         self._scene_handles['stage2'] = [h]
 
-        # Stage 3: Cropped depth as textured plane (positioned at crop region)
+        # Stage 3: Cropped depth as plane (positioned at crop region)
         u0, v0, u1, v1 = p['crop_bounds']
-        mesh3 = image_to_textured_mesh(
+        h = add_image_plane(
+            self.server, '/stage3/crop_plane',
             p['depth_roi_colored'], z, self.fx, self.fy, self.cx, self.cy,
+            self.img_w, self.img_h,
             u0=u0, v0=v0, u1=u1, v1=v1)
-        h = self.server.scene.add_mesh_trimesh('/stage3/crop_plane', mesh3)
         self._scene_handles['stage3'] = [h]
 
         # Stage 4: Raw point cloud
@@ -635,7 +634,7 @@ def main():
     parser.add_argument(
         '--captures-dir', type=Path,
         default=Path(__file__).resolve().parents[2]
-        / 'src/tidybot_perception/test/captures_real',
+        / 'tidybot_perception/test/captures_real',
         help='Root captures directory')
     parser.add_argument(
         '--pair', type=str, default='pair_0008',
