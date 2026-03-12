@@ -38,8 +38,6 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 from interbotix_xs_msgs.msg import JointGroupCommand
-from tidybot_msgs.msg import ArmCommand
-
 
 class ArmWrapperNode(Node):
     """Wrapper node with velocity limiting for safe sim-to-real arm control."""
@@ -120,16 +118,6 @@ class ArmWrapperNode(Node):
         self.left_arm_sub = self.create_subscription(
             Float64MultiArray, '/left_arm/joint_cmd',
             lambda msg: self._arm_target_callback(msg, 'left'), 10
-        )
-        # ArmCommand subscribers — allows pick_and_place.py and other high-level
-        # nodes to send joint-space commands directly without arm_controller_node
-        self.right_arm_cmd_sub = self.create_subscription(
-            ArmCommand, '/right_arm/cmd',
-            lambda msg: self._arm_cmd_callback(msg, 'right'), 10
-        )
-        self.left_arm_cmd_sub = self.create_subscription(
-            ArmCommand, '/left_arm/cmd',
-            lambda msg: self._arm_cmd_callback(msg, 'left'), 10
         )
         self.pan_tilt_cmd_sub = self.create_subscription(
             Float64MultiArray, '/camera/pan_tilt_cmd',
@@ -216,22 +204,6 @@ class ArmWrapperNode(Node):
         else:
             self.left_target = target
 
-    def _arm_cmd_callback(self, msg: ArmCommand, side: str):
-        """Handle ArmCommand messages (joint positions + duration). Duration is
-        ignored — velocity limiting in the control loop provides smooth motion."""
-        if len(msg.joint_positions) != 6:
-            self.get_logger().warn(f'{side} arm: expected 6 joints, got {len(msg.joint_positions)}')
-            return
-        target = np.clip(
-            np.array(msg.joint_positions),
-            self.ARM_JOINT_LIMITS[:, 0],
-            self.ARM_JOINT_LIMITS[:, 1],
-        )
-        if side == 'right':
-            self.right_target = target
-        else:
-            self.left_target = target
-
     def _pan_tilt_target_callback(self, msg: Float64MultiArray):
         """Store pan-tilt target positions."""
         if len(msg.data) < 2:
@@ -250,21 +222,27 @@ class ArmWrapperNode(Node):
     #  Control loop — velocity-limited interpolation toward targets
     # ------------------------------------------------------------------ #
 
+    # Tolerance (rad) below which the arm is considered "at target" and
+    # we stop publishing to avoid fighting with the motion planner.
+    _AT_TARGET_TOL = 0.01
+
     def _control_loop(self):
         """Move commanded positions toward targets at bounded velocity."""
-        # Right arm
+        # Right arm — only publish while actively moving toward target
         if self.right_target is not None and self.right_initialized:
-            self.right_cmd = self._step_toward(
-                self.right_cmd, self.right_target, self.arm_max_step
-            )
-            self._publish_arm_cmd(self.right_cmd, 'right')
+            if np.max(np.abs(self.right_target - self.right_cmd)) > self._AT_TARGET_TOL:
+                self.right_cmd = self._step_toward(
+                    self.right_cmd, self.right_target, self.arm_max_step
+                )
+                self._publish_arm_cmd(self.right_cmd, 'right')
 
-        # Left arm
+        # Left arm — only publish while actively moving toward target
         if self.left_target is not None and self.left_initialized:
-            self.left_cmd = self._step_toward(
-                self.left_cmd, self.left_target, self.arm_max_step
-            )
-            self._publish_arm_cmd(self.left_cmd, 'left')
+            if np.max(np.abs(self.left_target - self.left_cmd)) > self._AT_TARGET_TOL:
+                self.left_cmd = self._step_toward(
+                    self.left_cmd, self.left_target, self.arm_max_step
+                )
+                self._publish_arm_cmd(self.left_cmd, 'left')
 
         # Pan-tilt
         if self.pt_target is not None and self.pt_initialized:

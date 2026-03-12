@@ -118,6 +118,8 @@ GRASP_VALIDATION_POS = [0.0, -1.0, 0.6, 0.0, 0.4, 0.0]   # good pose for grasp v
 RETRACT_HOLDING_POS  = [0.0, -1.35, 0.6, 0.0, 0.75, 0.0]  # high overhead hold — clears camera & bin
 PRESENT_POSE         = [0.0, -0.5,  0.5,  0.0, -0.5,  0.0]  # raised presentation pose
 
+GRIPPER_OPEN_POS = 0.10  # gripper "open" command value
+
 FLOOR_MARGIN = 0.008  # RANSAC inlier distance threshold for floor plane
 
 
@@ -204,9 +206,9 @@ class PickAndBring(Node):
     GRASP_MOVE_DURATION          = 2.0
     GRASP_PRE_HEIGHT             = 0.10
     GRASP_LIFT_HEIGHT            = 0.15
-    GRASP_Z_OFFSET               = 0.03 # 0.03
-    GRASP_X_OFFSET               = -0.03
-    GRASP_Y_OFFSET               = -0.00
+    GRASP_Z_OFFSET               = 0.02 # 0.03
+    GRASP_X_OFFSET               = -0.05 #0.03
+    GRASP_Y_OFFSET               = -0.02
     GRASP_BBOX_PAD               = 1.3
     GRASP_SETTLE_TIME            = 1.0
     GRASP_GRIPPER_CLOSE_REPEATS  = 20
@@ -220,9 +222,9 @@ class PickAndBring(Node):
     GRASP_MAX_IK_NUDGES          = 6   # nudge-and-retry cycles per attempt
 
     # ── Grasp validation ────────────────────────────────────────────────────
-    GRASP_VALIDATION_TILT        = -0.7854  # camera tilt during validation (~45° up at trophy pose)
-    GRASP_VALIDATION_WAIT        = 2.0   # seconds per forearm-roll pose to check for detection
-    GRASP_VALIDATION_ROLLS       = [-0.5, 0.0, 0.5]  # forearm_roll angles to cycle
+    GRASP_VALIDATION_TILT        = -0.0  # camera tilt during validation (~45° up at trophy pose)
+    GRASP_VALIDATION_WAIT        = 3.0   # seconds to scan for detection at trophy pose
+    GRASP_VALIDATION_MIN_CONF    = 0.10  # very low confidence — any single frame counts
 
     # ── Bin parameters ────────────────────────────────────────────────────────
     BIN_HEIGHT              = 0.3048   # 12 inches
@@ -299,10 +301,11 @@ class PickAndBring(Node):
         self.declare_parameter('user_command', 'get')
         self.declare_parameter('arm_name', 'right')
         self.declare_parameter('target_person', 'michael')
-        self.declare_parameter('skip_grasp_validation', False)
+        self.declare_parameter('skip_grasp_validation', True)
+        _sgv_param = self.get_parameter('skip_grasp_validation').get_parameter_value()
         self.skip_grasp_validation = (
-            self.get_parameter('skip_grasp_validation')
-            .get_parameter_value().bool_value)
+            _sgv_param.bool_value
+            or str(_sgv_param.string_value).lower() in ('true', '1', 'yes'))
 
         self.target_person = (
             self.get_parameter('target_person')
@@ -392,6 +395,8 @@ class PickAndBring(Node):
             String, '/user_command', self._user_command_cb, voice_qos)
         self.create_subscription(
             String, '/target_object', self._target_object_cb, voice_qos)
+        self.create_subscription(
+            String, '/target_location', self._target_location_cb, voice_qos)
 
         # Safe-stop listener
         self._safe_stop_requested = False
@@ -438,6 +443,7 @@ class PickAndBring(Node):
             self.get_logger().info(
                 f'  Mode   : voice commands via /target_object')
         self.get_logger().info(f'  Arm    : {self.GRASP_ARM_NAME}')
+        self.get_logger().info(f'  Skip grasp validation: {self.skip_grasp_validation}')
         self.get_logger().info('=' * 55)
 
     # ── Sensor callbacks ─────────────────────────────────────────────────────
@@ -753,7 +759,7 @@ class PickAndBring(Node):
             time.sleep(0.05)
 
         grip_msg = Float64MultiArray()
-        grip_msg.data = [0.05]
+        grip_msg.data = [GRIPPER_OPEN_POS]
         for _ in range(10):
             self.gripper_pub.publish(grip_msg)
             rclpy.spin_once(self, timeout_sec=0.05)
@@ -897,6 +903,20 @@ class PickAndBring(Node):
         action = self._last_voice_action
         self.command_queue.append((action, obj))
         self.get_logger().info(f'[VOICE] Queued command: {action} {obj}')
+
+    def _target_location_cb(self, msg: String):
+        """Handle /target_location — look for bin names when holding an object."""
+        location = msg.data.strip().lower()
+        if not location:
+            return
+        if self.state != TaskState.WAITING_FOR_DROP:
+            return
+        bin_target = self._parse_bin_target(location)
+        if bin_target is not None:
+            self.get_logger().info(
+                f'[VOICE] Bin command from location: "{location}" → {bin_target} bin')
+            self._bin_pending = True
+            self._bin_target_name = bin_target
 
     def _start_next_command(self):
         if not self.command_queue:
@@ -1682,7 +1702,7 @@ class PickAndBring(Node):
             return False
 
         # Retract arm to overhead holding pose
-        self._retract_holding()
+        self._retract_holding(trophy_pose=trophy_pose)
 
         # Transition to Phase 2: find person
         self._transition_to_person_finding()
@@ -2400,7 +2420,7 @@ class PickAndBring(Node):
             if result.executed:
                 if keep_gripper_open:
                     grip_msg = Float64MultiArray()
-                    grip_msg.data = [0.05]
+                    grip_msg.data = [GRIPPER_OPEN_POS]
                     deadline = time.time() + self.GRASP_MOVE_DURATION + 0.5
                     while time.time() < deadline:
                         self.gripper_pub.publish(grip_msg)
@@ -2443,19 +2463,20 @@ class PickAndBring(Node):
         self.arm_pub.publish(msg)
         time.sleep(duration + 0.5)
 
-    def _retract_holding(self, duration=3.0):
-        """Retract arm to a raised overhead pose while keeping gripper closed."""
-        self.get_logger().info(
-            f'[ARM] Retracting arm to overhead pose over {duration}s')
-        msg = ArmCommand()
-        msg.joint_positions = list(RETRACT_HOLDING_POS)
-        msg.duration = duration
-        self.arm_pub.publish(msg)
-        grip_msg = Float64MultiArray()
-        grip_msg.data = [1.0]
-        for _ in range(int(duration / 0.1)):
-            self.gripper_pub.publish(grip_msg)
-            rclpy.spin_once(self, timeout_sec=0.1)
+    def _retract_holding(self, trophy_pose=None):
+        """Retract arm up and forward from trophy pose, out of camera's way."""
+        self.get_logger().info('[ARM] Retracting arm to overhead pose via IK')
+        pose = Pose()
+        if trophy_pose is not None:
+            pose.position.x = trophy_pose.position.x
+            pose.position.y = trophy_pose.position.y - 0.12  # forward (-Y)
+            pose.position.z = trophy_pose.position.z + 0.10  # up (+Z)
+        else:
+            pose.position.x = 0.0
+            pose.position.y = -0.20
+            pose.position.z = 0.45
+        if not self._bin_plan_and_execute(pose, 'RETRACT', use_orientation=False):
+            self.get_logger().warn('[ARM] IK retract failed, gripper remains closed')
         time.sleep(0.5)
 
     # ── Grasp validation ────────────────────────────────────────────────────
@@ -2464,8 +2485,8 @@ class PickAndBring(Node):
         """Check if the object is visible in the gripper at the trophy pose.
 
         Stays at the current (trophy) arm pose, tilts camera up to see the
-        gripper, and rotates the forearm to present the object from multiple
-        angles.  Returns True if the target object is detected.
+        gripper, and scans for any YOLO detection of the target object
+        (even a single low-confidence frame counts as success).
         """
         if self.skip_grasp_validation:
             self.get_logger().info('[GRASP-VALIDATE] Validation skipped (parameter)')
@@ -2479,49 +2500,37 @@ class PickAndBring(Node):
             f'[GRASP-VALIDATE] Camera tilt → {self.GRASP_VALIDATION_TILT:.2f}, waiting to settle...')
         self._spin_for(2.0)
 
-        # Cycle through forearm_roll angles to present the object
-        for roll_angle in self.GRASP_VALIDATION_ROLLS:
-            # Build a pose that keeps the validation config but changes forearm_roll
-            pose = list(GRASP_VALIDATION_POS)
-            pose[3] = roll_angle  # forearm_roll (index 3)
+        # Clear stale detections, then scan for any detection at low confidence
+        self.latest_yolo_detection = None
+        saved_min_conf = self.MIN_CONFIDENCE
+        self.MIN_CONFIDENCE = self.GRASP_VALIDATION_MIN_CONF
 
-            self.get_logger().info(
-                f'[GRASP-VALIDATE] Rotating forearm to {roll_angle:.2f} rad...')
-            msg = ArmCommand()
-            msg.joint_positions = pose
-            msg.duration = 1.5
-            self.arm_pub.publish(msg)
-
-            # Keep gripper closed while arm moves to pose
-            grip_msg = Float64MultiArray()
-            grip_msg.data = [1.0]
-            for _ in range(int(1.5 / 0.1)):
-                self.gripper_pub.publish(grip_msg)
-                rclpy.spin_once(self, timeout_sec=0.1)
-
-            # Wait for arm to settle, then clear stale detections and check
-            self._spin_for(0.5)
-            self.latest_yolo_detection = None
-            self._spin_for(self.GRASP_VALIDATION_WAIT)
-
+        detected = False
+        deadline = time.time() + self.GRASP_VALIDATION_WAIT
+        while time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.05)
             if self.latest_yolo_detection is not None:
+                det = self.latest_yolo_detection
+                score = det.results[0].hypothesis.score
                 self.get_logger().info(
-                    f'[GRASP-VALIDATE] Object detected at forearm_roll={roll_angle:.2f} '
+                    f'[GRASP-VALIDATE] Object detected (conf={score:.2f}) '
                     f'— grasp CONFIRMED!')
-                return True
+                detected = True
+                break
 
-            self.get_logger().info(
-                f'[GRASP-VALIDATE] No detection at forearm_roll={roll_angle:.2f}')
+        self.MIN_CONFIDENCE = saved_min_conf
 
-        # All rotations checked, no detection — grasp failed
+        if detected:
+            return True
+
         self.get_logger().warn(
-            '[GRASP-VALIDATE] Object NOT detected after all rotations — grasp FAILED')
+            '[GRASP-VALIDATE] Object NOT detected — grasp FAILED')
 
         # Tilt camera back to object-finding angle
         self._set_camera_tilt(self.PHASE_PARAMS['object']['initial_tilt'])
 
         # Open gripper (not holding anything)
-        self._set_gripper(0.05)
+        self._set_gripper(GRIPPER_OPEN_POS)
         self._spin_for(0.5)
 
         return False
