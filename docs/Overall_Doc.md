@@ -1,5 +1,10 @@
 # TidyBot2 — System Overview
 
+**Task Documentation:**
+[Task 1: Explore & Find](docs/Task1_Explore_and_Find.md) |
+[Task 2: Pick & Place](docs/Task2_Pick_and_Place.md) |
+[Task 3: Pick & Bring](docs/Task3_Pick_and_Bring.md)
+
 ## What It Is
 
 TidyBot2 is a mobile bimanual robot (2x WX250s arms, pan-tilt RealSense D435 camera, omnidirectional base) built for Stanford ME326 Collaborative Robotics. It autonomously finds, grasps, and delivers household objects using vision-based perception and voice commands.

@@ -1,212 +1,68 @@
-# Collaborative Robotics 2026
+# TidyBot2 — System Overview
 
-This repository contains software for controlling the **TidyBot2** mobile robot with bimanual **WX250s** 6-DOF arms, developed for Professor Monroe Kennedy's 2026 Collaborative Robotics Class.
+**Task Documentation:**
+[Task 1: Explore & Find](docs/Task1_Explore_and_Find.md) |
+[Task 2: Pick & Place](docs/Task2_Pick_and_Place.md) |
+[Task 3: Pick & Bring](docs/Task3_Pick_and_Bring.md)
 
-## Installation
+## What It Is
 
-There are two ways to get started:
+TidyBot2 is a mobile bimanual robot (2x WX250s arms, pan-tilt RealSense D435 camera, omnidirectional base) built for Stanford ME326 Collaborative Robotics. It autonomously finds, grasps, and delivers household objects using vision-based perception and voice commands.
 
-### Option A: Docker (Any OS)
+## Architecture
 
-Use our pre-built Docker image with VNC desktop access. Works on any OS (Windows, macOS, Linux).
+```
+Voice Command ──► State Machine ──► Base Control (cmd_vel)
+                      │              Arm Control (IK / motion planner)
+YOLO Detection ──────►│              Gripper Control
+Face Recognition ────►│
+AprilTag Detection ──►│
+Depth + TF ──────────►│
+```
+
+All three tasks share a common code base via **mixin classes** in `scripts/common/`:
+
+| Module | Role |
+|--------|------|
+| `constants.py` | YOLO class map, AprilTag IDs, joint poses, RANSAC |
+| `perception.py` | Camera callbacks, depth→world projection, YOLO filtering |
+| `grasp_pipeline.py` | Top-down grasp planning, IK, visual servoing, execution |
+| `arm_helpers.py` | Gripper open/close, home/retract poses, camera tilt |
+| `base_control.py` | Base motion, pose queries, waypoint recording |
+
+## The Three Tasks
+
+| Task | Script | Summary |
+|------|--------|---------|
+| **1** | `task1_explore_and_find.py` | Voice-commanded object retrieval with return-to-start |
+| **2** | `task2_pick_and_place.py` | Pick object (YOLO) → find bin (AprilTag) → drop |
+| **3** | `task3_pick_and_bring.py` | Pick object → find person (face recognition) → present → optional bin placement |
+
+See the individual task docs for details.
+
+## Quick Start
 
 ```bash
-# 1. Clone the repo (if you are in windows, we highly, highly recommend WSL Bash)
-git clone https://github.com/armlabstanford/collaborative-robotics-2026.git
-cd collaborative-robotics-2026
+# Build
+cd ros2_ws && colcon build --packages-select tidybot_perception tidybot_bringup && source install/setup.bash
 
-# 2. Pull the image
-docker pull peasant98/tidybot2:humble
+# Launch sim
+ros2 launch tidybot_bringup sim.launch.py scene:=scene_bins.xml
 
-# 3. Run with the repo mounted (changes sync between host and container)
-docker run -p 6080:80 --shm-size=2g \
-    -v $(pwd):/home/ubuntu/Desktop/collaborative \
-    peasant98/tidybot2:humble
+# Launch YOLO
+ros2 run object_classification classifier
 
-# Access via browser: http://127.0.0.1:6080/
-
-# You can open a terminal there, and then go to the /home/ubuntu/Desktop/collaborative folder and run
-./setup.sh
-
-# (this will give you options to install everything, just the sim, etc.
+# Run a task (e.g. Task 2)
+ros2 launch tidybot_bringup pick_and_place.launch.py target_object:=banana
 ```
 
-**Syncing updates:** With the volume mount, any `git pull` on your host machine will immediately reflect inside the running container.
+## Key ROS Topics
 
-**Available commands in container:**
-| Command | Description |
-|---------|-------------|
-| `tidybot-sim` | MuJoCo standalone simulation |
-| `tidybot-ros` | ROS2 + RViz + MuJoCo |
-| `tidybot-ros-no-rviz` | ROS2 + MuJoCo (no RViz) |
-| `tidybot-test-base` | Test base movement |
-| `tidybot-test-arms` | Test arm control |
-
-### Option B: Native Ubuntu 22.04
-
-If you have Ubuntu 22.04 (native install, dual-boot, or VM), use the setup script:
-
-```bash
-# Clone the repository
-git clone https://github.com/armlabstanford/collaborative-robotics-2026.git
-cd collaborative-robotics-2026
-
-# Run the setup script (installs ROS2, dependencies, and builds workspace)
-./setup.sh
-```
-
-The setup script handles everything: system dependencies, ROS2 Humble, Python environment (`uv sync`), and building the ROS2 workspace (`colcon build`).
-
-## Quick Start SIMULATION
-
-### Option 1: Standalone MuJoCo Simulation (No ROS2)
-
-```bash
-cd simulation/scripts
-
-# Bimanual arm demo with camera control
-uv run python test_move.py
-
-# Object manipulation demo
-uv run python pick_up_block.py
-```
-
-### Option 2: Full ROS2 Simulation
-
-**Terminal 1 - Launch simulation:**
-```bash
-cd ros2_ws
-source setup_env.bash
-ros2 launch tidybot_bringup sim.launch.py
-```
-
-This opens RViz2 and MuJoCo viewer.
-
-**Terminal 2 - Run test scripts:**
-```bash
-cd ros2_ws
-source setup_env.bash
-
-# Test base movement
-ros2 run tidybot_bringup test_base_sim.py
-
-# Test bimanual arms
-ros2 run tidybot_bringup test_arms_sim.py
-
-# Test camera pan-tilt
-ros2 run tidybot_bringup test_camera_sim.py
-
-# Advanced state machine example
-ros2 run tidybot_bringup example_state_machine.py
-```
-
-**Launch Options:**
-```bash
-# Disable RViz
-ros2 launch tidybot_bringup sim.launch.py use_rviz:=false
-
-# Disable MuJoCo viewer
-ros2 launch tidybot_bringup sim.launch.py show_mujoco_viewer:=false
-```
-
-## Quick Start REAL
-
-NOTE: You do not need to re-run "colcon build" for every new terminal, re-build is only necessary whenver source code was modified. Make sure to re-source for new terminals.
-
-**Terminal 1: Launch Initialization of TidyBot**
-```bash
-cd ros2_ws
-source setup_env.bash 
-
-# Launch bringup
-ros2 launch tidybot_bringup real.launch.py
-```
-
-**Terminal 2: Run Command Script**
-```bash
-cd ros2_ws
-source setup_env.bash 
-
-# Test base movement
-ros2 run tidybot_bringup test_base_real.py
-
-# Test bimanual arms
-ros2 run tidybot_bringup test_arms_real.py
-```
-
-## Repository Structure
-
-```
-collaborative-robotics-2026/
-├── simulation/                  # Standalone MuJoCo simulation
-│   ├── scripts/                 # test_move.py, pick_up_block.py
-│   └── assets/                  # MuJoCo models and meshes
-│
-└── ros2_ws/                     # ROS2 workspace
-    ├── setup_env.bash           # Environment setup script
-    └── src/
-        ├── tidybot_bringup/     # Launch files & test scripts
-        ├── tidybot_description/ # URDF/XACRO robot model
-        ├── tidybot_msgs/        # Custom ROS2 messages
-        ├── tidybot_mujoco_bridge/  # MuJoCo-ROS2 bridge
-        └── tidybot_control/     # Arm/base controllers
-```
-
-## Robot Specifications
-
-**TidyBot2** is a mobile manipulation platform consisting of:
-- **Mobile Base**: Kobuki or Create3 base with 3 DOF (x, y, theta)
-- **Arms**: 2x WX250s 6-DOF manipulators (650mm reach, 250g payload)
-  - Waist (base rotation): ±180°
-  - Shoulder (lift): -108° to 114°
-  - Elbow (bend): -123° to 92°
-  - Forearm roll: ±180°
-  - Wrist angle: -100° to 123°
-  - Wrist rotate: ±180°
-- **Grippers**: 2x Robotiq 2F-85 adaptive parallel jaw (85mm max opening)
-- **Camera**: Pan-tilt RealSense D435 (RGB + Depth)
-
-## ROS2 Topics
-
-| Topic | Type | Description |
-|-------|------|-------------|
-| `/cmd_vel` | geometry_msgs/Twist | Base velocity |
-| `/left_arm/command` | ArmCommand | Left arm control |
-| `/right_arm/command` | ArmCommand | Right arm control |
-| `/left_gripper/command` | GripperCommand | Left gripper |
-| `/right_gripper/command` | GripperCommand | Right gripper |
-| `/camera/pan_tilt` | PanTilt | Camera orientation |
-| `/joint_states` | sensor_msgs/JointState | Joint feedback |
-
-## Troubleshooting
-
-**MuJoCo rendering issues:**
-```bash
-sudo apt install -y mesa-utils
-glxinfo | grep "OpenGL version"
-```
-
-**Python import errors:**
-```bash
-# Always source environment first
-source ros2_ws/setup_env.bash
-```
-
-**colcon build fails:**
-```bash
-# Ensure ROS2 is sourced before building
-source /opt/ros/humble/setup.bash
-cd ros2_ws && colcon build
-```
-
-## Resources
-
-- [MuJoCo Documentation](https://mujoco.readthedocs.io/)
-- [uv Documentation](https://docs.astral.sh/uv/)
-- [TidyBot Paper](https://arxiv.org/abs/2305.05658)
-- [TidyBot2 Paper](https://arxiv.org/pdf/2412.10447)
-- [Interbotix WX250s Specs](https://docs.trossenrobotics.com/interbotix_xsarms_docs/specifications/wx250s.html)
-
-## Authors
-
-Alex Qiu & Matt Strong - Stanford ARM Lab
+| Topic | Purpose |
+|-------|---------|
+| `/objbbox` | YOLO detections (Detection2DArray) |
+| `/target_object` | Voice: which object to find |
+| `/user_command` | Voice: "get", "drop", "bring it to the bin" |
+| `/face_detections` | Face recognition bounding boxes |
+| `/cmd_vel` | Base velocity |
+| `/left_arm/command`, `/right_arm/command` | Arm joint commands |
