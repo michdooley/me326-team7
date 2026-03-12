@@ -232,7 +232,12 @@ def method_minwidth_sweep(points: np.ndarray, plane_normal: np.ndarray,
         center_offset = (proj_min + proj_max) / 2.0
         clearance = (GRIPPER_MAX_OPENING_M - width) / 2.0
         feasible = width <= GRIPPER_MAX_OPENING_M
-        score = max(0.0, clearance / (GRIPPER_MAX_OPENING_M / 2.0)) if feasible else 0.0
+        # Positive score for feasible grasps; for infeasible, use negative
+        # clearance so the narrowest (least infeasible) still ranks highest
+        if feasible:
+            score = clearance / (GRIPPER_MAX_OPENING_M / 2.0)
+        else:
+            score = clearance / (GRIPPER_MAX_OPENING_M / 2.0)  # negative
 
         # Grasp center in 3D: centroid + offset along finger direction in plane
         finger_3d = finger_2d[0] * u_axis + finger_2d[1] * v_axis
@@ -302,8 +307,8 @@ def create_gripper_mesh(center: np.ndarray, yaw: float, width: float,
 
 
 def score_to_color(score: float) -> tuple:
-    """Map score [0,1] to color: red (0) -> yellow (0.5) -> green (1)."""
-    s = max(0.0, min(1.0, score))
+    """Map score to color: red (<=0) -> yellow (0.5) -> green (1)."""
+    s = max(0.0, min(1.0, score))  # clamp negatives to red
     if s < 0.5:
         t = s * 2
         return (int(220), int(t * 200), int(20))
