@@ -43,7 +43,7 @@ ros2 run object_classification classifier
 ros2 run tidybot_bringup task2_pick_and_place.py --ros-args -p skip_voice:=true
 
 # Terminal 4: AprilTag detector (for bin finding)
-ros2 run tidybot_perception apriltag_detector_node.py
+ros2 run tidybot_perception apriltag_detector_node
 ```
 
 **Real hardware:**
@@ -58,7 +58,7 @@ ros2 run object_classification classifier
 ros2 run tidybot_bringup task2_pick_and_place.py --ros-args -p skip_voice:=false
 
 # Terminal 4: AprilTag detector (for bin finding)
-ros2 run tidybot_perception apriltag_detector_node.py
+ros2 run tidybot_perception apriltag_detector_node
 
 # Terminal 5: voice
 ros2 run tidybot_bringup voice_command.py

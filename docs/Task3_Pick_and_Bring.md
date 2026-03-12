@@ -42,7 +42,7 @@ ros2 run object_classification classifier
 ros2 run tidybot_bringup task3_pick_and_bring.py --ros-args -p skip_voice:=true
 
 # Terminal 4: AprilTag detector (for bin finding)
-ros2 run tidybot_perception apriltag_detector_node.py
+ros2 run tidybot_perception apriltag_detector_node
 ```
 
 **Real hardware:**
@@ -57,10 +57,11 @@ ros2 run object_classification classifier
 ros2 run tidybot_bringup task3_pick_and_bring.py --ros-args -p skip_voice:=false
 
 # Terminal 4: AprilTag detector (for bin finding)
-ros2 run tidybot_perception apriltag_detector_node.py
+ros2 run tidybot_perception apriltag_detector_node
 
 # Terminal 5: face recognition
-ros2 run tidybot_perception face_recognition_node.py
+ros2 run tidybot_perception face_recognition_node --ros-args \
+    -p known_faces_dir:=ros2_ws/src/tidybot_bringup/face/
 
 # Terminal 6: voice
 ros2 run tidybot_bringup voice_command.py
