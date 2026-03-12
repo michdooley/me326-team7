@@ -31,6 +31,7 @@ The script uses `PHASE_PARAMS` to switch detection sources and approach distance
 
 ## How to Run
 
+**Simulation:**
 ```bash
 # Terminal 1: sim
 ros2 launch tidybot_bringup sim.launch.py scene:=scene_bins.xml
@@ -38,17 +39,35 @@ ros2 launch tidybot_bringup sim.launch.py scene:=scene_bins.xml
 # Terminal 2: YOLO
 ros2 run object_classification classifier
 
-# Terminal 3: task (no voice)
-ros2 launch tidybot_bringup pick_and_place.launch.py target_object:=banana
+# Terminal 3: task
+ros2 run tidybot_bringup task2_pick_and_place.py --ros-args -p skip_voice:=true
+
+# Terminal 4: AprilTag detector (for bin finding)
+ros2 run tidybot_perception apriltag_detector_node.py
 ```
 
-**With voice:**
+**Real hardware:**
 ```bash
-# Terminal 3:
-ros2 launch tidybot_bringup pick_and_place.launch.py skip_voice:=false
+# Terminal 1: robot
+ros2 launch tidybot_bringup real.launch.py use_planner:=true
 
-# Terminal 4:
+# Terminal 2: YOLO
+ros2 run object_classification classifier
+
+# Terminal 3: task
+ros2 run tidybot_bringup task2_pick_and_place.py --ros-args -p skip_voice:=false
+
+# Terminal 4: AprilTag detector (for bin finding)
+ros2 run tidybot_perception apriltag_detector_node.py
+
+# Terminal 5: voice
 ros2 run tidybot_bringup voice_command.py
+```
+
+**Parameter overrides:**
+```bash
+ros2 run tidybot_bringup task2_pick_and_place.py --ros-args \
+    -p skip_voice:=true -p target_object:=banana
 ```
 
 ## Key Parameters

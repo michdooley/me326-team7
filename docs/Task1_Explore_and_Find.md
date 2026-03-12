@@ -24,22 +24,37 @@ WAITING_FOR_COMMAND → SCANNING → CENTERING → APPROACHING → GRASPING → 
 
 ## How to Run
 
-**Simulation (no voice):**
+**Simulation:**
 ```bash
 # Terminal 1: sim
-ros2 launch tidybot_bringup sim.launch.py scene:=scene_banana_test.xml show_mujoco_viewer:=false
+ros2 launch tidybot_bringup sim.launch.py scene:=scene_banana_test.xml
 
-# Terminal 2: nav + grasp
-ros2 launch tidybot_bringup nav.launch.py target_object:=banana user_command:=get
+# Terminal 2: YOLO
+ros2 run object_classification classifier
+
+# Terminal 3: task
+ros2 run tidybot_bringup task1_explore_and_find.py --ros-args -p skip_voice:=true -p target_object:=banana
 ```
 
-**With voice:**
+**Real hardware:**
 ```bash
-# Terminal 2:
-ros2 launch tidybot_bringup nav.launch.py skip_voice:=false
+# Terminal 1: robot
+ros2 launch tidybot_bringup real.launch.py use_planner:=true
 
-# Terminal 3:
+# Terminal 2: YOLO
+ros2 run object_classification classifier
+
+# Terminal 3: task
+ros2 run tidybot_bringup task1_explore_and_find.py --ros-args -p skip_voice:=false
+
+# Terminal 4: voice
 ros2 run tidybot_bringup voice_command.py
+```
+
+**Parameter overrides:**
+```bash
+ros2 run tidybot_bringup task1_explore_and_find.py --ros-args \
+    -p skip_voice:=true -p target_object:=banana -p user_command:=get
 ```
 
 ## Key Parameters

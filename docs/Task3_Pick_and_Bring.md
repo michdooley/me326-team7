@@ -30,20 +30,47 @@ After presenting the object to the person:
 
 ## How to Run
 
+**Simulation:**
 ```bash
 # Terminal 1: sim
-ros2 launch tidybot_bringup sim.launch.py
+ros2 launch tidybot_bringup sim.launch.py scene:=scene_bins.xml
 
 # Terminal 2: YOLO
 ros2 run object_classification classifier
 
-# Terminal 3: face recognition
-ros2 run tidybot_perception face_recognition_node --ros-args \
-    -p known_faces_dir:=/path/to/faces -p person_name:=michael
+# Terminal 3: task
+ros2 run tidybot_bringup task3_pick_and_bring.py --ros-args -p skip_voice:=true
 
-# Terminal 4: task
+# Terminal 4: AprilTag detector (for bin finding)
+ros2 run tidybot_perception apriltag_detector_node.py
+```
+
+**Real hardware:**
+```bash
+# Terminal 1: robot
+ros2 launch tidybot_bringup real.launch.py use_planner:=true
+
+# Terminal 2: YOLO
+ros2 run object_classification classifier
+
+# Terminal 3: task
+ros2 run tidybot_bringup task3_pick_and_bring.py --ros-args -p skip_voice:=false
+
+# Terminal 4: AprilTag detector (for bin finding)
+ros2 run tidybot_perception apriltag_detector_node.py
+
+# Terminal 5: face recognition
+ros2 run tidybot_perception face_recognition_node.py
+
+# Terminal 6: voice
+ros2 run tidybot_bringup voice_command.py
+```
+
+**Parameter overrides:**
+```bash
 ros2 run tidybot_bringup task3_pick_and_bring.py --ros-args \
-    -p skip_voice:=true -p target_object:=banana -p target_person:=michael
+    -p skip_voice:=true -p target_object:=banana -p target_person:=michael \
+    -p skip_grasp_validation:=true
 ```
 
 ## Key Parameters
