@@ -77,6 +77,19 @@ class FaceRecognitionNode(Node):
         self.INFERENCE_RATE = self.get_parameter('inference_rate').value
         self.model = self.get_parameter('model').value
 
+        # Auto-discover face directory from tidybot_bringup package if not set
+        if not known_faces_dir:
+            try:
+                from ament_index_python.packages import get_package_share_directory
+                default_dir = os.path.join(
+                    get_package_share_directory('tidybot_bringup'), 'face')
+                if os.path.isdir(default_dir):
+                    known_faces_dir = default_dir
+                    self.get_logger().info(
+                        f'Auto-discovered known_faces_dir: {default_dir}')
+            except Exception:
+                pass
+
         # Load known face encodings
         self.known_encodings: list[np.ndarray] = []
         self.known_names: list[str] = []

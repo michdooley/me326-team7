@@ -14,6 +14,11 @@ install(DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config
 )
 
+# Install known face images for face recognition
+install(DIRECTORY face/
+  DESTINATION share/${PROJECT_NAME}/face
+)
+
 # Install rviz config files
 install(DIRECTORY rviz/
   DESTINATION share/${PROJECT_NAME}/rviz
