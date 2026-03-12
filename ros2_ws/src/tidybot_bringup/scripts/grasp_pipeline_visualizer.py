@@ -240,8 +240,9 @@ def method_minwidth_sweep(points: np.ndarray, plane_normal: np.ndarray,
             score = clearance / (GRIPPER_MAX_OPENING_M / 2.0)  # negative
 
         # Grasp center in 3D: centroid + offset along finger direction in plane
+        # Then offset 3cm above the floor plane (along plane normal)
         finger_3d = finger_2d[0] * u_axis + finger_2d[1] * v_axis
-        grasp_center = centroid + center_offset * finger_3d
+        grasp_center = centroid + center_offset * finger_3d + 0.03 * plane_normal
 
         results.append(GraspResult(
             center=grasp_center,
@@ -306,15 +307,20 @@ def create_gripper_mesh(center: np.ndarray, yaw: float, width: float,
     return gripper
 
 
-def score_to_color(score: float) -> tuple:
-    """Map score to color: red (<=0) -> yellow (0.5) -> green (1)."""
-    s = max(0.0, min(1.0, score))  # clamp negatives to red
-    if s < 0.5:
-        t = s * 2
-        return (int(220), int(t * 200), int(20))
+def width_to_color(width: float, min_width: float, max_width: float) -> tuple:
+    """Map grasp width to color: green (narrowest) -> yellow -> red (widest)."""
+    if max_width <= min_width:
+        return (0, 200, 0)
+    t = (width - min_width) / (max_width - min_width)  # 0=narrow, 1=wide
+    t = max(0.0, min(1.0, t))
+    if t < 0.5:
+        # green -> yellow
+        s = t * 2
+        return (int(s * 220), 200, 20)
     else:
-        t = (s - 0.5) * 2
-        return (int(220 * (1 - t)), int(200), int(20))
+        # yellow -> red
+        s = (t - 0.5) * 2
+        return (220, int(200 * (1 - s)), 20)
 
 
 def color_by_depth(points: np.ndarray) -> np.ndarray:
@@ -662,8 +668,14 @@ class PipelineVisualizer:
                 colors=colors5, point_size=0.002)
             handles6.append(h)
 
-        for i, g in enumerate(p['all_grasps'][:36]):  # show up to 36
-            c = score_to_color(g.score)
+        all_grasps = p['all_grasps'][:36]  # show up to 36
+        if all_grasps:
+            widths = [g.width for g in all_grasps]
+            min_w, max_w = min(widths), max(widths)
+        else:
+            min_w, max_w = 0, 1
+        for i, g in enumerate(all_grasps):
+            c = width_to_color(g.width, min_w, max_w)
             mesh = create_gripper_mesh(g.center, g.yaw, g.width,
                                        plane_normal, color=c)
             h = self.server.scene.add_mesh_trimesh(f'/stage6/gripper_{i:02d}', mesh)
@@ -682,7 +694,7 @@ class PipelineVisualizer:
             g = p['best_grasp']
             mesh = create_gripper_mesh(g.center, g.yaw, g.width,
                                        plane_normal,
-                                       color=(0, 220, 0), alpha=230)
+                                       color=(50, 100, 255), alpha=230)
             h = self.server.scene.add_mesh_trimesh('/stage7/gripper_best', mesh)
             handles7.append(h)
         self._scene_handles['stage7'] = handles7
