@@ -44,6 +44,9 @@ install(PROGRAMS
   scripts/pick_up_block.py
   scripts/pick_up_block_real.py
   scripts/frontier_exploration.py
+  scripts/task1_explore_and_find.py
+  scripts/task2_pick_and_place.py
+  scripts/task3_pick_and_bring.py
   scripts/explore_and_find_object.py
   scripts/topdown_grasp_demo.py
   scripts/voice_command.py
@@ -54,11 +57,6 @@ install(PROGRAMS
   scripts/safe_stop.py
   scripts/find_bin_and_drop.py
   scripts/pick_and_place.py
-  scripts/pick_and_bring.py
-  scripts/pick_and_bring_v2.py
-  scripts/pick_and_bring_face.py
-  scripts/pick_and_bring_v3.py
-  scripts/pick_and_bring_v4.py
   scripts/map_arm_workspace.py
   scripts/test_grasp_calibration.py
   scripts/ik_workspace_scan.py
@@ -69,6 +67,11 @@ install(PROGRAMS
 
 # Install subtask modules (importable by objective1_task.py)
 install(DIRECTORY scripts/subtasks
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# Install shared modules (importable by task scripts)
+install(DIRECTORY scripts/common
   DESTINATION lib/${PROJECT_NAME}
 )
 
