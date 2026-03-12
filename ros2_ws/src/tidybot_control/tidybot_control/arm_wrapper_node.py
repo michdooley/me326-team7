@@ -39,7 +39,6 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 from interbotix_xs_msgs.msg import JointGroupCommand
 
-
 class ArmWrapperNode(Node):
     """Wrapper node with velocity limiting for safe sim-to-real arm control."""
 
@@ -223,21 +222,27 @@ class ArmWrapperNode(Node):
     #  Control loop — velocity-limited interpolation toward targets
     # ------------------------------------------------------------------ #
 
+    # Tolerance (rad) below which the arm is considered "at target" and
+    # we stop publishing to avoid fighting with the motion planner.
+    _AT_TARGET_TOL = 0.01
+
     def _control_loop(self):
         """Move commanded positions toward targets at bounded velocity."""
-        # Right arm
+        # Right arm — only publish while actively moving toward target
         if self.right_target is not None and self.right_initialized:
-            self.right_cmd = self._step_toward(
-                self.right_cmd, self.right_target, self.arm_max_step
-            )
-            self._publish_arm_cmd(self.right_cmd, 'right')
+            if np.max(np.abs(self.right_target - self.right_cmd)) > self._AT_TARGET_TOL:
+                self.right_cmd = self._step_toward(
+                    self.right_cmd, self.right_target, self.arm_max_step
+                )
+                self._publish_arm_cmd(self.right_cmd, 'right')
 
-        # Left arm
+        # Left arm — only publish while actively moving toward target
         if self.left_target is not None and self.left_initialized:
-            self.left_cmd = self._step_toward(
-                self.left_cmd, self.left_target, self.arm_max_step
-            )
-            self._publish_arm_cmd(self.left_cmd, 'left')
+            if np.max(np.abs(self.left_target - self.left_cmd)) > self._AT_TARGET_TOL:
+                self.left_cmd = self._step_toward(
+                    self.left_cmd, self.left_target, self.arm_max_step
+                )
+                self._publish_arm_cmd(self.left_cmd, 'left')
 
         # Pan-tilt
         if self.pt_target is not None and self.pt_initialized:

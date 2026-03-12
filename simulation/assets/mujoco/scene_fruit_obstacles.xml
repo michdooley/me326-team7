@@ -1,0 +1,172 @@
+<mujoco model="tidybot fruit obstacle scene">
+  <include file="tidybot_wx250s_bimanual.xml"/>
+
+  <statistic center="0 0 0.525" extent="1.1" meansize="0.05"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.1 0.1 0.1" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="140" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.4 0.4 0.4" rgb2="0.35 0.35 0.35"
+      markrgb="0.5 0.5 0.5" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.1"/>
+
+    <!-- Obstacle materials -->
+    <material name="obstacle_material" rgba="0.5 0.5 0.5 1"/>
+    <material name="wall_material" rgba="0.35 0.35 0.35 1"/>
+    <material name="red_obstacle_material" rgba="0.8 0.2 0.2 1"/>
+    <material name="dark_obstacle_material" rgba="0.3 0.3 0.35 1"/>
+
+    <!-- Fruit meshes -->
+    <material name="apple_mat" rgba="0.85 0.15 0.15 1"/>
+    <material name="orange_mat" rgba="0.95 0.55 0.10 1"/>
+    <material name="banana_mat" rgba="0.95 0.90 0.10 1"/>
+    <mesh name="apple_mesh" file="fruit/apple.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="orange_mesh" file="fruit/orange.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="banana_mesh" file="fruit/banana.stl" scale="0.019 0.019 0.019"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.5" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <!-- Border walls (10m x 12m, 0.5m tall) -->
+    <geom name="wall_north" type="box" pos="0 10.5 0.25" size="5.05 0.05 0.25" material="wall_material"/>
+    <geom name="wall_south" type="box" pos="0 -1.5 0.25" size="5.05 0.05 0.25" material="wall_material"/>
+    <geom name="wall_east" type="box" pos="5.0 4.5 0.25" size="0.05 6.05 0.25" material="wall_material"/>
+    <geom name="wall_west" type="box" pos="-5.0 4.5 0.25" size="0.05 6.05 0.25" material="wall_material"/>
+
+    <!-- ===== Near zone (1.5-2.5m from robot) ===== -->
+
+    <body name="obstacle_start_ahead_box" pos="0.0 2.2 0.25">
+      <geom name="obstacle_start_ahead_box_geom" type="box" size="0.35 0.35 0.25" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <body name="obstacle_near_left" pos="-1.8 1.5 0.25">
+      <geom name="obstacle_near_left_geom" type="box" size="0.20 0.15 0.25" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <body name="obstacle_near_right" pos="2.0 1.2 0.25">
+      <geom name="obstacle_near_right_geom" type="cylinder" size="0.22 0.25" material="dark_obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <!-- ===== Mid zone (3-6m from robot) ===== -->
+
+    <body name="obstacle_mid_box_1" pos="-1.2 4.5 0.25">
+      <geom name="obstacle_mid_box_1_geom" type="box" size="0.25 0.20 0.25" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <body name="obstacle_mid_cylinder_1" pos="1.4 4.2 0.25">
+      <geom name="obstacle_mid_cylinder_1_geom" type="cylinder" size="0.18 0.25" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <body name="obstacle_mid_wide_1" pos="0.0 5.7 0.25">
+      <geom name="obstacle_mid_wide_1_geom" type="box" size="0.40 0.15 0.25" material="dark_obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <body name="obstacle_mid_box_2" pos="-2.7 5.2 0.25">
+      <geom name="obstacle_mid_box_2_geom" type="box" size="0.15 0.25 0.25" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <body name="obstacle_mid_cylinder_2" pos="3.0 4.8 0.25">
+      <geom name="obstacle_mid_cylinder_2_geom" type="cylinder" size="0.20 0.25" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <body name="obstacle_corridor_left" pos="-0.8 6.8 0.25">
+      <geom name="obstacle_corridor_left_geom" type="box" size="0.20 0.30 0.25" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <body name="obstacle_corridor_right" pos="1.2 7.2 0.25">
+      <geom name="obstacle_corridor_right_geom" type="box" size="0.15 0.25 0.25" material="dark_obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <!-- ===== Target zone obstacles ===== -->
+
+    <body name="obstacle_hide_left" pos="-0.5 8.2 0.25">
+      <geom name="obstacle_hide_left_geom" type="box" size="0.25 0.20 0.25" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <body name="obstacle_hide_right" pos="1.0 8.0 0.25">
+      <geom name="obstacle_hide_right_geom" type="cylinder" size="0.20 0.25" material="dark_obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <body name="obstacle_hide_behind" pos="0.3 9.0 0.25">
+      <geom name="obstacle_hide_behind_geom" type="box" size="0.30 0.15 0.25" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <!-- ===== Far zone (scattered) ===== -->
+
+    <body name="obstacle_far_box_1" pos="-3.8 9.0 0.25">
+      <geom name="obstacle_far_box_1_geom" type="box" size="0.20 0.20 0.25" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <body name="obstacle_far_cylinder_1" pos="3.8 8.7 0.25">
+      <geom name="obstacle_far_cylinder_1_geom" type="cylinder" size="0.22 0.25" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <body name="obstacle_far_box_2" pos="-2.3 3.0 0.25">
+      <geom name="obstacle_far_box_2_geom" type="box" size="0.18 0.18 0.25" material="dark_obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <body name="obstacle_far_cylinder_2" pos="4.2 2.2 0.25">
+      <geom name="obstacle_far_cylinder_2_geom" type="cylinder" size="0.15 0.25" material="obstacle_material"
+        mass="10.0" friction="2.0 1.0 1.0"/>
+    </body>
+
+    <!-- ===== FRUIT scattered in accessible open areas ===== -->
+
+    <!-- Apple: Near zone, right side gap -->
+    <body name="apple" pos="1.0 1.8 0.045">
+      <freejoint name="apple_joint"/>
+      <geom name="apple_geom" type="mesh" mesh="apple_mesh" mass="0.02"
+        material="apple_mat" friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
+    </body>
+
+    <!-- Orange: Mid zone, right side open corridor -->
+    <body name="orange" pos="2.5 3.5 0.045">
+      <freejoint name="orange_joint"/>
+      <geom name="orange_geom" type="mesh" mesh="orange_mesh" mass="0.018"
+        material="orange_mat" friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
+    </body>
+
+    <!-- Banana: Mid zone, left of wide obstacle -->
+    <body name="banana" pos="-2.0 5.5 0.025">
+      <freejoint name="banana_joint"/>
+      <geom name="banana_geom" type="mesh" mesh="banana_mesh" mass="0.012"
+        material="banana_mat" friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
+    </body>
+  </worldbody>
+
+  <keyframe>
+    <!-- qpos: robot (21) + 3 fruit freejoints (7 each = 21) = 42 total -->
+    <key name="scene_home"
+      qpos="0 0 1.5708
+        0 0.7854
+        0 0 0 0 0 0 0.037 0.037
+        0 0 0 0 0 0 0.037 0.037
+        1.0 1.8 0.045 1 0 0 0
+        2.5 3.5 0.045 1 0 0 0
+        -2.0 5.5 0.025 1 0 0 0"
+      ctrl="0 0 1.5708 0 0.7854 0 0 0 0 0 0 0.037 0.037 0 0 0 0 0 0 0.037 0.037"/>
+  </keyframe>
+</mujoco>

@@ -45,6 +45,14 @@ Visualization Manager:
       Queue Size: 2
 
     - Class: rviz_default_plugins/Image
+      Name: YOLO Detections
+      Enabled: true
+      Topic:
+        Value: /camera/color/image_yolo
+      Transport Hint: raw
+      Queue Size: 2
+
+    - Class: rviz_default_plugins/Image
       Name: Depth Camera
       Enabled: true
       Topic:
@@ -74,6 +82,28 @@ Visualization Manager:
       Color: 160; 160; 164
       Plane: XY
       Plane Cell Count: 20
+
+    - Class: rviz_default_plugins/Map
+      Name: Occupancy Map
+      Enabled: true
+      Topic:
+        Value: /map
+        Reliability Policy: Reliable
+      Alpha: 0.7
+      Color Scheme: map
+      Draw Behind: true
+
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Detected Objects
+      Enabled: true
+      Topic:
+        Value: /detected_objects
+
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Frontier Markers
+      Enabled: true
+      Topic:
+        Value: /frontier_markers
 
   Global Options:
     Background Color: 48; 48; 48

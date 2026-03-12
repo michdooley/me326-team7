@@ -24,6 +24,8 @@ setup(
             'detector_node = tidybot_perception.detector_node:main',
             'object_localizer_node = tidybot_perception.object_localizer_node:main',
             'grasp_planner_node = tidybot_perception.grasp_planner_node:main',
+            'apriltag_detector_node = tidybot_perception.apriltag_detector_node:main',
+            'face_recognition_node = tidybot_perception.face_recognition_node:main',
         ],
     },
 )

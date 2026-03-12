@@ -1,0 +1,157 @@
+<mujoco model="tidybot bins scene">
+  <include file="tidybot_wx250s_bimanual.xml"/>
+
+  <statistic center="0 0 0.525" extent="1.1" meansize="0.05"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.1 0.1 0.1" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="140" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="flat" rgb1="0.45 0.45 0.45" width="1" height="1"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" reflectance="0.0"/>
+
+    <!-- Bin materials -->
+    <material name="bin_mat" rgba="0.6 0.4 0.2 1"/>
+
+    <!-- AprilTag textures (tag36h11 family) -->
+    <texture type="2d" name="tag_0_tex" file="apriltags/tag36h11_0.png"/>
+    <texture type="2d" name="tag_1_tex" file="apriltags/tag36h11_1.png"/>
+    <material name="tag_0_mat" texture="tag_0_tex" texrepeat="1 1" texuniform="false"/>
+    <material name="tag_1_mat" texture="tag_1_tex" texrepeat="1 1" texuniform="false"/>
+
+    <!-- Person card texture -->
+    <texture type="2d" name="person_tex" file="personImage.png"/>
+    <material name="person_mat" texture="person_tex" texrepeat="1 1" texuniform="false"/>
+
+    <!-- Fruit materials and meshes -->
+    <material name="apple_mat" rgba="0.85 0.15 0.15 1"/>
+    <material name="orange_mat" rgba="0.95 0.55 0.10 1"/>
+    <material name="banana_mat" rgba="0.95 0.90 0.10 1"/>
+    <mesh name="apple_mesh" file="fruit/apple.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="orange_mesh" file="fruit/orange.stl" scale="0.001 0.001 0.001"/>
+    <mesh name="banana_mesh" file="fruit/banana.stl" scale="0.019 0.019 0.019"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.5" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <!-- Border walls (6m x 6m) -->
+    <geom name="wall_north" type="box" pos="0 6.05 0.25" size="3.05 0.05 0.25" material="bin_mat"/>
+    <geom name="wall_south" type="box" pos="0 -1.05 0.25" size="3.05 0.05 0.25" material="bin_mat"/>
+    <geom name="wall_east"  type="box" pos="3.0 2.5 0.25"  size="0.05 3.55 0.25" material="bin_mat"/>
+    <geom name="wall_west"  type="box" pos="-3.0 2.5 0.25" size="0.05 3.55 0.25" material="bin_mat"/>
+
+    <!--
+      Bins: 12" x 12" x 12" = 0.3048m per side
+      Wall thickness: 0.01m
+      Half-dimensions: 0.1524m (half-side), 0.005m (half-wall-thickness)
+      Bin body center at z=0.1524 so bottom sits on ground.
+      Robot starts at origin facing +Y (theta=pi/2).
+      Bins placed ~2.5m ahead, spread along X axis.
+      AprilTag material on all 4 vertical walls.
+    -->
+
+    <!--
+      Each bin has:
+        - 5 structural geoms (bottom + 4 walls) with bin_mat for collision
+        - 4 tag decals: visual-only boxes (contype/conaffinity=0) placed
+          just OUTSIDE each wall surface.
+          Decals use size="0.14 0.14 0.001" so the XY face (where MuJoCo
+          maps the 2D texture) is the large square. Euler rotations orient
+          the XY face to point outward from each wall.
+          Wall outer surfaces are at ±0.1524 from bin center.
+          Decals placed at ±0.1535 (just outside).
+    -->
+
+    <!-- Bin 0: Banana bin (tag 0) — left -->
+    <body name="bin_banana" pos="-1.0 2.5 0.1524">
+      <geom name="bin0_bottom" type="box" size="0.1524 0.1524 0.005" pos="0 0 -0.1474"
+            material="bin_mat" mass="1.0"/>
+      <geom name="bin0_front" type="box" size="0.1524 0.005 0.1524" pos="0 -0.1474 0"
+            material="bin_mat"/>
+      <geom name="bin0_back" type="box" size="0.1524 0.005 0.1524" pos="0 0.1474 0"
+            material="bin_mat"/>
+      <geom name="bin0_left" type="box" size="0.005 0.1524 0.1524" pos="-0.1474 0 0"
+            material="bin_mat"/>
+      <geom name="bin0_right" type="box" size="0.005 0.1524 0.1524" pos="0.1474 0 0"
+            material="bin_mat"/>
+      <!-- Tag decals: size XY=large, Z=thin; euler rotates XY face outward -->
+      <geom name="bin0_tag_front" type="box" size="0.14 0.14 0.001" pos="0 -0.1535 0"
+            euler="1.5708 0 0" material="tag_0_mat" contype="0" conaffinity="0"/>
+      <geom name="bin0_tag_back" type="box" size="0.14 0.14 0.001" pos="0 0.1535 0"
+            euler="-1.5708 0 0" material="tag_0_mat" contype="0" conaffinity="0"/>
+      <geom name="bin0_tag_left" type="box" size="0.14 0.14 0.001" pos="-0.1535 0 0"
+            euler="0 -1.5708 0" material="tag_0_mat" contype="0" conaffinity="0"/>
+      <geom name="bin0_tag_right" type="box" size="0.14 0.14 0.001" pos="0.1535 0 0"
+            euler="0 1.5708 0" material="tag_0_mat" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- Bin 1: Apple bin (tag 1) — center -->
+    <body name="bin_apple" pos="0.0 2.5 0.1524">
+      <geom name="bin1_bottom" type="box" size="0.1524 0.1524 0.005" pos="0 0 -0.1474"
+            material="bin_mat" mass="1.0"/>
+      <geom name="bin1_front" type="box" size="0.1524 0.005 0.1524" pos="0 -0.1474 0"
+            material="bin_mat"/>
+      <geom name="bin1_back" type="box" size="0.1524 0.005 0.1524" pos="0 0.1474 0"
+            material="bin_mat"/>
+      <geom name="bin1_left" type="box" size="0.005 0.1524 0.1524" pos="-0.1474 0 0"
+            material="bin_mat"/>
+      <geom name="bin1_right" type="box" size="0.005 0.1524 0.1524" pos="0.1474 0 0"
+            material="bin_mat"/>
+      <geom name="bin1_tag_front" type="box" size="0.14 0.14 0.001" pos="0 -0.1535 0"
+            euler="1.5708 0 0" material="tag_1_mat" contype="0" conaffinity="0"/>
+      <geom name="bin1_tag_back" type="box" size="0.14 0.14 0.001" pos="0 0.1535 0"
+            euler="-1.5708 0 0" material="tag_1_mat" contype="0" conaffinity="0"/>
+      <geom name="bin1_tag_left" type="box" size="0.14 0.14 0.001" pos="-0.1535 0 0"
+            euler="0 -1.5708 0" material="tag_1_mat" contype="0" conaffinity="0"/>
+      <geom name="bin1_tag_right" type="box" size="0.14 0.14 0.001" pos="0.1535 0 0"
+            euler="0 1.5708 0" material="tag_1_mat" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- Person card: replaces bin 2. 24" wide (0.6096m) x 32" tall (0.8128m).
+         Image is 2316x3088 portrait (aspect 1:1.333), pre-flipped in the PNG.
+         Centered at x=1.0 y=2.5, z=card midpoint (0.4064m). -->
+    <body name="person_card" pos="1.0 2.5 0.4064">
+      <geom name="person_card_geom" type="box" size="0.3048 0.4064 0.001"
+            euler="-1.5708 0 0"
+            material="person_mat" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- Fruits (near robot start position) -->
+    <body name="apple" pos="0.45 -0.10 0.04">
+      <freejoint name="apple_joint"/>
+      <geom name="apple_geom" type="mesh" mesh="apple_mesh" mass="0.02"
+        material="apple_mat" friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
+    </body>
+
+    <body name="orange" pos="0.50 0.00 0.04">
+      <freejoint name="orange_joint"/>
+      <geom name="orange_geom" type="mesh" mesh="orange_mesh" mass="0.018"
+        material="orange_mat" friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
+    </body>
+
+    <body name="banana" pos="0.42 0.08 0.025">
+      <freejoint name="banana_joint"/>
+      <geom name="banana_geom" type="mesh" mesh="banana_mesh" mass="0.012"
+        material="banana_mat" friction="2.0 1.0 1.0" solref="0.01 1" solimp="0.99 0.99 0.001"/>
+    </body>
+  </worldbody>
+
+  <keyframe>
+    <!-- qpos: robot (21) + 3 fruit freejoints (7 each) = 42 total -->
+    <key name="scene_home"
+      qpos="0 0 1.5708
+        0 0.7854
+        0 0 0 0 0 0 0.037 0.037
+        0 0 0 0 0 0 0.037 0.037
+        0.45 -0.10 0.04 1 0 0 0
+        0.50  0.00 0.04 1 0 0 0
+        0.42  0.08 0.025 1 0 0 0"
+      ctrl="0 0 1.5708 0 0.7854 0 0 0 0 0 0 0.037 0.037 0 0 0 0 0 0 0.037 0.037"/>
+  </keyframe>
+</mujoco>

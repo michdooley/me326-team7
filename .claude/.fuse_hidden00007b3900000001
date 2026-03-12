@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(source:*)",
+      "Bash(colcon build:*)",
+      "Bash(ls:*)",
+      "Bash(wc:*)",
+      "Bash(python3:*)",
+      "Bash(uv run python3:*)",
+      "Bash(chmod:*)",
+      "Bash(git ls-tree:*)",
+      "Bash(git merge-tree:*)",
+      "Bash(git merge:*)",
+      "Bash(git checkout:*)",
+      "Bash(grep:*)",
+      "Bash(pip install:*)"
+    ]
+  }
+}
