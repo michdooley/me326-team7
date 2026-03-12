@@ -55,6 +55,9 @@ install(PROGRAMS
   scripts/find_bin_and_drop.py
   scripts/pick_and_place.py
   scripts/pick_and_bring.py
+  scripts/pick_and_bring_v2.py
+  scripts/pick_and_bring_face.py
+  scripts/pick_and_bring_v3.py
   scripts/map_arm_workspace.py
   scripts/test_grasp_calibration.py
   scripts/ik_workspace_scan.py
