@@ -41,6 +41,10 @@ GRASP_MIN_DEPTH_M = 0.15
 GRASP_MAX_DEPTH_M = 5.0
 GRIPPER_MAX_OPENING_M = 0.048
 
+# D435 depth sensor intrinsics (wider FOV than RGB)
+D435_DEPTH_K = (380.4629821777344, 380.4629821777344,
+                324.5294494628906, 241.70526123046875)
+
 STAGE_LABELS = {
     1: 'Depth Image (normalized)',
     2: 'RGB + YOLO Bounding Box',
@@ -119,17 +123,21 @@ def depth_roi_to_points(depth_roi: np.ndarray, u_offset: int, v_offset: int,
 
 def separate_floor(points: np.ndarray, distance_thresh: float = 0.008,
                    max_iterations: int = 200, min_pts: int = 20):
-    """RANSAC plane fit. Returns (floor_val, object_points).
+    """RANSAC plane fit. Returns (plane_info, object_points).
 
-    In camera frame, the "floor" is the dominant plane (table surface).
-    floor_val is the median of the dominant-axis coordinate of inliers.
+    plane_info is a dict with:
+        'normal': unit normal of the dominant plane
+        'point':  centroid of plane inliers
+        'inlier_points': the inlier points themselves
     """
     n = len(points)
     if n < min_pts:
-        return 0.0, points
+        return None, points
 
     best_inlier_mask = None
     best_count = 0
+    best_normal = None
+    best_p0 = None
 
     rng = np.random.default_rng(42)
     for _ in range(max_iterations):
@@ -151,18 +159,26 @@ def separate_floor(points: np.ndarray, distance_thresh: float = 0.008,
         if count > best_count:
             best_count = count
             best_inlier_mask = inlier_mask
+            best_normal = normal
+            best_p0 = p0
 
     if best_inlier_mask is None or best_count < 0.20 * n:
-        return 0.0, points
+        return None, points
 
-    # Use Y coordinate for floor in camera frame (Y is "down")
-    floor_y = float(np.median(points[best_inlier_mask, 1]))
+    inlier_pts = points[best_inlier_mask]
+    plane_center = np.mean(inlier_pts, axis=0)
     outlier_mask = ~best_inlier_mask
 
-    if outlier_mask.sum() < min_pts:
-        return floor_y, points
+    plane_info = {
+        'normal': best_normal,
+        'point': plane_center,
+        'inlier_points': inlier_pts,
+    }
 
-    return floor_y, points[outlier_mask]
+    if outlier_mask.sum() < min_pts:
+        return plane_info, points
+
+    return plane_info, points[outlier_mask]
 
 
 def method_minwidth_sweep(points: np.ndarray, angle_step: int = 5
@@ -384,13 +400,54 @@ def run_yolo(rgb_bgr: np.ndarray, target: Optional[str] = None
 
 # ── Pipeline computation ───────────────────────────────────────────────────
 
-def compute_pipeline(depth_mm: np.ndarray, rgb_bgr: np.ndarray,
+def align_depth_to_rgb(depth_mm: np.ndarray, rgb_bgr: np.ndarray,
+                       rgb_K: Tuple[float, float, float, float],
+                       depth_K: Tuple[float, float, float, float] = D435_DEPTH_K
+                       ) -> np.ndarray:
+    """Align depth image from depth-sensor FOV to RGB-sensor FOV.
+
+    The D435 depth sensor has a wider FOV (lower focal length) than the
+    RGB sensor. This remaps depth pixels so they match the RGB image.
+    """
+    old_fx, old_fy, old_cx, old_cy = depth_K
+    new_fx, new_fy, new_cx, new_cy = rgb_K
+
+    K_old = np.array([[old_fx, 0, old_cx],
+                       [0, old_fy, old_cy],
+                       [0, 0, 1]])
+    K_new = np.array([[new_fx, 0, new_cx],
+                       [0, new_fy, new_cy],
+                       [0, 0, 1]])
+
+    h, w = rgb_bgr.shape[:2]
+    K_new_inv = np.linalg.inv(K_new)
+
+    x, y = np.meshgrid(np.arange(w), np.arange(h))
+    homogeneous = np.stack([x.ravel(), y.ravel(), np.ones_like(x).ravel()], axis=-1).T
+    old_coords = K_old @ K_new_inv @ homogeneous
+    old_coords /= old_coords[2, :]
+
+    map_x = old_coords[0, :].reshape(h, w).astype(np.float32)
+    map_y = old_coords[1, :].reshape(h, w).astype(np.float32)
+
+    return cv2.remap(depth_mm, map_x, map_y,
+                     interpolation=cv2.INTER_NEAREST)
+
+
+def compute_pipeline(depth_mm_raw: np.ndarray, rgb_bgr: np.ndarray,
                      fx: float, fy: float, cx: float, cy: float,
                      detection: dict) -> dict:
     """Compute all 7 pipeline stages from raw data. Returns dict of results."""
     results = {}
 
-    # Stage 1: Normalized depth
+    # Align depth to RGB intrinsics (D435 depth has wider FOV than RGB)
+    depth_mm = align_depth_to_rgb(
+        depth_mm_raw, rgb_bgr, rgb_K=(fx, fy, cx, cy))
+    print(f'Depth aligned to RGB intrinsics '
+          f'(depth FOV: f={D435_DEPTH_K[0]:.0f}, '
+          f'RGB FOV: f={fx:.0f})')
+
+    # Stage 1: Normalized depth (aligned)
     results['depth_colored'] = normalize_depth_colormap(depth_mm)
 
     # Stage 2: RGB + YOLO bbox
@@ -418,20 +475,27 @@ def compute_pipeline(depth_mm: np.ndarray, rgb_bgr: np.ndarray,
                   (u0, v0), (u1, v1),
                   (0, 165, 255), 2)  # orange for padded crop
 
-    # Stage 4: Cropped point cloud
+    # Stage 4: Cropped point cloud (using RGB intrinsics since depth is aligned)
     points_cam = depth_roi_to_points(roi, u0, v0, fx, fy, cx, cy)
     results['points_raw'] = points_cam
     print(f'Stage 4: {len(points_cam)} points from cropped depth')
 
     # Stage 5: RANSAC floor separation
     if len(points_cam) >= 20:
-        floor_y, obj_pts = separate_floor(points_cam)
-        results['floor_y'] = floor_y
+        plane_info, obj_pts = separate_floor(points_cam)
+        results['plane_info'] = plane_info
         results['points_filtered'] = obj_pts
-        print(f'Stage 5: RANSAC {len(points_cam)} -> {len(obj_pts)} points, '
-              f'floor_y={floor_y:.3f}m')
+        if plane_info is not None:
+            n = plane_info['normal']
+            p = plane_info['point']
+            print(f'Stage 5: RANSAC {len(points_cam)} -> {len(obj_pts)} points, '
+                  f'plane normal=({n[0]:.2f},{n[1]:.2f},{n[2]:.2f}), '
+                  f'center=({p[0]:.3f},{p[1]:.3f},{p[2]:.3f})')
+        else:
+            print(f'Stage 5: RANSAC found no dominant plane, '
+                  f'keeping all {len(obj_pts)} points')
     else:
-        results['floor_y'] = 0.0
+        results['plane_info'] = None
         results['points_filtered'] = points_cam
 
     # Stage 6: Min-sweep grasps
@@ -527,14 +591,32 @@ class PipelineVisualizer:
                 colors=colors5, point_size=0.002)
             handles5.append(h)
 
-            # Floor plane (translucent, at floor_y in camera frame)
-            centroid = np.mean(pts_filt, axis=0)
-            floor_y = p['floor_y']
-            plane_mesh = trimesh.creation.box([0.15, 0.001, 0.15])
-            plane_mesh.apply_translation([centroid[0], floor_y, centroid[2]])
-            plane_mesh.visual.face_colors = [255, 165, 0, 60]
-            h = self.server.scene.add_mesh_trimesh('/stage5/floor', plane_mesh)
-            handles5.append(h)
+            # Floor plane oriented by RANSAC normal
+            plane_info = p.get('plane_info')
+            if plane_info is not None:
+                plane_center = plane_info['point']
+                plane_normal = plane_info['normal']
+
+                # Build a rotation that aligns +Y with the plane normal
+                # (trimesh box has thin dimension along Y when created as [w, thin, h])
+                up = np.array([0.0, 1.0, 0.0])
+                if abs(np.dot(up, plane_normal)) < 0.999:
+                    axis = np.cross(up, plane_normal)
+                    axis /= np.linalg.norm(axis)
+                    angle = np.arccos(np.clip(np.dot(up, plane_normal), -1, 1))
+                    rot = Rotation.from_rotvec(axis * angle).as_matrix()
+                else:
+                    rot = np.eye(3) if np.dot(up, plane_normal) > 0 else \
+                        Rotation.from_euler('x', 180, degrees=True).as_matrix()
+
+                plane_mesh = trimesh.creation.box([0.20, 0.001, 0.20])
+                xform = np.eye(4)
+                xform[:3, :3] = rot
+                xform[:3, 3] = plane_center
+                plane_mesh.apply_transform(xform)
+                plane_mesh.visual.face_colors = [255, 165, 0, 60]
+                h = self.server.scene.add_mesh_trimesh('/stage5/floor', plane_mesh)
+                handles5.append(h)
         self._scene_handles['stage5'] = handles5
 
         # Stage 6: All grasps + point cloud
