@@ -35,14 +35,11 @@ After presenting the object to the person:
 # Terminal 1: sim
 ros2 launch tidybot_bringup sim.launch.py scene:=scene_bins.xml
 
-# Terminal 2: YOLO
-ros2 run object_classification classifier
+# Terminal 2: perception (all nodes for Task 3)
+ros2 launch tidybot_bringup perception.launch.py
 
 # Terminal 3: task
 ros2 run tidybot_bringup task3_pick_and_bring.py --ros-args -p skip_voice:=true
-
-# Terminal 4: AprilTag detector (for bin finding)
-ros2 run tidybot_perception apriltag_detector_node
 ```
 
 **Real hardware:**
@@ -50,19 +47,13 @@ ros2 run tidybot_perception apriltag_detector_node
 # Terminal 1: robot
 ros2 launch tidybot_bringup real.launch.py use_planner:=true
 
-# Terminal 2: YOLO
-ros2 run object_classification classifier
+# Terminal 2: perception (all nodes for Task 3)
+ros2 launch tidybot_bringup perception.launch.py
 
 # Terminal 3: task
 ros2 run tidybot_bringup task3_pick_and_bring.py --ros-args -p skip_voice:=false
 
-# Terminal 4: AprilTag detector (for bin finding)
-ros2 run tidybot_perception apriltag_detector_node
-
-# Terminal 5: face recognition (auto-loads faces from tidybot_bringup/face/)
-ros2 run tidybot_perception face_recognition_node
-
-# Terminal 6: voice
+# Terminal 4: voice
 ros2 run tidybot_bringup voice_command.py
 ```
 
