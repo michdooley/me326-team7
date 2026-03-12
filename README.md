@@ -45,25 +45,32 @@ See the individual task docs for details.
 
 ```bash
 # Build
-cd ros2_ws && colcon build --packages-select tidybot_perception tidybot_bringup && source install/setup.bash
+cd ros2_ws && colcon build && source install/setup.bash
 
-# Launch sim
+# Terminal 1: Launch sim
 ros2 launch tidybot_bringup sim.launch.py scene:=scene_bins.xml
 
-# Launch YOLO
-ros2 run object_classification classifier
+# Terminal 2: Launch perception (YOLO + AprilTag + face recognition + overlay)
+ros2 launch tidybot_bringup perception.launch.py
 
-# Run a task (e.g. Task 2)
-ros2 launch tidybot_bringup pick_and_place.launch.py target_object:=banana
+# Terminal 3: Run a task (e.g. Task 2)
+ros2 run tidybot_bringup task2_pick_and_place.py --ros-args -p skip_voice:=true -p target_object:=banana
 ```
+
+The `perception.launch.py` starts all perception nodes in one terminal. Disable unneeded ones per task:
+- **Task 1:** `perception.launch.py use_face_recognition:=false use_apriltag:=false`
+- **Task 2:** `perception.launch.py use_face_recognition:=false`
+- **Task 3:** `perception.launch.py` (all enabled)
 
 ## Key ROS Topics
 
 | Topic | Purpose |
 |-------|---------|
 | `/objbbox` | YOLO detections (Detection2DArray) |
+| `/face_detections` | Face recognition bounding boxes |
+| `/apriltag_detections` | AprilTag detections |
+| `/camera/color/image_annotated` | Unified overlay (YOLO + face + AprilTag) |
 | `/target_object` | Voice: which object to find |
 | `/user_command` | Voice: "get", "drop", "bring it to the bin" |
-| `/face_detections` | Face recognition bounding boxes |
 | `/cmd_vel` | Base velocity |
 | `/left_arm/command`, `/right_arm/command` | Arm joint commands |
