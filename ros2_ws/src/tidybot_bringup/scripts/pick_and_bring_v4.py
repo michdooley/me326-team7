@@ -204,7 +204,7 @@ class PickAndBring(Node):
     GRASP_MOVE_DURATION          = 2.0
     GRASP_PRE_HEIGHT             = 0.10
     GRASP_LIFT_HEIGHT            = 0.15
-    GRASP_Z_OFFSET               = 0.00 # 0.03
+    GRASP_Z_OFFSET               = 0.03 # 0.03
     GRASP_X_OFFSET               = -0.03
     GRASP_Y_OFFSET               = -0.00
     GRASP_BBOX_PAD               = 1.3
